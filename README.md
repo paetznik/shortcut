@@ -9,12 +9,14 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 3. Highlight-Auswahl:
    - mit Anthropic-API-Schlüssel (in den Einstellungen hinterlegen): Claude wählt die Ausschnitte und schreibt Titel und Beschreibungen,
    - ohne Schlüssel: automatische Auswahl nach Sprechtempo, Fragen und Schlüsselwörtern.
-4. Optional Prüfmodus: Titel, Hook-Text und Untertitel jedes Clips vor dem Rendern korrigieren.
+4. Optional Prüfmodus: Titel, Hook-Text (mit KI-Varianten), Titelbild-Text und Untertitel jedes Clips vor dem Rendern korrigieren; Wörter im Transkript anklicken schneidet sie heraus.
 5. Schnitt mit ffmpeg:
-   - 9:16-Zuschnitt, der dem Sprecher folgt (Gesichtserkennung mit OpenCV, Mundbewegung entscheidet bei mehreren Personen), alternativ Mitte oder ganzes Bild mit unscharfem Hintergrund,
-   - Pausen und Füllwörter werden herausgeschnitten,
-   - Hook-Text in den ersten Sekunden, animierte Wort-für-Wort-Untertitel, Lautstärke-Normalisierung.
-6. Download als MP4 plus SRT, automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Start, Ende, Titel und Text lassen sich pro Clip nachträglich ändern und neu rendern.
+   - 9:16-Zuschnitt, der dem Sprecher folgt (Gesichtserkennung mit OpenCV, Mundbewegung entscheidet bei mehreren Personen), alternativ Mitte oder ganzes Bild mit unscharfem Hintergrund; optional zusätzlich 4:5 und 1:1,
+   - Pausen, Füllwörter und angeklickte Wörter werden herausgeschnitten, dynamische Zooms an Schnitten und Satzanfängen,
+   - Hook-Text in den ersten Sekunden, Untertitel in vier Stilen (Pop, Box, Minimal, ganze Sätze) mit farbigen Schlüsselwörtern, innerhalb der Sicherheitszonen der Plattformen,
+   - Tonaufbereitung (Rumpelfilter, Rauschunterdrückung, De-Esser, Kompressor, Lautheit −14 LUFS) und optionale Hintergrundmusik, die unter Sprache leiser wird,
+   - Titelbild mit großem Text für das Profilraster.
+6. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
 
 ## Deployment
 

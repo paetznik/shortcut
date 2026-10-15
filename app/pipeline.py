@@ -39,7 +39,8 @@ def probe(path):
     w, h = int(v["width"]), int(v["height"])
     if rot in (90, 270):
         w, h = h, w
-    return {"duration": float(info["format"].get("duration", 0)), "width": w, "height": h}
+    has_audio = any(s.get("codec_type") == "audio" for s in info["streams"])
+    return {"duration": float(info["format"].get("duration", 0)), "width": w, "height": h, "has_audio": has_audio}
 
 
 def extract_audio(video, wav):
@@ -144,7 +145,9 @@ def highlights_claude(segments, api_key, n, min_len, max_len, context):
         "Antworte NUR mit einem JSON-Array, ohne weiteren Text, in diesem Format:\n"
         '[{"start": 12.3, "end": 55.0, "title": "kurzer, packender Titel", '
         '"hook": "warum das funktioniert (1 Satz)", "score": 1-100, '
-        '"caption": "Social-Media-Beschreibung mit 3-5 Hashtags"}]\n\n'
+        '"caption": "Social-Media-Beschreibung mit 3-5 Hashtags", '
+        '"hooks": ["3 unterschiedliche Hook-Texte für die ersten Sekunden, je max. 8 Wörter: z. B. Frage, steile These, Neugier"], '
+        '"keywords": ["2-6 Wörter, die im Ausschnitt wörtlich vorkommen und hervorgehoben werden sollen, z. B. Zahlen, Kernbegriffe"]}]\n\n'
         "TRANSKRIPT:\n%s"
     ) % (n, min_len, max_len, extra, transcript)
 
@@ -197,10 +200,15 @@ def highlights_heuristic(segments, n, min_len, max_len):
             j += 1
     clips = remove_overlaps(cands)[:n]
     for c in clips:
-        first = re.split(r"(?<=[.!?])\s", c["text"])[0]
-        c["title"] = (first[:70] + "…") if len(first) > 70 else first
+        sentences = [s for s in re.split(r"(?<=[.!?])\s", c["text"]) if s.strip()]
+        short = lambda s: (s[:70] + "…") if len(s) > 70 else s
+        c["title"] = short(sentences[0])
         c["hook"] = "Automatisch gewählt (Sprechdichte, Fragen, Schlüsselwörter)"
         c["caption"] = ""
+        # alternatives: the first question in the clip and the second sentence
+        alts = [s for s in sentences[1:] if s.endswith("?")][:1] + sentences[1:2]
+        c["hooks"] = list(dict.fromkeys([c["title"]] + [short(s) for s in alts]))[:3]
+        c["keywords"] = guess_keywords(c["text"])
         del c["text"]
     if clips:
         top = max(c["score"] for c in clips) or 1
@@ -228,7 +236,24 @@ def find_highlights(segments, api_key, n, min_len, max_len, context, log):
         c.setdefault("title", "")
         c.setdefault("hook", "")
         c.setdefault("caption", "")
+        hooks = [str(h).strip() for h in (c.get("hooks") or []) if str(h).strip()]
+        c["hooks"] = list(dict.fromkeys(([c["title"]] if c["title"] else []) + hooks))[:4]
+        kw = c.get("keywords") or []
+        c["keywords"] = [str(k).strip() for k in kw if str(k).strip()][:8] if isinstance(kw, list) else []
     return snapped, source
+
+
+def guess_keywords(text):
+    """Words worth colouring without AI: numbers, hook words and long nouns, a handful per clip."""
+    out = []
+    for tok in text.split():
+        w = re.sub(r"[^\wäöüÄÖÜß%€$]", "", tok)
+        if not w:
+            continue
+        if re.search(r"\d", w) or w.lower() in HOOK_WORDS or (len(w) >= 9 and w[0].isupper()):
+            if w.lower() not in (x.lower() for x in out):
+                out.append(w)
+    return out[:6]
 
 
 # ---------------------------------------------------------------- transcript editing
@@ -291,21 +316,47 @@ def is_filler(word):
     return re.sub(r"[^\wäöüß]", "", word.lower()) in FILLERS
 
 
-def keep_intervals(words, duration, remove_pauses, max_pause=0.35, pad=0.1):
-    """Parts of the clip (relative seconds) that stay after cutting pauses and filler words."""
+def keep_intervals(words, duration, remove_pauses, removed=(), max_pause=0.35, pad=0.1):
+    """Parts of the clip (relative seconds) that stay after cutting pauses, filler words and words the user struck out.
+
+    `removed` holds the start times of struck-out words; a struck-out word always forces a cut."""
+    cut = {round(float(s), 2) for s in removed}
+    gone = [round(w["s"], 2) in cut for w in words]
     if not remove_pauses:
-        return [(0.0, duration)]
-    spoken = [w for w in words if not is_filler(w["w"])]
-    if not spoken:
-        return [(0.0, duration)]
-    out = []
-    for w in spoken:
-        a, b = max(0.0, w["s"] - pad), min(duration, w["e"] + pad)
-        if out and a - out[-1][1] < max_pause:
+        out = [[0.0, duration]]
+        for w, g in zip(words, gone):
+            if not g:
+                continue
+            nxt = []
+            for a, b in out:  # subtract the word from every kept interval
+                if w["e"] <= a or w["s"] >= b:
+                    nxt.append([a, b])
+                    continue
+                if w["s"] > a:
+                    nxt.append([a, w["s"]])
+                if w["e"] < b:
+                    nxt.append([w["e"], b])
+            out = nxt
+        return [(round(a, 3), round(b, 3)) for a, b in out if b - a > 0.05]
+    out, blocked, prev_cut_end = [], False, 0.0
+    for i, w in enumerate(words):
+        if gone[i]:
+            blocked, prev_cut_end = True, w["e"]
+            continue
+        if is_filler(w["w"]):
+            continue
+        nxt_cut = next((x["s"] for x, g in zip(words[i + 1:], gone[i + 1:]) if g), duration)
+        a = max(0.0, prev_cut_end if blocked else 0.0, w["s"] - pad)
+        b = min(duration, nxt_cut, w["e"] + pad)
+        if out and not blocked and a - out[-1][1] < max_pause:
             out[-1][1] = max(out[-1][1], b)
         else:
             out.append([a, b])
-    out[-1][1] = min(duration, out[-1][1] + 0.25)
+        blocked = False
+    if not out:
+        return [(0.0, duration)] if not any(gone) else [(0.0, 0.5)]
+    tail_cut = next((x["s"] for x, g in zip(words, gone) if g and x["s"] >= out[-1][1]), duration)
+    out[-1][1] = min(duration, tail_cut, out[-1][1] + 0.25)
     return [(round(a, 3), round(b, 3)) for a, b in out if b - a > 0.05]
 
 
@@ -334,7 +385,7 @@ def remap_words(words, intervals):
 # ---------------------------------------------------------------- speaker tracking
 
 def track_speaker(video, info, start, end):
-    """Find who is talking and return crop positions [(t0, t1, x)] in clip time, or None for a centre crop.
+    """Find who is talking and return [(t0, t1, centre_x)] in clip time (source pixels), or None for a centre crop.
 
     Faces are detected on a few frames per second; the face whose mouth area moves most within each second
     is treated as the speaker, and short switches are smoothed away so the framing does not jump around."""
@@ -385,15 +436,13 @@ def track_speaker(video, info, start, end):
     tracks = [t for t in tracks if t["seen"] >= max(3, len(frames) * 0.15)]
     if not tracks:
         return None
-    cw = int(H * 9 / 16) // 2 * 2
 
-    def crop_x(track):
-        cx = float(np.median(track["cx"])) * W / aw
-        return int(min(max(0, cx - cw / 2), W - cw))
+    def centre(track):
+        return int(float(np.median(track["cx"])) * W / aw)
 
     duration = end - start
     if len(tracks) == 1:
-        return [(0.0, duration, crop_x(tracks[0]))]
+        return [(0.0, duration, centre(tracks[0]))]
 
     windows = max(1, int(np.ceil(len(frames) / fps)))
     choice, prev = [], max(range(len(tracks)), key=lambda k: tracks[k]["seen"])
@@ -418,22 +467,34 @@ def track_speaker(video, info, start, end):
             merged.append([k, n])
     segs, t = [], 0.0
     for k, n in merged:
-        segs.append((t, min(duration, t + n), crop_x(tracks[k])))
+        segs.append((t, min(duration, t + n), centre(tracks[k])))
         t += n
     return segs
 
 
-def crop_filter(segs, W, H):
-    cw = int(H * 9 / 16) // 2 * 2
+def crop_box(W, H, ar):
+    """Largest crop of the source with aspect ratio `ar` (width/height)."""
+    if W / H > ar:
+        return int(H * ar) // 2 * 2, H
+    return W, int(W / ar) // 2 * 2
+
+
+def crop_filter(segs, W, H, ar):
+    cw, ch = crop_box(W, H, ar)
+    y = (H - ch) // 2
     if not segs:
-        return "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'"
-    expr = str(segs[-1][2])
-    for t0, t1, x in reversed(segs[:-1]):
+        return "crop=%d:%d:%d:%d" % (cw, ch, (W - cw) // 2, y)
+    xs = [int(min(max(0, cx - cw / 2), W - cw)) for _, _, cx in segs]
+    expr = str(xs[-1])
+    for (t0, t1, _), x in reversed(list(zip(segs[:-1], xs[:-1]))):
         expr = "if(lt(t,%.2f),%d,%s)" % (t1, x, expr)
-    return "crop=%d:%d:'%s':0" % (cw, H, expr)
+    return "crop=%d:%d:'%s':%d" % (cw, ch, expr, y)
 
 
 # ---------------------------------------------------------------- subtitles
+
+SUB_STYLES = ("pop", "box", "minimal", "satz")
+
 
 def ass_time(t):
     t = max(0, t)
@@ -446,10 +507,10 @@ def srt_time(t):
     return "%02d:%02d:%02d,%03d" % (ms // 3600000, ms // 60000 % 60, ms // 1000 % 60, ms % 1000)
 
 
-def hex_to_ass(color):
+def hex_to_ass(color, fallback="FFE600"):
     c = color.lstrip("#")
     if len(c) != 6:
-        c = "FFE600"
+        c = fallback
     return "&H00%s%s%s" % (c[4:6], c[2:4], c[0:2])
 
 
@@ -480,52 +541,127 @@ def ass_escape(text):
     return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
-def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0):
+def norm_word(w):
+    return re.sub(r"[^\wäöüß%€$]", "", w.lower())
+
+
+def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, keywords=(), size=(1080, 1920)):
+    """Subtitles in one of several looks; keywords get their own colour, the active word the highlight colour."""
+    pw, ph = size
+    k = ph / 1920
+    look = style.get("sub_style", "pop")
     upper = style.get("uppercase", True)
     hl = hex_to_ass(style.get("highlight", "#FFE600"))
-    size = int(style.get("font_size", 78))
-    pos = style.get("position", "unten")
-    margin_v = {"unten": 420, "mitte": 860, "oben": 1350}.get(pos, 420)
+    kw_col = hex_to_ass(style.get("keyword_color", "#4ADE80"), "4ADE80")
+    fs = int(style.get("font_size", 78)) * max(0.72, k)
+    margin_v = int({"unten": 0.22, "mitte": 0.45, "oben": 0.70}.get(style.get("position", "unten"), 0.22) * ph)
     max_words = int(style.get("words_per_line", 3))
+    keys = {norm_word(x) for kw in keywords for x in str(kw).split() if norm_word(x)}
 
     def txt(w):
         return ass_escape(w.upper() if upper else w)
 
+    # side margins keep text clear of the platform buttons on the right (safe zone)
+    side = int(0.12 * pw)
+    if look == "box":
+        main = "Default,Montserrat,%d,&H00FFFFFF,&H00FFFFFF,&H64000000,&H64000000,-1,0,0,0,100,100,0,0,3,10,0,2,%d,%d,%d,1" % (fs * 0.92, side, side, margin_v)
+    elif look == "minimal":
+        fs *= 0.78
+        main = "Default,Montserrat,%d,&H00FFFFFF,&H00FFFFFF,&H50000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,2,2,%d,%d,%d,1" % (fs, side, side, margin_v)
+    elif look == "satz":
+        fs *= 0.72
+        main = "Default,Montserrat,%d,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,3,8,0,2,%d,%d,%d,1" % (fs, side, side, margin_v)
+    else:
+        main = "Default,Montserrat,%d,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,%d,3,2,%d,%d,%d,1" % (fs, max(4, int(7 * k)), side, side, margin_v)
     header = (
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 0\n"
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
         "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,Montserrat,%d,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,7,3,2,70,70,%d,1\n"
-        "Style: Hook,Montserrat,72,&H00111111,&H00111111,%s,&H00000000,-1,0,0,0,100,100,0,0,3,16,0,8,110,110,250,1\n\n"
+        "Style: %s\n"
+        "Style: Hook,Montserrat,%d,&H00111111,&H00111111,%s,&H00000000,-1,0,0,0,100,100,0,0,3,16,0,8,%d,%d,%d,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    ) % (size, margin_v, hl)
+    ) % (pw, ph, main, 72 * max(0.75, k), hl, side, side, int(0.13 * ph))
     events, srt = [], []
     hook_secs = float(style.get("hook_seconds", 3))
     if style.get("hook", True) and hook_text.strip():
         end = min(hook_secs, total) if total else hook_secs
         events.append("Dialogue: 1,%s,%s,Hook,,0,0,0,,{\\fad(120,250)\\fscx90\\fscy90\\t(0,150,\\fscx100\\fscy100)}%s"
                       % (ass_time(0), ass_time(end), ass_escape(hook_text.strip())))
-    for n, chunk in enumerate(chunk_words(words, max_words), 1):
+
+    def coloured(x):
+        return ("{\\c%s&}%s{\\r}" % (kw_col, txt(x["w"]))) if norm_word(x["w"]) in keys else txt(x["w"])
+
+    if look == "satz":
+        chunks = chunk_words(words, 12, 42)
+    else:
+        chunks = chunk_words(words, max_words)
+    for n, chunk in enumerate(chunks, 1):
         c_end = chunk[-1]["e"]
         srt.append("%d\n%s --> %s\n%s\n" % (n, srt_time(chunk[0]["s"]), srt_time(c_end), " ".join(w["w"] for w in chunk)))
+        if look == "satz":  # whole sentence at once, keywords coloured
+            events.append("Dialogue: 0,%s,%s,Default,,0,0,0,,%s" % (ass_time(chunk[0]["s"]), ass_time(c_end),
+                                                                   " ".join(coloured(x) for x in chunk)))
+            continue
         for i, w in enumerate(chunk):
             s = w["s"] if i else chunk[0]["s"]
             e = chunk[i + 1]["s"] if i + 1 < len(chunk) else c_end
             parts = []
-            for k, x in enumerate(chunk):
-                if k == i:
-                    parts.append("{\\c%s&\\fscx112\\fscy112}%s{\\r}" % (hl, txt(x["w"])))
+            for j, x in enumerate(chunk):
+                if j == i:
+                    grow = "\\fscx112\\fscy112" if look == "pop" else ""
+                    parts.append("{\\c%s&%s}%s{\\r}" % (hl, grow, txt(x["w"])))
                 else:
-                    parts.append(txt(x["w"]))
-            pop = "" if i else "{\\fscx80\\fscy80\\t(0,90,\\fscx100\\fscy100)}"
+                    parts.append(coloured(x))
+            pop = "{\\fscx80\\fscy80\\t(0,90,\\fscx100\\fscy100)}" if (look == "pop" and not i) else ""
             events.append("Dialogue: 0,%s,%s,Default,,0,0,0,,%s%s" % (ass_time(s), ass_time(e), pop, " ".join(parts)))
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(events) + "\n")
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(srt))
+    if srt_path:
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(srt))
     return bool(events)
+
+
+# ---------------------------------------------------------------- zooms
+
+def zoom_spans(words, intervals, total, every=4.0):
+    """Punch-in zoom spans (output time): the zoom toggles at cuts and at sentence starts, at least `every` s apart,
+    so jump cuts look intentional and long takes get movement."""
+    points = []
+    acc = 0.0
+    for a, b in intervals[:-1]:
+        acc += b - a
+        points.append(acc)
+    for prev, w in zip(words, words[1:]):
+        if prev["w"][-1:] in ".!?":
+            points.append(w["s"])
+    points = sorted(p for p in points if 1.0 < p < total - 1.0)
+    picked, last = [], 0.0
+    for p in points:
+        if p - last >= 2.5:
+            picked.append(p)
+            last = p
+    t = picked[-1] if picked else 0.0
+    while t + every < total - 1.0:  # long stretches without sentence ends still get a change
+        t += every
+        picked.append(t)
+    picked = sorted(set(round(p, 2) for p in picked))
+    spans, on = [], False
+    edges = [0.0] + picked + [total]
+    for a, b in zip(edges, edges[1:]):
+        if on:
+            spans.append((a, b))
+        on = not on
+    return spans
+
+
+def zoom_filter(spans, ow, oh, amount=0.1):
+    if not spans:
+        return ""
+    z = "(1+%.3f*(%s))" % (amount, "+".join("between(t,%.2f,%.2f)" % s for s in spans))
+    return (",scale=w='trunc(%d*%s/2)*2':h='trunc(%d*%s/2)*2':eval=frame,crop=%d:%d" % (ow, z, oh, z, ow, oh))
 
 
 # ---------------------------------------------------------------- rendering
@@ -534,36 +670,81 @@ def select_expr(intervals):
     return "+".join("between(t,%.3f,%.3f)" % (a, b) for a, b in intervals)
 
 
-def render_clip(video, info, start, end, workdir, name, mode, ass_name, burn, intervals=None, crop_segs=None):
+def video_chain(info, mode, crop_segs, sel, ow, oh):
     w, h = info["width"], info["height"]
-    duration = end - start
-    cut = intervals and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
-    sel = (",select='%s',setpts=N/30/TB" % select_expr(intervals)) if cut else ""
-    sub = (",ass=" + ass_name) if burn else ""
-    portrait = w / h <= 9 / 16 + 0.01
-    if mode == "blur" and not portrait:
-        vf = (
+    if mode == "blur" and w / h > ow / oh + 0.01:
+        return (
             "[0:v]fps=30" + sel + ",split=2[a][b];"
-            "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:3,eq=brightness=-0.08[bg];"
-            "[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1" + sub + "[v]"
+            "[a]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,boxblur=24:3,eq=brightness=-0.08[bg];"
+            "[b]scale=%d:%d:force_original_aspect_ratio=decrease[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1" % (ow, oh, ow, oh, ow, oh)
         )
-    else:
-        crop = crop_filter(crop_segs if mode == "auto" else None, w, h)
-        vf = "[0:v]fps=30," + crop + sel + ",scale=1080:1920,setsar=1" + sub + "[v]"
-    af = ("aselect='%s',asetpts=N/SR/TB," % select_expr(intervals)) if cut else ""
-    af += "loudnorm=I=-14:TP=-1.5:LRA=11"
+    crop = crop_filter(crop_segs if mode == "auto" else None, w, h, ow / oh)
+    return "[0:v]fps=30," + crop + sel + ",scale=%d:%d,setsar=1" % (ow, oh)
+
+
+def audio_chain(intervals, cut, enhance, music, music_volume):
+    """Voice clean-up (rumble, noise, sibilance, levelling) and optional background music that ducks under speech."""
+    a = "[0:a]aformat=sample_rates=48000:channel_layouts=stereo"
+    if cut:
+        a += ",aselect='%s',asetpts=N/SR/TB" % select_expr(intervals)
+    if enhance:
+        a += ",highpass=f=80,afftdn=nf=-25,deesser=i=0.4,acompressor=threshold=-20dB:ratio=3:attack=5:release=150"
+    if music:
+        a += (",asplit=2[vs][vm];"
+              "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=%.2f[m];"
+              "[m][vs]sidechaincompress=threshold=0.03:ratio=10:attack=15:release=400[md];"
+              "[vm][md]amix=inputs=2:duration=first:normalize=0" % (music_volume / 100))
+    return a + ",loudnorm=I=-14:TP=-1.5:LRA=11[a]"
+
+
+def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
+                size=(1080, 1920), zoom_spans_out=None, music=None):
+    ow, oh = size
+    duration = end - start
+    cut = bool(intervals) and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
+    sel = (",select='%s',setpts=N/30/TB" % select_expr(intervals)) if cut else ""
+    graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh)
+    if style.get("zoom", True) and zoom_spans_out:
+        graph += zoom_filter(zoom_spans_out, ow, oh)
+    graph += ((",ass=" + ass_name) if burn else "") + "[v]"
+    cmd = [FFMPEG, "-y", "-ss", "%.2f" % start, "-t", "%.2f" % duration, "-i", video]
+    has_audio = info.get("has_audio", True)
+    if has_audio:
+        if music:
+            cmd += ["-stream_loop", "-1", "-i", music]
+        graph += ";" + audio_chain(intervals, cut, style.get("enhance_audio", True), music,
+                                   int(style.get("music_volume", 15)))
     out = name + ".mp4"
-    run(
-        [
-            FFMPEG, "-y", "-ss", "%.2f" % start, "-t", "%.2f" % duration, "-i", video,
-            "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", "30",
-            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", af,
-            "-movflags", "+faststart", "-threads", str(THREADS), out,
-        ],
-        cwd=workdir,
-    )
-    out_len = sum(b - a for a, b in intervals) if cut else duration
-    run([FFMPEG, "-y", "-ss", "%.2f" % min(1.0, out_len / 2), "-i", out, "-frames:v", "1", "-vf", "scale=360:-2", name + ".jpg"], cwd=workdir)
-    return out_len
+    cmd += ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]", "-c:a", "aac", "-b:a", "160k", "-ar", "48000"] if has_audio else [])
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", "30",
+            "-shortest", "-movflags", "+faststart", "-threads", str(THREADS), out]
+    run(cmd, cwd=workdir)
+    return sum(b - a for a, b in intervals) if cut else duration
+
+
+def render_thumb(workdir, video_name, name, at):
+    run([FFMPEG, "-y", "-ss", "%.2f" % at, "-i", video_name, "-frames:v", "1", "-vf", "scale=360:-2", name + ".jpg"], cwd=workdir)
+
+
+def render_cover(video, info, start, rel, workdir, name, style, crop_segs, text):
+    """Cover image for the profile grid: a frame of the clip, darkened, with the title in large type."""
+    ass = name + ".ass"
+    hl = hex_to_ass(style.get("highlight", "#FFE600"))
+    with open(os.path.join(workdir, ass), "w", encoding="utf-8") as f:
+        f.write(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+            "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+            "MarginL, MarginR, MarginV, Encoding\n"
+            "Style: Cover,Montserrat,112,&H00111111,&H00111111,%s,&H00000000,-1,0,0,0,100,100,0,0,3,24,0,5,110,110,0,1\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:00.00,0:00:10.00,Cover,,0,0,0,,%s\n" % (hl, ass_escape(text.upper()))
+        )
+    at = start + rel
+    segs = [s for s in (crop_segs or []) if s[0] <= rel < s[1]] or (crop_segs or [])[:1]
+    graph = video_chain(info, style.get("mode", "auto"), segs and [(0, 999, segs[0][2])], "", 1080, 1920)
+    graph += ",eq=brightness=-0.12:saturation=1.1,ass=" + ass + "[v]"
+    run([FFMPEG, "-y", "-ss", "%.2f" % at, "-i", video, "-filter_complex", graph, "-map", "[v]", "-frames:v", "1",
+         "-q:v", "3", name + ".jpg"], cwd=workdir)
+    os.remove(os.path.join(workdir, ass))

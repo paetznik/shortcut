@@ -86,6 +86,22 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
 .hint.blue{background:#16202e;border-color:#2b4170;color:#b9d0ff}
 .log{font:12px/1.5 ui-monospace,monospace;color:var(--muted);margin-top:8px}
 .up{margin-top:14px;display:none}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.chip{font:inherit;font-size:12px;padding:4px 10px;border-radius:99px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;text-align:left}
+.chip:hover{border-color:var(--accent)}
+.words-cut{background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:8px 10px;max-height:180px;overflow:auto;line-height:1.9;font-size:14px;user-select:none}
+.wd{cursor:pointer;border-radius:4px;padding:1px 2px}
+.wd:hover{background:var(--panel2)}
+.wd.cut{text-decoration:line-through;color:var(--err);opacity:.7}
+.warn{font-size:12px;color:var(--accent2)}
+.vwrap{position:relative}
+.sz{position:absolute;display:none;pointer-events:none;background:rgba(255,61,110,.28);outline:1px dashed rgba(255,255,255,.6)}
+body.safe .sz{display:block}
+.sz-top{left:0;right:0;top:0;height:8%}
+.sz-right{right:0;top:30%;width:15%;height:52%}
+.sz-bottom{left:0;right:0;bottom:44px;height:17%}
+.mrow{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}
+.mrow audio{height:30px;flex:1;min-width:0}
 @media (max-width:600px){header{padding:12px 16px}.job{flex-wrap:wrap}.thumbs{display:none}h1{font-size:22px}}
 </style>
 </head>
@@ -120,6 +136,11 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
     <div style="grid-column:1/-1"><label>API-Adresse</label><input id="s_pz_url"></div>
     <div style="grid-column:1/-1"><label>API-Schlüssel <span id="hint_pz_key"></span></label><input id="s_pz_key" type="password" placeholder="leer lassen = unverändert" autocomplete="off"></div>
   </div>
+
+  <h3>Musikbibliothek</h3>
+  <p class="muted small" style="margin-top:0">Lizenzfreie Musik (z. B. aus der YouTube Audio Library) als MP3 hochladen. Sie wird unter die Stimme gemischt und automatisch leiser, sobald gesprochen wird.</p>
+  <div class="list" id="musicList" style="max-height:none"></div>
+  <div class="row" style="margin-top:8px"><button class="btn sm" onclick="$('musicFile').click()">Musik hochladen</button><input type="file" id="musicFile" accept="audio/*" style="display:none" onchange="uploadMusic(this.files[0])"></div>
 
   <h3>Passwort ändern</h3>
   <input id="s_new_password" type="password" placeholder="Neues Passwort (mind. 8 Zeichen)" autocomplete="new-password">
@@ -183,7 +204,7 @@ function boot(){
     loadSettings().then(route);
   });
 }
-function loadSettings(){return api("GET","/api/settings").then(function(s){S.settings=s})}
+function loadSettings(){return Promise.all([api("GET","/api/settings"),api("GET","/api/music")]).then(function(r){S.settings=r[0];S.music=r[1]})}
 
 function renderAuth(setup){
   app.innerHTML='<div class="center"><div class="card auth"><div class="logo"><i></i>ShortCut</div>'+
@@ -238,17 +259,25 @@ function renderHome(){
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
       '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
     '</div>'+
-    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
+    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
     '<details><summary>Untertitel, Hook und Qualität</summary><div class="grid">'+
-      '<div><label>Spracherkennung</label><select id="o_quality">'+opt("schnell",d.quality,"Schnell")+opt("ausgewogen",d.quality,"Ausgewogen")+opt("genau",d.quality,"Genau (langsam)")+'</select></div>'+
-      '<div><label>Hervorhebung</label><input id="o_highlight" type="color" value="'+d.highlight+'"></div>'+
+      '<div><label>Untertitel-Stil</label><select id="o_sub_style">'+opt("pop",d.sub_style,"Pop – Wort für Wort")+opt("box",d.sub_style,"Box – mit Hintergrund")+opt("minimal",d.sub_style,"Minimal")+opt("satz",d.sub_style,"Ganze Sätze")+'</select></div>'+
+      '<div><label>Hervorhebung (aktives Wort)</label><input id="o_highlight" type="color" value="'+d.highlight+'"></div>'+
+      '<div><label>Schlüsselwörter</label><input id="o_keyword_color" type="color" value="'+d.keyword_color+'"></div>'+
       '<div><label>Schriftgröße</label><input id="o_font_size" type="number" min="40" max="140" value="'+d.font_size+'"></div>'+
       '<div><label>Wörter pro Zeile</label><input id="o_words_per_line" type="number" min="1" max="6" value="'+d.words_per_line+'"></div>'+
       '<div><label>Position</label><select id="o_position">'+opt("unten",d.position,"Unteres Drittel")+opt("mitte",d.position,"Mitte")+opt("oben",d.position,"Oben")+'</select></div>'+
       '<div><label>Hook-Dauer (Sek.)</label><input id="o_hook_seconds" type="number" min="1" max="10" value="'+d.hook_seconds+'"></div>'+
+      '<div><label>Spracherkennung</label><select id="o_quality">'+opt("schnell",d.quality,"Schnell")+opt("ausgewogen",d.quality,"Ausgewogen")+opt("genau",d.quality,"Genau (langsam)")+'</select></div>'+
       '<div><label>&nbsp;</label>'+chk("o_uppercase",d.uppercase,"GROSSBUCHSTABEN")+'</div>'+
-    '</div><div style="margin-top:14px"><label>Worum geht es im Video? (optional, hilft der KI)</label><textarea id="o_context" placeholder="z. B. Podcast über Selbstständigkeit, Zielgruppe junge Gründer"></textarea></div>'+
-    '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="saveDefaults()">Als Standard speichern</button></div></details>'+
+    '</div></details>'+
+    '<details><summary>Musik und Formate</summary><div class="grid">'+
+      '<div><label>Hintergrundmusik</label><select id="o_music">'+opt("",d.music,"Keine")+(S.music||[]).map(function(m){return opt(esc(m.name),d.music,esc(m.name))}).join("")+'</select></div>'+
+      '<div><label>Musik-Lautstärke (%)</label><input id="o_music_volume" type="number" min="2" max="60" value="'+d.music_volume+'"></div>'+
+      '<div><label>Zusätzliche Formate</label>'+chk("o_fmt_4x5",d.fmt_4x5,"4:5 (Feed)")+chk("o_fmt_1x1",d.fmt_1x1,"1:1 (Quadrat)")+'</div>'+
+    '</div><p class="muted small">Musik lädst du in den <a href="#" onclick="openSettings();return false">Einstellungen</a> hoch. Sie wird automatisch leiser, sobald gesprochen wird. Jedes zusätzliche Format verlängert das Rendern.</p></details>'+
+    '<div style="margin-top:14px"><label>Worum geht es im Video? (optional, hilft der KI)</label><textarea id="o_context" placeholder="z. B. Podcast über Selbstständigkeit, Zielgruppe junge Gründer"></textarea></div>'+
+    '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="saveDefaults()">Einstellungen als Standard speichern</button></div>'+
     '</div><div class="jobs" id="jobs"></div>');
   if(S.srcTab==="file"){
     var drop=$("drop"),file=$("file");
@@ -262,8 +291,8 @@ function renderHome(){
 }
 
 function readOpts(){
-  var o={};["clips","min_len","max_len","mode","quality","highlight","font_size","words_per_line","position","hook_seconds"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review"].forEach(function(k){o[k]=$("o_"+k).checked});
+  var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume"].forEach(function(k){o[k]=$("o_"+k).value});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
@@ -327,38 +356,73 @@ function loadJob(id, quiet){
   }).catch(function(e){if(!quiet){toast(e.message);go("home")}});
 }
 
+function removedSet(i){
+  if(!S.removed) S.removed={};
+  if(!S.removed[i]) S.removed[i]=(S.job.clips[i].removed||[]).map(function(x){return x.toFixed(2)});
+  return S.removed[i];
+}
+function wordChips(c,i){
+  var cut=removedSet(i);
+  return (c.words||[]).map(function(w,k){var on=cut.indexOf(w[1].toFixed(2))>=0;return '<span class="wd'+(on?" cut":"")+'" onclick="toggleWord('+i+','+k+',event)">'+esc(w[0])+'</span>'}).join(" ");
+}
+function toggleWord(i,k,ev){
+  var c=S.job.clips[i],cut=removedSet(i),from=k;
+  if(ev.shiftKey&&S.lastWord&&S.lastWord[0]===i) from=S.lastWord[1];
+  var a=Math.min(from,k),b=Math.max(from,k),target=cut.indexOf(c.words[k][1].toFixed(2))<0;
+  for(var x=a;x<=b;x++){
+    var key=c.words[x][1].toFixed(2),pos=cut.indexOf(key);
+    if(target&&pos<0) cut.push(key); else if(!target&&pos>=0) cut.splice(pos,1);
+  }
+  S.lastWord=[i,k];
+  $("wc"+i).innerHTML=wordChips(c,i);
+  $("wn"+i).textContent=cut.length?cut.length+" Wörter werden geschnitten":"";
+}
 function editor(c,i,review){
+  var hooks=(c.hooks||[]).filter(function(h){return h});
   return '<div class="edit'+(review||S.editing[i]?" on":"")+'" id="ed'+i+'">'+
     '<div class="row" style="gap:8px;flex-wrap:nowrap"><div style="flex:1"><label>Start</label><input id="e_s'+i+'" value="'+fmt(c.start)+'"></div><div style="flex:1"><label>Ende</label><input id="e_e'+i+'" value="'+fmt(c.end)+'"></div></div>'+
     '<div><label>Titel</label><input id="e_t'+i+'" value="'+esc(c.title)+'"></div>'+
-    '<div><label>Hook-Text (erste Sekunden)</label><input id="e_h'+i+'" value="'+esc(c.hook_text==null?c.title:c.hook_text)+'"></div>'+
+    '<div><label>Hook-Text (erste Sekunden)</label><input id="e_h'+i+'" value="'+esc(c.hook_text==null?c.title:c.hook_text)+'">'+
+      (hooks.length>1?'<div class="chips">'+hooks.map(function(h,k){return '<button class="chip" onclick="$(\'e_h'+i+'\').value=S.job.clips['+i+'].hooks['+k+']">'+esc(h)+'</button>'}).join("")+'</div>':'')+
+      (!review?'<button class="btn sm ghost" style="margin-top:6px" onclick="duplicateClip('+i+')">Mit diesem Hook als Variante B rendern</button>':'')+'</div>'+
+    '<div><label>Text auf dem Titelbild</label><input id="e_cv'+i+'" value="'+esc(c.cover_text==null?c.title:c.cover_text)+'"></div>'+
+    '<div><label>Schlüsselwörter (farbig, mit Komma getrennt)</label><input id="e_k'+i+'" value="'+esc((c.keywords||[]).join(", "))+'"></div>'+
+    '<div><label>Schneiden: Wörter anklicken, die raus sollen (Umschalt-Klick markiert einen Bereich)</label><div class="words-cut" id="wc'+i+'">'+wordChips(c,i)+'</div><div class="muted small" id="wn'+i+'">'+(removedSet(i).length?removedSet(i).length+" Wörter werden geschnitten":"")+'</div></div>'+
     '<div><label>Untertitel – Tippfehler hier korrigieren</label><textarea class="words" id="e_w'+i+'">'+esc(c.text||"")+'</textarea></div>'+
     '<div><label>Beschreibung für Social Media</label><textarea id="e_c'+i+'">'+esc(c.caption||"")+'</textarea></div>'+
     '<div class="muted small">Zeiten als Minuten:Sekunden, z. B. 3:12.5. Bei geänderten Zeiten passen sich die Untertitel an.</div>'+
     '<button class="btn sm primary" onclick="saveClip('+i+')">'+(review?"Speichern":"Speichern und neu rendern")+'</button></div>';
 }
-
+function lengthNote(sec){
+  if(sec>180) return '<span class="warn">zu lang für Shorts/Reels (max. 3 min)</span>';
+  if(sec>90) return '<span class="warn">lang – unter 90 s läuft meist besser</span>';
+  return '';
+}
 function renderJob(){
   var j=S.job,running=isRunning(j),review=j.status==="prüfen";
   var html='<div class="row" style="justify-content:space-between;margin-bottom:6px"><button class="btn ghost sm" onclick="go(\'home\')">← Alle Projekte</button>'+
-    '<button class="btn sm danger" onclick="delJob()">Projekt löschen</button></div>'+
+    '<div class="row" style="gap:8px"><label class="chk small"><input type="checkbox" id="safeToggle"'+(S.safe?" checked":"")+' onchange="S.safe=this.checked;document.body.classList.toggle(\'safe\',S.safe)">Sicherheitszonen zeigen</label>'+
+    '<button class="btn sm danger" onclick="delJob()">Projekt löschen</button></div></div>'+
     '<h1 style="word-break:break-word">'+esc(j.name)+'</h1><div class="row muted small">'+statusPill(j)+'<span>'+esc(j.message)+'</span>'+
     (j.info?'<span>· '+fmt(j.info.duration)+' · '+j.info.width+'×'+j.info.height+'</span>':'')+
     (j.selector?'<span>· Auswahl: '+(j.selector==="claude"?"Claude KI":"Automatik")+'</span>':'')+'</div>';
   if(running) html+='<div class="bar" style="height:8px;margin-top:12px"><i style="width:'+j.progress+'%"></i></div>';
   if(running||j.status==="fertig") html+='<div class="log">'+(j.log||[]).map(esc).join("<br>")+'</div>';
   if(j.status==="fehler") html+='<div class="hint" style="margin-top:14px;background:#2a1616;border-color:#5a2525;color:#ffb3b3">'+esc(j.message)+'</div>';
-  if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Titel, Hook-Text und Untertitel jedes Clips. Korrigiere Tippfehler direkt im Text, dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
+  if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Hook, Titelbild-Text und Untertitel jedes Clips. Wörter anklicken schneidet sie heraus, Tippfehler korrigierst du im Textfeld. Dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
   html+='<div class="clips">'+(j.clips||[]).map(function(c,i){
     var done=c.file&&c.status==="fertig";
-    var media=done?'<video src="/files/'+j.id+'/'+c.file+'" poster="/files/'+j.id+'/'+c.thumb+'" controls preload="none" playsinline></video>':
+    var media=done?'<div class="vwrap"><video src="/files/'+j.id+'/'+c.file+'" poster="/files/'+j.id+'/'+c.thumb+'" controls preload="none" playsinline></video><div class="sz sz-top"></div><div class="sz sz-right"></div><div class="sz sz-bottom"></div></div>':
       (review?'':'<div class="ph">'+(c.status==="wartet"&&running?"wird gerendert …":"–")+'</div>');
+    var outLen=c.duration_out||(c.end-c.start);
     var len=c.duration_out?Math.round(c.duration_out)+' s'+(c.duration_out<c.end-c.start-0.5?' (von '+Math.round(c.end-c.start)+' s)':''):Math.round(c.end-c.start)+' s';
     var pz=c.postiz?'<div class="tag">✓ An Postiz gesendet'+(c.postiz.now?' (sofort)':' – geplant für '+new Date(c.postiz.date*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"}))+(c.postiz.channels&&c.postiz.channels.length?': '+esc(c.postiz.channels.join(", ")):'')+'</div>':'';
-    return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
-      '<div class="ti">'+esc(c.title)+'</div>'+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
+    var f=c.formats||{},dl=function(file,label,cls){return '<a class="btn sm'+(cls||"")+'" href="/files/'+j.id+'/'+file+'?dl=1">'+label+'</a>'};
+    return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+(c.variant_of!=null?' · Variante von Clip '+(c.variant_of+1):'')+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
+      lengthNote(outLen)+
+      '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
       (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+pz+
-      (done&&!review?'<div class="row" style="margin-top:auto;gap:8px"><a class="btn sm primary" href="/files/'+j.id+'/'+c.file+'?dl=1">MP4 laden</a><a class="btn sm" href="/files/'+j.id+'/'+c.srt+'?dl=1">SRT</a>'+
+      (done&&!review?'<div class="row" style="margin-top:auto;gap:8px">'+dl(c.file,"MP4 9:16"," primary")+(f["4x5"]?dl(f["4x5"],"4:5"):'')+(f["1x1"]?dl(f["1x1"],"1:1"):'')+(c.cover?dl(c.cover,"Titelbild"):'')+dl(c.srt,"SRT")+
         '<button class="btn sm" onclick="openPostiz('+i+')">An Postiz</button>'+
         (c.caption?'<button class="btn sm ghost" onclick="copyCap('+i+')">Text kopieren</button>':'')+'<button class="btn sm ghost" onclick="toggleEdit('+i+')">Anpassen</button></div>':'')+
       ((done||review)?editor(c,i,review):'')+
@@ -372,24 +436,31 @@ function renderJob(){
 }
 function toggleEdit(i){S.editing[i]=!S.editing[i];$("ed"+i).classList.toggle("on")}
 function copyCap(i){var c=S.job.clips[i];navigator.clipboard.writeText(c.title+"\n\n"+c.caption).then(function(){toast("Kopiert")})}
+function clipBody(i){
+  return {start:parseT($("e_s"+i).value),end:parseT($("e_e"+i).value),title:$("e_t"+i).value,hook_text:$("e_h"+i).value,
+    cover_text:$("e_cv"+i).value,keywords:$("e_k"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value,
+    removed:removedSet(i).map(parseFloat)};
+}
 function saveClip(i){
-  var s=parseT($("e_s"+i).value),e=parseT($("e_e"+i).value);
-  if(isNaN(s)||isNaN(e)) return toast("Ungültige Zeit");
-  var body={start:s,end:e,title:$("e_t"+i).value,hook_text:$("e_h"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value};
+  var body=clipBody(i);
+  if(isNaN(body.start)||isNaN(body.end)) return toast("Ungültige Zeit");
   var review=S.job.status==="prüfen";
   if(!review) S.editing[i]=false;
-  document.activeElement.blur();
-  api("POST","/api/jobs/"+S.job.id+"/clips/"+i,body).then(function(j){S.job=j;renderJob();toast(review?"Gespeichert":"Clip wird neu gerendert")}).catch(function(err){toast(err.message)});
+  if(document.activeElement) document.activeElement.blur();
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+i,body).then(function(j){S.job=j;S.removed={};renderJob();toast(review?"Gespeichert":"Clip wird neu gerendert")}).catch(function(err){toast(err.message)});
+}
+function duplicateClip(i){
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+i+"/duplicate",{hook_text:$("e_h"+i).value}).then(function(j){S.job=j;renderJob();toast("Variante B wird gerendert")}).catch(function(e){toast(e.message)});
 }
 function renderAll(){
   // save open edits first so nothing typed is lost
   var chain=Promise.resolve();
   S.job.clips.forEach(function(c,i){
     if(!$("e_s"+i)) return;
-    var body={start:parseT($("e_s"+i).value),end:parseT($("e_e"+i).value),title:$("e_t"+i).value,hook_text:$("e_h"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value};
+    var body=clipBody(i);
     chain=chain.then(function(){return api("POST","/api/jobs/"+S.job.id+"/clips/"+i,body)});
   });
-  chain.then(function(){return api("POST","/api/jobs/"+S.job.id+"/render")}).then(function(j){S.job=j;renderJob();toast("Rendern gestartet")}).catch(function(e){toast(e.message)});
+  chain.then(function(){return api("POST","/api/jobs/"+S.job.id+"/render")}).then(function(j){S.job=j;S.removed={};renderJob();toast("Rendern gestartet")}).catch(function(e){toast(e.message)});
 }
 function delJob(){if(!confirm("Projekt mit allen Clips löschen?")) return;api("DELETE","/api/jobs/"+S.job.id).then(function(){toast("Gelöscht");go("home")})}
 
@@ -427,7 +498,22 @@ function openSettings(){
   SECRETS.forEach(function(k){$("s_"+k).value="";$("hint_"+k).textContent=s["has_"+k]?"(hinterlegt)":"(nicht hinterlegt)"});
   TEXTS.forEach(function(k){$("s_"+k).value=s[k]||""});
   $("s_nc_export").checked=!!s.nc_export;$("s_new_password").value="";$("sErr").textContent="";
+  renderMusic();
   $("settingsModal").classList.add("on");
+}
+function renderMusic(){
+  $("musicList").innerHTML=(S.music||[]).length?S.music.map(function(m,k){return '<div class="mrow"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%">'+esc(m.name)+'</span><audio controls preload="none" src="/music/'+encodeURIComponent(m.name)+'"></audio><button class="btn sm danger" onclick="deleteMusic('+k+')">Löschen</button></div>'}).join(""):'<span class="muted small">Noch keine Musik hochgeladen.</span>';
+}
+function uploadMusic(f){
+  if(!f) return;
+  if(f.size>40*1024*1024) return toast("Musikdatei ist zu groß (max. 40 MB)");
+  toast("Lade Musik hoch …");
+  fetch("/api/music?name="+encodeURIComponent(f.name),{method:"PUT",body:f,credentials:"same-origin"}).then(function(r){return r.json().then(function(j){if(!r.ok) throw new Error(j.detail||"Fehler");})})
+    .then(loadSettings).then(function(){renderMusic();toast("Musik hochgeladen");$("musicFile").value=""}).catch(function(e){toast(e.message)});
+}
+function deleteMusic(k){
+  var m=S.music[k];if(!confirm("„"+m.name+"“ löschen?")) return;
+  api("DELETE","/api/music/"+encodeURIComponent(m.name)).then(loadSettings).then(function(){renderMusic();toast("Gelöscht")});
 }
 function saveSettings(){
   var b={nc_export:$("s_nc_export").checked};

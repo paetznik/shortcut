@@ -22,16 +22,20 @@ import pipeline
 DATA = os.environ.get("DATA_DIR", "/data")
 JOBS = os.path.join(DATA, "jobs")
 UPLOADS = os.path.join(DATA, "uploads")
+MUSIC = os.path.join(DATA, "music")
 CONFIG = os.path.join(DATA, "config.json")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "14"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(JOBS, exist_ok=True)
 os.makedirs(UPLOADS, exist_ok=True)
+os.makedirs(MUSIC, exist_ok=True)
 
 DEFAULTS = {
     "clips": 5, "min_len": 20, "max_len": 60, "mode": "auto", "quality": "ausgewogen",
     "highlight": "#FFE600", "uppercase": True, "font_size": 78, "position": "unten", "words_per_line": 3,
     "remove_pauses": True, "hook": True, "hook_seconds": 3, "review": False,
+    "sub_style": "pop", "keyword_color": "#4ADE80", "zoom": True, "enhance_audio": True, "music": "", "music_volume": 15,
+    "fmt_4x5": False, "fmt_1x1": False, "cover": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -206,8 +210,15 @@ def clean_settings(s):
         out["mode"] = "auto"
     if out["quality"] not in pipeline.WHISPER_PRESETS:
         out["quality"] = "ausgewogen"
-    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", out["highlight"]):
-        out["highlight"] = DEFAULTS["highlight"]
+    for k in ("highlight", "keyword_color"):
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", out[k]):
+            out[k] = DEFAULTS[k]
+    if out["sub_style"] not in pipeline.SUB_STYLES:
+        out["sub_style"] = "pop"
+    out["music_volume"] = max(2, min(60, out["music_volume"]))
+    if out["music"] and not os.path.isfile(os.path.join(MUSIC, os.path.basename(out["music"]))):
+        out["music"] = ""
+    out["music"] = os.path.basename(out["music"])
     return out
 
 
@@ -251,8 +262,11 @@ def public_job(job, with_text=False):
     if with_text and job.get("clips"):
         segments = load_transcript(job["id"])
         if segments:
-            out["clips"] = [dict(c, text=" ".join(w["w"] for w in pipeline.clip_words(segments, c["start"], c["end"])))
-                            for c in job["clips"]]
+            words = pipeline.all_words(segments)
+            out["clips"] = []
+            for c in job["clips"]:
+                cw = [w for w in words if w["e"] > c["start"] and w["s"] < c["end"]]
+                out["clips"].append(dict(c, text=" ".join(w["w"] for w in cw), words=[[w["w"], w["s"]] for w in cw]))
     return out
 
 
@@ -403,9 +417,18 @@ async def edit_clip(jid: str, idx: int, request: Request):
                 save_transcript(jid, pipeline.replace_words(segments, clip["start"], clip["end"],
                                                             pipeline.realign(old, new_text)))
         clip.update({"start": round(s, 2), "end": round(e, 2)})
-        for k in ("title", "hook_text", "caption"):
+        for k in ("title", "hook_text", "caption", "cover_text"):
             if k in body:
                 clip[k] = str(body[k])[:2000]
+        if "keywords" in body:
+            kw = body["keywords"]
+            kw = kw.split(",") if isinstance(kw, str) else kw
+            clip["keywords"] = [str(k).strip() for k in kw if str(k).strip()][:12]
+        if "removed" in body:
+            try:
+                clip["removed"] = sorted({round(float(x), 2) for x in body["removed"]})[:2000]
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Ungültige Wortauswahl")
         if "style" in body:
             job["settings"] = clean_settings({**job["settings"], **body["style"]})
         if job["status"] != "prüfen":
@@ -413,6 +436,31 @@ async def edit_clip(jid: str, idx: int, request: Request):
             job["status"] = "wartet"
             job["message"] = "Clip %d wird neu gerendert" % (idx + 1)
             work.put(("render", jid, idx))
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.post("/api/jobs/{jid}/clips/{idx}/duplicate")
+async def duplicate_clip(jid: str, idx: int, request: Request):
+    """Second version of a clip with another hook text, e.g. to compare two hooks (A/B)."""
+    require_auth(request)
+    body = await request.json()
+    with lock:
+        job = load_job(jid)
+        if job["status"] not in ("fertig", "fehler", "prüfen") or idx >= len(job["clips"]):
+            raise HTTPException(400, "Clip kann gerade nicht kopiert werden")
+        if len(job["clips"]) >= 30:
+            raise HTTPException(400, "Zu viele Clips in diesem Projekt")
+        src = job["clips"][idx]
+        copy = {k: v for k, v in src.items() if k not in ("file", "thumb", "srt", "cover", "formats", "version", "postiz")}
+        copy["hook_text"] = str(body.get("hook_text") or src.get("hook_text", ""))[:300]
+        copy["variant_of"] = idx
+        copy["status"] = "entwurf" if job["status"] == "prüfen" else "wartet"
+        job["clips"].append(copy)
+        new = len(job["clips"]) - 1
+        if job["status"] != "prüfen":
+            job["status"], job["message"] = "wartet", "Variante wird gerendert"
+            work.put(("render", jid, new))
         save_job(job)
     return public_job(job, with_text=True)
 
@@ -474,10 +522,59 @@ async def send_to_postiz(jid: str, idx: int, request: Request):
     return {"ok": True}
 
 
+def music_path(name):
+    name = os.path.basename(name)
+    if not re.fullmatch(r"[\w\-. äöüÄÖÜß()]{1,100}\.(mp3|m4a|wav|ogg|aac)", name, re.I):
+        raise HTTPException(400, "Bitte eine Audiodatei (MP3, M4A, WAV, OGG) wählen.")
+    return os.path.join(MUSIC, name)
+
+
+@app.get("/api/music")
+def list_music(request: Request):
+    require_auth(request)
+    return [{"name": n, "size": os.path.getsize(os.path.join(MUSIC, n))}
+            for n in sorted(os.listdir(MUSIC)) if not n.endswith(".part")]
+
+
+@app.put("/api/music")
+async def upload_music(request: Request, name: str = ""):
+    require_auth(request)
+    path = music_path(name)
+    size = 0
+    with open(path + ".part", "wb") as f:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 40 << 20:
+                f.close()
+                os.remove(path + ".part")
+                raise HTTPException(400, "Musikdatei ist zu groß (max. 40 MB).")
+            f.write(chunk)
+    os.replace(path + ".part", path)
+    return {"ok": True}
+
+
+@app.delete("/api/music/{name}")
+def delete_music(name: str, request: Request):
+    require_auth(request)
+    path = music_path(name)
+    if os.path.exists(path):
+        os.remove(path)
+    return {"ok": True}
+
+
+@app.get("/music/{name}")
+def get_music(name: str, request: Request):
+    require_auth(request)
+    path = music_path(name)
+    if not os.path.exists(path):
+        raise HTTPException(404, "Unbekannt")
+    return FileResponse(path)
+
+
 @app.get("/files/{jid}/{name}")
 def get_file(jid: str, name: str, request: Request, dl: int = 0):
     require_auth(request)
-    if not re.fullmatch(r"clip\d{1,2}(_v\d+)?\.(mp4|jpg|srt)", name):
+    if not re.fullmatch(r"clip\d{1,2}(_v\d+)?(_4x5|_1x1|_cover)?\.(mp4|jpg|srt)", name):
         raise HTTPException(404, "Unbekannt")
     path = os.path.join(job_dir(jid), name)
     if not os.path.exists(path):
@@ -516,43 +613,69 @@ def log(jid, msg):
         save_job(job)
 
 
+FORMATS = {"4x5": (1080, 1350), "1x1": (1080, 1080)}
+
+
+def clip_files(clip):
+    """Every file that belongs to the current version of a clip."""
+    files = [clip.get(k) for k in ("file", "thumb", "srt", "cover")]
+    files += list((clip.get("formats") or {}).values())
+    return [f for f in files if f]
+
+
 def render_one(jid, idx, info):
-    """Render one clip: subtitles, speaker framing, pause cuts and the hook text."""
+    """Render one clip: speaker framing, cuts (pauses, fillers, struck-out words), zooms, subtitles, hook, audio,
+    extra formats and the cover image."""
     d = os.path.join(JOBS, jid)
     job = load_job(jid)
     clip = job["clips"][idx]
     s = job["settings"]
+    src = os.path.join(d, job["source"])
     segments = load_transcript(jid)
     version = clip.get("version", 0) + 1
     name = "clip%02d" % (idx + 1) + ("_v%d" % version if version > 1 else "")
     duration = clip["end"] - clip["start"]
     words = pipeline.clip_words(segments, clip["start"], clip["end"])
-    intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True))
+    removed = [r - clip["start"] for r in clip.get("removed", [])]
+    intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True), removed)
     out_words = pipeline.remap_words(words, intervals)
     out_len = sum(b - a for a, b in intervals)
-    ass = name + ".ass"
-    burn = pipeline.write_subtitles(out_words, os.path.join(d, ass), os.path.join(d, name + ".srt"), s,
-                                    clip.get("hook_text", clip.get("title", "")), out_len)
-    crop_segs = None
-    if s.get("mode") == "auto":
-        crop_segs = pipeline.track_speaker(os.path.join(d, job["source"]), info, clip["start"], clip["end"])
-    out_len = pipeline.render_clip(os.path.join(d, job["source"]), info, clip["start"], clip["end"], d, name,
-                                   s["mode"], ass, burn, intervals, crop_segs)
-    for old in (clip.get("file"), clip.get("thumb"), clip.get("srt")):
-        if old and old.split(".")[0] != name:
+    zooms = pipeline.zoom_spans(out_words, intervals, out_len) if s.get("zoom", True) else None
+    crop_segs = pipeline.track_speaker(src, info, clip["start"], clip["end"]) if s.get("mode") == "auto" else None
+    music = os.path.join(MUSIC, s["music"]) if s.get("music") and os.path.exists(os.path.join(MUSIC, s["music"])) else None
+    hook = clip.get("hook_text", clip.get("title", ""))
+    keywords = clip.get("keywords", [])
+
+    outputs = {}
+    for fmt, size in [("9x16", (1080, 1920))] + [(f, FORMATS[f]) for f in FORMATS if s.get("fmt_" + f)]:
+        base = name if fmt == "9x16" else name + "_" + fmt
+        ass = base + ".ass"
+        burn = pipeline.write_subtitles(out_words, os.path.join(d, ass), os.path.join(d, name + ".srt") if fmt == "9x16" else None,
+                                        s, hook, out_len, keywords, size)
+        out_len = pipeline.render_clip(src, info, clip["start"], clip["end"], d, base, s, ass, burn, intervals, crop_segs,
+                                       size, zooms, music)
+        os.remove(os.path.join(d, ass))
+        outputs[fmt] = base + ".mp4"
+    pipeline.render_thumb(d, name + ".mp4", name, min(1.0, out_len / 2))
+    cover = None
+    if s.get("cover", True):
+        pipeline.render_cover(src, info, clip["start"], min(duration / 2, 1.5), d, name + "_cover", s, crop_segs,
+                              clip.get("cover_text") or clip.get("title", ""))
+        cover = name + "_cover.jpg"
+
+    keep = {name + ".mp4", name + ".jpg", name + ".srt", cover} | set(outputs.values())
+    for old in clip_files(clip):
+        if old not in keep:
             try:
                 os.remove(os.path.join(d, old))
             except OSError:
                 pass
-    try:
-        os.remove(os.path.join(d, ass))
-    except OSError:
-        pass
     with lock:
         job = load_job(jid)
         job["clips"][idx].update({
-            "file": name + ".mp4", "thumb": name + ".jpg", "srt": name + ".srt", "version": version,
-            "status": "fertig", "duration_out": round(out_len, 1), "speakers": len({x for _, _, x in crop_segs or []}),
+            "file": outputs["9x16"], "thumb": name + ".jpg", "srt": name + ".srt", "cover": cover,
+            "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "version": version, "status": "fertig",
+            "duration_out": round(out_len, 1), "speakers": len({x for _, _, x in crop_segs or []}),
         })
         save_job(job)
     export_clip(jid, idx)
@@ -568,8 +691,9 @@ def export_clip(jid, idx):
         nc = integrations.Nextcloud(cfg)
         folder = "Shorts/" + re.sub(r"[^\w\- ]+", "_", os.path.splitext(job["name"])[0])[:60].strip()
         nc.mkdirs(folder)
-        for k in ("file", "srt"):
-            nc.upload(folder + "/" + clip[k], os.path.join(JOBS, jid, clip[k]))
+        for f in clip_files(clip):
+            if f != clip.get("thumb"):
+                nc.upload(folder + "/" + f, os.path.join(JOBS, jid, f))
         log(jid, "Clip %d in Nextcloud gespeichert (%s/%s)" % (idx + 1, nc.folder, folder))
     except Exception as e:
         log(jid, "Nextcloud-Export fehlgeschlagen: " + str(e)[:200])
@@ -631,6 +755,7 @@ def process(jid):
     for c in clips:
         c["status"] = "entwurf" if s.get("review") else "wartet"
         c["hook_text"] = c.get("title", "")
+        c["cover_text"] = c.get("title", "")
     update(jid, clips=clips, selector=source)
     log(jid, "%d Highlights gefunden (%s)" % (len(clips), "Claude KI" if source == "claude" else "Automatik"))
     if s.get("review"):
