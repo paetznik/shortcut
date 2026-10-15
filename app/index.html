@@ -223,8 +223,6 @@ function renderHome(){
   var src={
     file:'<div class="drop" id="drop"><b>Video hierher ziehen oder klicken</b><div class="muted small">MP4, MOV, MKV, WebM, beliebige Länge</div></div><input type="file" id="file" accept="video/*,.mkv" style="display:none">'+
       '<div class="up" id="up"><div class="row" style="justify-content:space-between"><span id="upName"></span><span class="muted small" id="upPct"></span></div><div class="bar"><i id="upBar" style="width:0"></i></div></div>',
-    yt:'<div class="row" style="flex-wrap:nowrap"><input id="ytUrl" placeholder="https://www.youtube.com/watch?v=…"><button class="btn primary" onclick="importYoutube()">Laden</button></div>'+
-      '<p class="muted small">Nur für eigene Videos oder Videos, an denen du die Rechte hast. YouTube blockiert Downloads von Servern manchmal – dann bitte die Datei hochladen.</p>',
     nc:'<div class="row"><button class="btn primary" onclick="openNextcloud()">Video aus Nextcloud wählen</button><span class="muted small">Ordner „'+esc(S.settings.nc_folder||"ShortCut")+'“ in '+esc(S.settings.nc_url||"Nextcloud")+'</span></div>'+
       (!S.settings.has_nc_pass?'<p class="muted small">Noch nicht eingerichtet – trage Benutzer und App-Passwort in den <a href="#" onclick="openSettings();return false">Einstellungen</a> ein.</p>':'')
   };
@@ -232,7 +230,7 @@ function renderHome(){
     (!S.settings.has_anthropic_key?'<div class="hint">Tipp: Hinterlege in den <a href="#" onclick="openSettings();return false">Einstellungen</a> einen Claude-API-Schlüssel. Dann wählt eine KI die Highlights inhaltlich aus und schreibt Titel und Beschreibungen.</div>':'')+
     '<h1>Aus langen Videos werden Shorts</h1><p class="muted" style="margin-top:0">Die App transkribiert dein Video auf Deutsch, sucht die stärksten Momente und schneidet Clips im Hochformat 9:16 mit animierten Untertiteln.</p>'+
     '<div class="card"><div class="tabs">'+
-      ['file','yt','nc'].map(function(k){return '<button class="tab'+(S.srcTab===k?" on":"")+'" onclick="S.srcTab=\''+k+'\';renderHome()">'+{file:"Datei hochladen",yt:"YouTube-Link",nc:"Aus Nextcloud"}[k]+'</button>'}).join("")+
+      ['file','nc'].map(function(k){return '<button class="tab'+(S.srcTab===k?" on":"")+'" onclick="S.srcTab=\''+k+'\';renderHome()">'+{file:"Datei hochladen",nc:"Aus Nextcloud"}[k]+'</button>'}).join("")+
     '</div>'+src[S.srcTab]+
     '<div class="grid">'+
       '<div><label>Anzahl Clips</label><input id="o_clips" type="number" min="1" max="15" value="'+d.clips+'"></div>'+
@@ -297,11 +295,6 @@ function upload(f){
       api("POST","/api/jobs",meta).then(function(j){S.uploading=false;toast("Upload fertig, Verarbeitung startet");go("job",j.id)}).catch(function(e){fail(e.message)});
     },fail);
   }).catch(function(e){fail(e.message)});
-}
-function importYoutube(){
-  var meta=jobMeta();meta.url=$("ytUrl").value.trim();
-  if(!meta.url) return toast("Bitte einen YouTube-Link einfügen");
-  api("POST","/api/import/youtube",meta).then(function(j){toast("Video wird geladen");go("job",j.id)}).catch(function(e){toast(e.message)});
 }
 function openNextcloud(){
   $("ncInfo").textContent="Lade Dateiliste …";$("ncList").innerHTML="";$("ncModal").classList.add("on");

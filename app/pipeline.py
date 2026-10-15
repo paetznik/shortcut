@@ -4,7 +4,6 @@ import json
 import os
 import re
 import subprocess
-import time
 
 import httpx
 
@@ -568,41 +567,3 @@ def render_clip(video, info, start, end, workdir, name, mode, ass_name, burn, in
     out_len = sum(b - a for a, b in intervals) if cut else duration
     run([FFMPEG, "-y", "-ss", "%.2f" % min(1.0, out_len / 2), "-i", out, "-frames:v", "1", "-vf", "scale=360:-2", name + ".jpg"], cwd=workdir)
     return out_len
-
-
-# ---------------------------------------------------------------- downloads
-
-def download_youtube(url, workdir, progress):
-    import yt_dlp
-
-    state = {"last": 0}
-
-    def hook(d):
-        if d.get("status") == "downloading" and time.time() - state["last"] > 2:
-            state["last"] = time.time()
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            pct = d.get("downloaded_bytes", 0) / total * 100 if total else None
-            progress(pct, "Lade Video von YouTube … " + (("%d %%" % pct) if pct is not None else ""))
-
-    opts = {
-        "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
-        "outtmpl": os.path.join(workdir, "source.%(ext)s"),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [hook],
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as e:
-        msg = str(e)
-        if "confirm you" in msg or "bot" in msg.lower() or "429" in msg:
-            raise RuntimeError("YouTube blockiert gerade Downloads von diesem Server. Bitte lade das Video selbst "
-                               "herunter und lade es hoch oder lege es in Nextcloud ab.")
-        raise RuntimeError("YouTube-Download fehlgeschlagen: " + re.sub(r"\x1b\[[0-9;]*m", "", msg)[:300])
-    files = [f for f in os.listdir(workdir) if f.startswith("source.")]
-    if not files:
-        raise RuntimeError("YouTube-Download fehlgeschlagen: keine Datei erhalten.")
-    return files[0], (info or {}).get("title") or "YouTube-Video"

@@ -4,7 +4,7 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 
 ## Ablauf
 
-1. Video holen: Upload im Browser (in 8-MB-Stücken, daher auch große Dateien), YouTube-Link (nur eigene Videos; YouTube blockiert Server-IPs zeitweise) oder Datei aus einem Nextcloud-Ordner.
+1. Video holen: Upload im Browser (in 8-MB-Stücken, daher auch große Dateien) oder Datei aus einem Nextcloud-Ordner.
 2. Transkription auf Deutsch mit [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (lokal, CPU). Eine Liste mit Fachbegriffen und Namen in den Einstellungen verbessert die Schreibweise.
 3. Highlight-Auswahl:
    - mit Anthropic-API-Schlüssel (in den Einstellungen hinterlegen): Claude wählt die Ausschnitte und schreibt Titel und Beschreibungen,

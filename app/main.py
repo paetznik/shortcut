@@ -344,18 +344,6 @@ async def create_job(request: Request):
     return public_job(job)
 
 
-@app.post("/api/import/youtube")
-async def import_youtube(request: Request):
-    require_auth(request)
-    body = await request.json()
-    url = str(body.get("url") or "").strip()
-    if not re.match(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", url):
-        raise HTTPException(400, "Bitte einen gültigen YouTube-Link einfügen.")
-    job = new_job("YouTube-Video", clean_settings(body.get("settings")), str(body.get("context") or "")[:1000],
-                  None, {"type": "youtube", "url": url})
-    return public_job(job)
-
-
 @app.get("/api/nextcloud/files")
 def nextcloud_files(request: Request):
     require_auth(request)
@@ -588,17 +576,13 @@ def export_clip(jid, idx):
 
 
 def fetch_source(jid, job):
-    """Download the video for imported jobs (YouTube link or Nextcloud file)."""
+    """Download the video for jobs imported from Nextcloud."""
     d = os.path.join(JOBS, jid)
     remote = job.get("remote") or {}
 
     def prog(p, msg):
         update(jid, message=msg, **({"progress": round(p * 0.03, 1)} if p is not None else {}))
 
-    if remote.get("type") == "youtube":
-        update(jid, message="Lade Video von YouTube …")
-        src, title = pipeline.download_youtube(remote["url"], d, prog)
-        return update(jid, source=src, name=title[:120], size=os.path.getsize(os.path.join(d, src)))
     if remote.get("type") == "nextcloud":
         update(jid, message="Lade Video aus Nextcloud …")
         src = source_name(remote["name"])
