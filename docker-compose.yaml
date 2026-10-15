@@ -1,0 +1,20 @@
+services:
+  shortcut:
+    build:
+      context: https://github.com/paetznik/shortcut.git#master
+    image: shortcut-app:latest
+    pull_policy: build
+    restart: unless-stopped
+    volumes:
+      - data:/data
+      - models:/models
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.shortcut.rule=Host(`shorts.paetze.digital`)
+      - traefik.http.routers.shortcut.entrypoints=websecure
+      - traefik.http.routers.shortcut.tls.certresolver=letsencrypt
+      - traefik.http.services.shortcut.loadbalancer.server.port=8000
+
+volumes:
+  data:
+  models:
