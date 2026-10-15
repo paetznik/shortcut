@@ -19,27 +19,33 @@ main{max-width:1180px;margin:0 auto;padding:24px 16px 80px}
 .btn{border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:9px 16px;border-radius:10px;font:inherit;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;text-decoration:none;white-space:nowrap}
 .btn:hover{border-color:#3a4150}
 .btn.primary{background:linear-gradient(135deg,var(--accent),#ff6a4d);border:0;color:#fff}
-.btn.primary:disabled{opacity:.5;cursor:not-allowed}
+.btn:disabled{opacity:.5;cursor:not-allowed}
 .btn.ghost{background:transparent}
 .btn.sm{padding:6px 11px;font-size:13px}
 .btn.danger:hover{border-color:var(--err);color:var(--err)}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:20px}
 h1{font-size:26px;letter-spacing:-.02em;margin:0 0 4px}
 h2{font-size:18px;margin:0 0 14px}
+h3{font-size:15px;margin:22px 0 8px}
 .muted{color:var(--muted)}
 .small{font-size:13px}
+.tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.tab{padding:7px 14px;border-radius:99px;border:1px solid var(--line);background:transparent;color:var(--muted);font:inherit;font-weight:600;cursor:pointer}
+.tab.on{background:var(--panel2);color:var(--text);border-color:#3a4150}
 .drop{border:2px dashed #353b48;border-radius:var(--r);padding:38px 20px;text-align:center;cursor:pointer;transition:.15s;background:var(--panel2)}
 .drop:hover,.drop.over{border-color:var(--accent);background:#241c22}
 .drop b{font-size:17px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-top:18px}
 label{display:block;font-size:13px;color:var(--muted);margin-bottom:5px;font-weight:600}
+label.chk{display:flex;align-items:center;color:var(--text);font-weight:500;font-size:14px;margin:0}
 input,select,textarea{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:9px;padding:9px 11px;font:inherit}
 input[type=color]{padding:3px;height:40px}
-input[type=checkbox]{width:auto;margin-right:6px}
+input[type=checkbox],input[type=radio]{width:auto;margin:0 8px 0 0;accent-color:var(--accent)}
 textarea{resize:vertical;min-height:60px}
 input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
 details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16px}
 .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.toggles{display:flex;gap:10px 22px;flex-wrap:wrap;margin-top:16px}
 .jobs{display:flex;flex-direction:column;gap:10px;margin-top:28px}
 .job{display:flex;gap:16px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;cursor:pointer}
 .job:hover{border-color:#3a4150}
@@ -50,27 +56,34 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
 .bar{height:6px;background:var(--panel2);border-radius:9px;overflow:hidden;margin-top:7px}
 .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .5s}
 .pill{font-size:12px;font-weight:700;padding:3px 9px;border-radius:99px;background:var(--panel2);border:1px solid var(--line);white-space:nowrap}
-.pill.ok{color:var(--ok);border-color:#1f5a44}.pill.err{color:var(--err);border-color:#5a2525}.pill.run{color:var(--accent2);border-color:#5a4520}
-.clips{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:18px;margin-top:20px}
+.pill.ok{color:var(--ok);border-color:#1f5a44}.pill.err{color:var(--err);border-color:#5a2525}.pill.run{color:var(--accent2);border-color:#5a4520}.pill.rev{color:#8ab4ff;border-color:#2b4170}
+.clips{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:18px;margin-top:20px}
 .clip{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column}
 .clip video{width:100%;aspect-ratio:9/16;background:#000;display:block}
-.clip .ph{aspect-ratio:9/16;display:grid;place-items:center;background:#000;color:var(--muted)}
+.clip .ph{aspect-ratio:9/16;display:grid;place-items:center;background:#000;color:var(--muted);text-align:center;padding:20px}
 .clip .b{padding:14px;display:flex;flex-direction:column;gap:8px;flex:1}
 .clip .ti{font-weight:700;line-height:1.3}
 .score{font-size:12px;font-weight:800;color:#111;background:var(--accent2);border-radius:6px;padding:1px 7px}
 .cap{font-size:13px;color:var(--muted);background:var(--panel2);border-radius:8px;padding:8px 10px;white-space:pre-wrap}
+.tag{font-size:12px;color:var(--ok)}
 .edit{display:none;flex-direction:column;gap:8px;border-top:1px solid var(--line);padding-top:10px}
 .edit.on{display:flex}
+.edit textarea.words{min-height:130px;font-size:14px}
 .center{min-height:80vh;display:grid;place-items:center}
 .auth{width:100%;max-width:380px}
 .auth .logo{justify-content:center;font-size:26px;margin-bottom:18px}
 .err{color:var(--err);font-size:14px;min-height:20px;margin-top:8px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;padding:40px 16px;z-index:20;overflow:auto}
 .modal.on{display:flex}
-.modal .card{width:100%;max-width:560px}
-.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:10px 18px;border-radius:10px;opacity:0;transition:.25s;pointer-events:none;z-index:30}
+.modal .card{width:100%;max-width:580px}
+.list{display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow:auto;margin-top:10px}
+.item{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);cursor:pointer}
+.item:hover{border-color:var(--accent)}
+.item img{width:28px;height:28px;border-radius:50%}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:10px 18px;border-radius:10px;opacity:0;transition:.25s;pointer-events:none;z-index:30;max-width:90vw}
 .toast.on{opacity:1}
 .hint{background:#2a2216;border:1px solid #5a4520;color:#ffd58a;border-radius:10px;padding:10px 14px;font-size:14px;margin-bottom:18px}
+.hint.blue{background:#16202e;border-color:#2b4170;color:#b9d0ff}
 .log{font:12px/1.5 ui-monospace,monospace;color:var(--muted);margin-top:8px}
 .up{margin-top:14px;display:none}
 @media (max-width:600px){header{padding:12px 16px}.job{flex-wrap:wrap}.thumbs{display:none}h1{font-size:22px}}
@@ -78,25 +91,71 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
 </head>
 <body>
 <div id="app"></div>
+
 <div class="modal" id="settingsModal"><div class="card">
-  <div class="row" style="justify-content:space-between"><h2 style="margin:0">Einstellungen</h2><button class="btn ghost sm" onclick="closeSettings()">Schließen</button></div>
-  <h2 style="margin-top:20px;font-size:15px">KI-Highlight-Auswahl (Claude)</h2>
-  <p class="muted small" style="margin-top:-6px">Mit einem Anthropic-API-Schlüssel wählt Claude die Highlights inhaltlich aus und schreibt Titel und Beschreibungen. Ohne Schlüssel nutzt die App eine automatische Auswahl nach Sprechtempo, Fragen und Schlüsselwörtern. Den Schlüssel bekommst du unter console.anthropic.com.</p>
-  <label>API-Schlüssel <span id="keyHint"></span></label>
-  <input id="sKey" type="password" placeholder="sk-ant-… (leer lassen = unverändert)" autocomplete="off">
-  <div class="row" style="margin-top:8px"><button class="btn sm danger" onclick="removeKey()">Schlüssel entfernen</button></div>
-  <h2 style="margin-top:22px;font-size:15px">Passwort ändern</h2>
-  <input id="sPw" type="password" placeholder="Neues Passwort (mind. 8 Zeichen)" autocomplete="new-password">
+  <div class="row" style="justify-content:space-between"><h2 style="margin:0">Einstellungen</h2><button class="btn ghost sm" onclick="closeModal('settingsModal')">Schließen</button></div>
+
+  <h3>KI-Highlight-Auswahl (Claude)</h3>
+  <p class="muted small" style="margin-top:0">Mit einem Anthropic-API-Schlüssel wählt Claude die Highlights inhaltlich aus und schreibt Titel und Beschreibungen. Ohne Schlüssel nutzt die App eine automatische Auswahl. Schlüssel unter console.anthropic.com.</p>
+  <label>API-Schlüssel <span id="hint_anthropic_key"></span></label>
+  <input id="s_anthropic_key" type="password" placeholder="sk-ant-… (leer lassen = unverändert)" autocomplete="off">
+
+  <h3>Fachbegriffe und Namen</h3>
+  <p class="muted small" style="margin-top:0">Wörter, die die Spracherkennung richtig schreiben soll, mit Komma getrennt, z. B. Namen, Marken, Fachbegriffe.</p>
+  <textarea id="s_vocabulary" placeholder="z. B. paetze.digital, Nextcloud, Gründerzuschuss"></textarea>
+
+  <h3>Nextcloud</h3>
+  <p class="muted small" style="margin-top:0">Für Import und Export. Lege in Nextcloud unter Einstellungen → Sicherheit ein App-Passwort an und trage es hier ein.</p>
+  <div class="grid" style="margin-top:0">
+    <div><label>Adresse</label><input id="s_nc_url" placeholder="https://cloud.paetze.digital"></div>
+    <div><label>Benutzername</label><input id="s_nc_user" autocomplete="off"></div>
+    <div><label>App-Passwort <span id="hint_nc_pass"></span></label><input id="s_nc_pass" type="password" placeholder="leer lassen = unverändert" autocomplete="new-password"></div>
+    <div><label>Ordner</label><input id="s_nc_folder" placeholder="ShortCut"></div>
+  </div>
+  <label class="chk" style="margin-top:12px"><input type="checkbox" id="s_nc_export">Fertige Clips automatisch in Nextcloud speichern (Ordner/Shorts/…)</label>
+
+  <h3>Postiz</h3>
+  <p class="muted small" style="margin-top:0">Den API-Schlüssel findest du in Postiz unter Einstellungen → Public API.</p>
+  <div class="grid" style="margin-top:0">
+    <div style="grid-column:1/-1"><label>API-Adresse</label><input id="s_pz_url"></div>
+    <div style="grid-column:1/-1"><label>API-Schlüssel <span id="hint_pz_key"></span></label><input id="s_pz_key" type="password" placeholder="leer lassen = unverändert" autocomplete="off"></div>
+  </div>
+
+  <h3>Passwort ändern</h3>
+  <input id="s_new_password" type="password" placeholder="Neues Passwort (mind. 8 Zeichen)" autocomplete="new-password">
   <div class="err" id="sErr"></div>
-  <div class="row" style="justify-content:flex-end"><button class="btn primary" onclick="saveSettings()">Speichern</button></div>
+  <div class="row" style="justify-content:space-between"><button class="btn sm danger" onclick="clearSecrets()">Alle Schlüssel entfernen</button><button class="btn primary" onclick="saveSettings()">Speichern</button></div>
 </div></div>
+
+<div class="modal" id="ncModal"><div class="card">
+  <div class="row" style="justify-content:space-between"><h2 style="margin:0">Video aus Nextcloud</h2><button class="btn ghost sm" onclick="closeModal('ncModal')">Schließen</button></div>
+  <p class="muted small" id="ncInfo"></p>
+  <div class="list" id="ncList"></div>
+</div></div>
+
+<div class="modal" id="pzModal"><div class="card">
+  <div class="row" style="justify-content:space-between"><h2 style="margin:0">An Postiz senden</h2><button class="btn ghost sm" onclick="closeModal('pzModal')">Schließen</button></div>
+  <label style="margin-top:14px">Kanäle</label>
+  <div class="list" id="pzList" style="max-height:30vh"></div>
+  <label style="margin-top:14px">Beitragstext</label>
+  <textarea id="pzContent" style="min-height:120px"></textarea>
+  <div class="row" style="margin-top:14px">
+    <label class="chk"><input type="radio" name="pzWhen" value="schedule" checked>Planen für</label>
+    <input type="datetime-local" id="pzDate" style="width:auto">
+    <label class="chk"><input type="radio" name="pzWhen" value="now">Sofort veröffentlichen</label>
+  </div>
+  <div class="err" id="pzErr"></div>
+  <div class="row" style="justify-content:flex-end"><button class="btn primary" id="pzSend" onclick="sendPostiz()">An Postiz senden</button></div>
+</div></div>
+
 <div class="toast" id="toast"></div>
 <script>
-var S = {view: "home", job: null, jobs: [], settings: null, timer: null, editing: {}};
+var S = {view: "home", job: null, jobs: [], settings: null, timer: null, editing: {}, srcTab: "file"};
 var app = document.getElementById("app");
 
 function esc(s){return String(s == null ? "" : s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]})}
-function toast(m){var t=document.getElementById("toast");t.textContent=m;t.classList.add("on");clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove("on")},2500)}
+function $(id){return document.getElementById(id)}
+function toast(m){var t=$("toast");t.textContent=m;t.classList.add("on");clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove("on")},3500)}
 function api(method, url, body){
   return fetch(url,{method:method,headers:body?{"Content-Type":"application/json"}:{},body:body?JSON.stringify(body):undefined,credentials:"same-origin"})
     .then(function(r){return r.json().catch(function(){return {}}).then(function(j){
@@ -106,21 +165,25 @@ function api(method, url, body){
 function fmt(t){t=Math.max(0,t||0);var m=Math.floor(t/60),s=(t%60).toFixed(1);return m+":"+(s<10?"0":"")+s}
 function parseT(v){v=String(v).trim().replace(",",".");if(v.indexOf(":")>=0){var p=v.split(":");return parseFloat(p[0])*60+parseFloat(p[1])}return parseFloat(v)}
 function size(b){return b>1e9?(b/1e9).toFixed(2)+" GB":(b/1e6).toFixed(0)+" MB"}
+function closeModal(id){$(id).classList.remove("on")}
 function statusPill(j){
   if(j.status==="fertig") return '<span class="pill ok">Fertig</span>';
   if(j.status==="fehler") return '<span class="pill err">Fehler</span>';
+  if(j.status==="prüfen") return '<span class="pill rev">Prüfen</span>';
   if(j.status==="wartet") return '<span class="pill">Wartet</span>';
   return '<span class="pill run">'+Math.round(j.progress)+' %</span>';
 }
+function isRunning(j){return j.status==="läuft"||j.status==="wartet"}
 
 function boot(){
   clearInterval(S.timer);
   api("GET","/api/state").then(function(st){
     if(st.setup_needed) return renderAuth(true);
     if(!st.logged_in) return renderAuth(false);
-    api("GET","/api/settings").then(function(s){S.settings=s; route()});
+    loadSettings().then(route);
   });
 }
+function loadSettings(){return api("GET","/api/settings").then(function(s){S.settings=s})}
 
 function renderAuth(setup){
   app.innerHTML='<div class="center"><div class="card auth"><div class="logo"><i></i>ShortCut</div>'+
@@ -128,9 +191,9 @@ function renderAuth(setup){
     '<form id="af"><label>Passwort</label><input id="pw" type="password" autofocus autocomplete="'+(setup?"new-password":"current-password")+'">'+
     (setup?'<label style="margin-top:12px">Passwort wiederholen</label><input id="pw2" type="password" autocomplete="new-password">':'')+
     '<div class="err" id="ae"></div><button class="btn primary" style="width:100%;justify-content:center">'+(setup?"Einrichten":"Anmelden")+'</button></form></div></div>';
-  document.getElementById("af").onsubmit=function(e){
-    e.preventDefault();var pw=document.getElementById("pw").value,ae=document.getElementById("ae");
-    if(setup && pw!==document.getElementById("pw2").value){ae.textContent="Die Passwörter stimmen nicht überein.";return}
+  $("af").onsubmit=function(e){
+    e.preventDefault();var pw=$("pw").value,ae=$("ae");
+    if(setup && pw!==$("pw2").value){ae.textContent="Die Passwörter stimmen nicht überein.";return}
     api("POST",setup?"/api/setup":"/api/login",{password:pw}).then(boot).catch(function(err){ae.textContent=err.message});
   };
 }
@@ -145,52 +208,68 @@ window.onhashchange=function(){route()};
 function route(){
   clearInterval(S.timer);
   var m=location.hash.match(/^#job\/([0-9a-f]{12})/);
-  if(m){S.view="job";loadJob(m[1])}else{S.view="home";renderHome();loadJobs()}
+  if(m){S.view="job";S.job=null;S.editing={};loadJob(m[1])}else{S.view="home";renderHome();loadJobs()}
   S.timer=setInterval(function(){
     if(S.view==="home") loadJobs();
-    else if(S.job && (S.job.status==="läuft"||S.job.status==="wartet")) loadJob(S.job.id, true);
+    else if(S.job && isRunning(S.job)) loadJob(S.job.id, true);
   },3000);
 }
 
+// ---------------------------------------------------------------- home
 function opt(v,cur,label){return '<option value="'+v+'"'+(String(v)===String(cur)?" selected":"")+'>'+label+'</option>'}
+function chk(id,on,label){return '<label class="chk"><input type="checkbox" id="'+id+'"'+(on?" checked":"")+'>'+label+'</label>'}
 function renderHome(){
   var d=S.settings.defaults;
+  var src={
+    file:'<div class="drop" id="drop"><b>Video hierher ziehen oder klicken</b><div class="muted small">MP4, MOV, MKV, WebM, beliebige Länge</div></div><input type="file" id="file" accept="video/*,.mkv" style="display:none">'+
+      '<div class="up" id="up"><div class="row" style="justify-content:space-between"><span id="upName"></span><span class="muted small" id="upPct"></span></div><div class="bar"><i id="upBar" style="width:0"></i></div></div>',
+    yt:'<div class="row" style="flex-wrap:nowrap"><input id="ytUrl" placeholder="https://www.youtube.com/watch?v=…"><button class="btn primary" onclick="importYoutube()">Laden</button></div>'+
+      '<p class="muted small">Nur für eigene Videos oder Videos, an denen du die Rechte hast. YouTube blockiert Downloads von Servern manchmal – dann bitte die Datei hochladen.</p>',
+    nc:'<div class="row"><button class="btn primary" onclick="openNextcloud()">Video aus Nextcloud wählen</button><span class="muted small">Ordner „'+esc(S.settings.nc_folder||"ShortCut")+'“ in '+esc(S.settings.nc_url||"Nextcloud")+'</span></div>'+
+      (!S.settings.has_nc_pass?'<p class="muted small">Noch nicht eingerichtet – trage Benutzer und App-Passwort in den <a href="#" onclick="openSettings();return false">Einstellungen</a> ein.</p>':'')
+  };
   app.innerHTML=shell(
-    (!S.settings.has_key?'<div class="hint">Tipp: Hinterlege in den <a href="#" onclick="openSettings();return false">Einstellungen</a> einen Claude-API-Schlüssel. Dann wählt eine KI die Highlights inhaltlich aus und schreibt Titel und Beschreibungen.</div>':'')+
-    '<h1>Aus langen Videos werden Shorts</h1><p class="muted" style="margin-top:0">Video hochladen: Die App transkribiert es auf Deutsch, sucht die stärksten Momente und schneidet Clips im Hochformat 9:16 mit animierten Untertiteln.</p>'+
-    '<div class="card"><div class="drop" id="drop"><b>Video hierher ziehen oder klicken</b><div class="muted small">MP4, MOV, MKV, WebM, beliebige Länge</div></div>'+
-    '<input type="file" id="file" accept="video/*,.mkv" style="display:none">'+
-    '<div class="up" id="up"><div class="row" style="justify-content:space-between"><span id="upName"></span><span class="muted small" id="upPct"></span></div><div class="bar"><i id="upBar" style="width:0"></i></div></div>'+
+    (!S.settings.has_anthropic_key?'<div class="hint">Tipp: Hinterlege in den <a href="#" onclick="openSettings();return false">Einstellungen</a> einen Claude-API-Schlüssel. Dann wählt eine KI die Highlights inhaltlich aus und schreibt Titel und Beschreibungen.</div>':'')+
+    '<h1>Aus langen Videos werden Shorts</h1><p class="muted" style="margin-top:0">Die App transkribiert dein Video auf Deutsch, sucht die stärksten Momente und schneidet Clips im Hochformat 9:16 mit animierten Untertiteln.</p>'+
+    '<div class="card"><div class="tabs">'+
+      ['file','yt','nc'].map(function(k){return '<button class="tab'+(S.srcTab===k?" on":"")+'" onclick="S.srcTab=\''+k+'\';renderHome()">'+{file:"Datei hochladen",yt:"YouTube-Link",nc:"Aus Nextcloud"}[k]+'</button>'}).join("")+
+    '</div>'+src[S.srcTab]+
     '<div class="grid">'+
       '<div><label>Anzahl Clips</label><input id="o_clips" type="number" min="1" max="15" value="'+d.clips+'"></div>'+
       '<div><label>Länge min. (Sek.)</label><input id="o_min_len" type="number" min="5" max="170" value="'+d.min_len+'"></div>'+
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
-      '<div><label>Bildformat</label><select id="o_mode">'+opt("crop",d.mode,"Mitte zuschneiden (Vollbild)")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
+      '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
     '</div>'+
-    '<details><summary>Untertitel und Qualität</summary><div class="grid">'+
+    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
+    '<details><summary>Untertitel, Hook und Qualität</summary><div class="grid">'+
       '<div><label>Spracherkennung</label><select id="o_quality">'+opt("schnell",d.quality,"Schnell")+opt("ausgewogen",d.quality,"Ausgewogen")+opt("genau",d.quality,"Genau (langsam)")+'</select></div>'+
       '<div><label>Hervorhebung</label><input id="o_highlight" type="color" value="'+d.highlight+'"></div>'+
       '<div><label>Schriftgröße</label><input id="o_font_size" type="number" min="40" max="140" value="'+d.font_size+'"></div>'+
       '<div><label>Wörter pro Zeile</label><input id="o_words_per_line" type="number" min="1" max="6" value="'+d.words_per_line+'"></div>'+
       '<div><label>Position</label><select id="o_position">'+opt("unten",d.position,"Unteres Drittel")+opt("mitte",d.position,"Mitte")+opt("oben",d.position,"Oben")+'</select></div>'+
-      '<div><label>&nbsp;</label><label style="color:var(--text);font-weight:500"><input id="o_uppercase" type="checkbox"'+(d.uppercase?" checked":"")+'>GROSSBUCHSTABEN</label></div>'+
+      '<div><label>Hook-Dauer (Sek.)</label><input id="o_hook_seconds" type="number" min="1" max="10" value="'+d.hook_seconds+'"></div>'+
+      '<div><label>&nbsp;</label>'+chk("o_uppercase",d.uppercase,"GROSSBUCHSTABEN")+'</div>'+
     '</div><div style="margin-top:14px"><label>Worum geht es im Video? (optional, hilft der KI)</label><textarea id="o_context" placeholder="z. B. Podcast über Selbstständigkeit, Zielgruppe junge Gründer"></textarea></div>'+
     '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="saveDefaults()">Als Standard speichern</button></div></details>'+
     '</div><div class="jobs" id="jobs"></div>');
-  var drop=document.getElementById("drop"),file=document.getElementById("file");
-  drop.onclick=function(){file.click()};
-  file.onchange=function(){if(file.files[0]) upload(file.files[0])};
-  drop.ondragover=function(e){e.preventDefault();drop.classList.add("over")};
-  drop.ondragleave=function(){drop.classList.remove("over")};
-  drop.ondrop=function(e){e.preventDefault();drop.classList.remove("over");if(e.dataTransfer.files[0]) upload(e.dataTransfer.files[0])};
+  if(S.srcTab==="file"){
+    var drop=$("drop"),file=$("file");
+    drop.onclick=function(){file.click()};
+    file.onchange=function(){if(file.files[0]) upload(file.files[0])};
+    drop.ondragover=function(e){e.preventDefault();drop.classList.add("over")};
+    drop.ondragleave=function(){drop.classList.remove("over")};
+    drop.ondrop=function(e){e.preventDefault();drop.classList.remove("over");if(e.dataTransfer.files[0]) upload(e.dataTransfer.files[0])};
+  }
   renderJobs();
 }
 
 function readOpts(){
-  var o={};["clips","min_len","max_len","mode","quality","highlight","font_size","words_per_line","position"].forEach(function(k){o[k]=document.getElementById("o_"+k).value});
-  o.uppercase=document.getElementById("o_uppercase").checked;return o;
+  var o={};["clips","min_len","max_len","mode","quality","highlight","font_size","words_per_line","position","hook_seconds"].forEach(function(k){o[k]=$("o_"+k).value});
+  ["uppercase","remove_pauses","hook","review"].forEach(function(k){o[k]=$("o_"+k).checked});
+  return o;
 }
-function saveDefaults(){api("POST","/api/settings",{defaults:readOpts()}).then(function(){return api("GET","/api/settings")}).then(function(s){S.settings=s;toast("Gespeichert")}).catch(function(e){toast(e.message)})}
+function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
+function saveDefaults(){api("POST","/api/settings",{defaults:readOpts()}).then(loadSettings).then(function(){toast("Gespeichert")}).catch(function(e){toast(e.message)})}
 
 var CHUNK=8*1024*1024;
 function sendChunk(uid,f,offset,tries,done,fail){
@@ -205,13 +284,13 @@ function sendChunk(uid,f,offset,tries,done,fail){
   function retry(){if(tries<4) setTimeout(function(){sendChunk(uid,f,offset,tries+1,done,fail)},2000*(tries+1));else fail("Upload fehlgeschlagen – Verbindung prüfen")}
   xhr.open("PUT","/api/uploads/"+uid+"?offset="+offset);xhr.send(blob);
 }
-function showUp(p){var b=document.getElementById("upBar");if(!b) return;b.style.width=p+"%";document.getElementById("upPct").textContent="Upload "+p.toFixed(0)+" %"}
+function showUp(p){var b=$("upBar");if(!b) return;b.style.width=p+"%";$("upPct").textContent="Upload "+p.toFixed(0)+" %"}
 function upload(f){
   if(S.uploading) return toast("Es läuft bereits ein Upload");
-  var meta={filename:f.name,context:document.getElementById("o_context").value,settings:readOpts()};
+  var meta=jobMeta();meta.filename=f.name;
   S.uploading=true;window.onbeforeunload=function(){return S.uploading?"Upload läuft":undefined};
-  document.getElementById("up").style.display="block";document.getElementById("upName").textContent=f.name+" ("+size(f.size)+")";showUp(0);
-  function fail(m){S.uploading=false;toast(m);var u=document.getElementById("up");if(u) u.style.display="none"}
+  $("up").style.display="block";$("upName").textContent=f.name+" ("+size(f.size)+")";showUp(0);
+  function fail(m){S.uploading=false;toast(m);var u=$("up");if(u) u.style.display="none"}
   api("POST","/api/uploads").then(function(u){
     sendChunk(u.id,f,0,0,function(){
       meta.upload_id=u.id;
@@ -219,70 +298,155 @@ function upload(f){
     },fail);
   }).catch(function(e){fail(e.message)});
 }
+function importYoutube(){
+  var meta=jobMeta();meta.url=$("ytUrl").value.trim();
+  if(!meta.url) return toast("Bitte einen YouTube-Link einfügen");
+  api("POST","/api/import/youtube",meta).then(function(j){toast("Video wird geladen");go("job",j.id)}).catch(function(e){toast(e.message)});
+}
+function openNextcloud(){
+  $("ncInfo").textContent="Lade Dateiliste …";$("ncList").innerHTML="";$("ncModal").classList.add("on");
+  api("GET","/api/nextcloud/files").then(function(files){
+    $("ncInfo").textContent=files.length?"Klicke auf ein Video, um es zu verarbeiten.":"Keine Videos im Ordner „"+(S.settings.nc_folder||"ShortCut")+"“ gefunden.";
+    $("ncList").innerHTML=files.map(function(f,i){return '<div class="item" onclick="importNextcloud('+i+')"><div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(f.name)+'</div><span class="muted small">'+size(f.size)+'</span></div>'}).join("");
+    S.ncFiles=files;
+  }).catch(function(e){$("ncInfo").textContent=e.message});
+}
+function importNextcloud(i){
+  var meta=jobMeta();meta.name=S.ncFiles[i].name;
+  api("POST","/api/import/nextcloud",meta).then(function(j){closeModal("ncModal");toast("Video wird aus Nextcloud geladen");go("job",j.id)}).catch(function(e){toast(e.message)});
+}
 
 function loadJobs(){api("GET","/api/jobs").then(function(j){S.jobs=j;renderJobs()}).catch(function(){})}
 function renderJobs(){
-  var el=document.getElementById("jobs");if(!el) return;
+  var el=$("jobs");if(!el) return;
   if(!S.jobs.length){el.innerHTML='';return}
   el.innerHTML='<h2 style="margin:8px 0 2px">Deine Projekte</h2>'+S.jobs.map(function(j){
     var th=(j.clips||[]).filter(function(c){return c.thumb}).slice(0,6).map(function(c){return '<img src="/files/'+j.id+'/'+c.thumb+'" loading="lazy">'}).join("");
-    var running=j.status==="läuft"||j.status==="wartet";
     return '<div class="job" onclick="go(\'job\',\''+j.id+'\')"><div class="t"><div class="n">'+esc(j.name)+'</div><div class="muted small">'+new Date(j.created*1000).toLocaleString("de-DE")+' · '+esc(j.message)+'</div>'+
-      (running?'<div class="bar"><i style="width:'+j.progress+'%"></i></div>':'')+'</div><div class="thumbs">'+th+'</div>'+statusPill(j)+'</div>';
+      (isRunning(j)?'<div class="bar"><i style="width:'+j.progress+'%"></i></div>':'')+'</div><div class="thumbs">'+th+'</div>'+statusPill(j)+'</div>';
   }).join("");
 }
 
+// ---------------------------------------------------------------- job
 function loadJob(id, quiet){
   api("GET","/api/jobs/"+id).then(function(j){
     var changed=!S.job||S.job.id!==j.id||JSON.stringify(S.job)!==JSON.stringify(j);S.job=j;if(changed) renderJob();
   }).catch(function(e){if(!quiet){toast(e.message);go("home")}});
 }
 
+function editor(c,i,review){
+  return '<div class="edit'+(review||S.editing[i]?" on":"")+'" id="ed'+i+'">'+
+    '<div class="row" style="gap:8px;flex-wrap:nowrap"><div style="flex:1"><label>Start</label><input id="e_s'+i+'" value="'+fmt(c.start)+'"></div><div style="flex:1"><label>Ende</label><input id="e_e'+i+'" value="'+fmt(c.end)+'"></div></div>'+
+    '<div><label>Titel</label><input id="e_t'+i+'" value="'+esc(c.title)+'"></div>'+
+    '<div><label>Hook-Text (erste Sekunden)</label><input id="e_h'+i+'" value="'+esc(c.hook_text==null?c.title:c.hook_text)+'"></div>'+
+    '<div><label>Untertitel – Tippfehler hier korrigieren</label><textarea class="words" id="e_w'+i+'">'+esc(c.text||"")+'</textarea></div>'+
+    '<div><label>Beschreibung für Social Media</label><textarea id="e_c'+i+'">'+esc(c.caption||"")+'</textarea></div>'+
+    '<div class="muted small">Zeiten als Minuten:Sekunden, z. B. 3:12.5. Bei geänderten Zeiten passen sich die Untertitel an.</div>'+
+    '<button class="btn sm primary" onclick="saveClip('+i+')">'+(review?"Speichern":"Speichern und neu rendern")+'</button></div>';
+}
+
 function renderJob(){
-  var j=S.job,running=j.status==="läuft"||j.status==="wartet";
-  // keep playing videos and open editors untouched while polling
+  var j=S.job,running=isRunning(j),review=j.status==="prüfen";
   var html='<div class="row" style="justify-content:space-between;margin-bottom:6px"><button class="btn ghost sm" onclick="go(\'home\')">← Alle Projekte</button>'+
     '<button class="btn sm danger" onclick="delJob()">Projekt löschen</button></div>'+
-    '<h1 style="word-break:break-all">'+esc(j.name)+'</h1><div class="row muted small">'+statusPill(j)+'<span>'+esc(j.message)+'</span>'+
+    '<h1 style="word-break:break-word">'+esc(j.name)+'</h1><div class="row muted small">'+statusPill(j)+'<span>'+esc(j.message)+'</span>'+
     (j.info?'<span>· '+fmt(j.info.duration)+' · '+j.info.width+'×'+j.info.height+'</span>':'')+
     (j.selector?'<span>· Auswahl: '+(j.selector==="claude"?"Claude KI":"Automatik")+'</span>':'')+'</div>';
-  if(running) html+='<div class="bar" style="height:8px;margin-top:12px"><i style="width:'+j.progress+'%"></i></div><div class="log">'+(j.log||[]).map(esc).join("<br>")+'</div>';
+  if(running) html+='<div class="bar" style="height:8px;margin-top:12px"><i style="width:'+j.progress+'%"></i></div>';
+  if(running||j.status==="fertig") html+='<div class="log">'+(j.log||[]).map(esc).join("<br>")+'</div>';
   if(j.status==="fehler") html+='<div class="hint" style="margin-top:14px;background:#2a1616;border-color:#5a2525;color:#ffb3b3">'+esc(j.message)+'</div>';
+  if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Titel, Hook-Text und Untertitel jedes Clips. Korrigiere Tippfehler direkt im Text, dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
   html+='<div class="clips">'+(j.clips||[]).map(function(c,i){
-    var media=c.file&&c.status==="fertig"?'<video src="/files/'+j.id+'/'+c.file+'" poster="/files/'+j.id+'/'+c.thumb+'" controls preload="none" playsinline></video>':'<div class="ph">'+(c.status==="wartet"&&running?"wird gerendert …":"–")+'</div>';
-    return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+Math.round(c.end-c.start)+' s</span><span class="score">'+c.score+'</span></div>'+
+    var done=c.file&&c.status==="fertig";
+    var media=done?'<video src="/files/'+j.id+'/'+c.file+'" poster="/files/'+j.id+'/'+c.thumb+'" controls preload="none" playsinline></video>':
+      (review?'':'<div class="ph">'+(c.status==="wartet"&&running?"wird gerendert …":"–")+'</div>');
+    var len=c.duration_out?Math.round(c.duration_out)+' s'+(c.duration_out<c.end-c.start-0.5?' (von '+Math.round(c.end-c.start)+' s)':''):Math.round(c.end-c.start)+' s';
+    var pz=c.postiz?'<div class="tag">✓ An Postiz gesendet'+(c.postiz.now?' (sofort)':' – geplant für '+new Date(c.postiz.date*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"}))+(c.postiz.channels&&c.postiz.channels.length?': '+esc(c.postiz.channels.join(", ")):'')+'</div>':'';
+    return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
       '<div class="ti">'+esc(c.title)+'</div>'+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
-      (c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+
-      (c.file&&c.status==="fertig"?'<div class="row" style="margin-top:auto;gap:8px"><a class="btn sm primary" href="/files/'+j.id+'/'+c.file+'?dl=1">MP4 laden</a><a class="btn sm" href="/files/'+j.id+'/'+c.srt+'?dl=1">SRT</a>'+
-        (c.caption?'<button class="btn sm" onclick="copyCap('+i+')">Text kopieren</button>':'')+'<button class="btn sm ghost" onclick="toggleEdit('+i+')">Anpassen</button></div>':'')+
-      '<div class="edit'+(S.editing[i]?" on":"")+'" id="ed'+i+'"><div class="row" style="gap:8px;flex-wrap:nowrap"><div style="flex:1"><label>Start</label><input id="es'+i+'" value="'+fmt(c.start)+'"></div><div style="flex:1"><label>Ende</label><input id="ee'+i+'" value="'+fmt(c.end)+'"></div></div>'+
-      '<div><label>Titel</label><input id="et'+i+'" value="'+esc(c.title)+'"></div><div class="muted small">Zeiten als Minuten:Sekunden, z. B. 3:12.5. Untertitel werden automatisch angepasst.</div><button class="btn sm primary" onclick="rerender('+i+')">Neu rendern</button></div>'+
+      (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+pz+
+      (done&&!review?'<div class="row" style="margin-top:auto;gap:8px"><a class="btn sm primary" href="/files/'+j.id+'/'+c.file+'?dl=1">MP4 laden</a><a class="btn sm" href="/files/'+j.id+'/'+c.srt+'?dl=1">SRT</a>'+
+        '<button class="btn sm" onclick="openPostiz('+i+')">An Postiz</button>'+
+        (c.caption?'<button class="btn sm ghost" onclick="copyCap('+i+')">Text kopieren</button>':'')+'<button class="btn sm ghost" onclick="toggleEdit('+i+')">Anpassen</button></div>':'')+
+      ((done||review)?editor(c,i,review):'')+
       '</div></div>';
   }).join("")+'</div>';
   var playing=Array.prototype.some.call(document.querySelectorAll("video"),function(v){return !v.paused});
   if(playing&&!running) return;
-  var focused=document.activeElement&&document.activeElement.id&&/^e[set]\d/.test(document.activeElement.id);
-  if(focused) return;
+  var a=document.activeElement;
+  if(a&&a.id&&/^e_/.test(a.id)) return;
   app.innerHTML=shell(html);
 }
-function toggleEdit(i){S.editing[i]=!S.editing[i];document.getElementById("ed"+i).classList.toggle("on")}
+function toggleEdit(i){S.editing[i]=!S.editing[i];$("ed"+i).classList.toggle("on")}
 function copyCap(i){var c=S.job.clips[i];navigator.clipboard.writeText(c.title+"\n\n"+c.caption).then(function(){toast("Kopiert")})}
-function rerender(i){
-  var s=parseT(document.getElementById("es"+i).value),e=parseT(document.getElementById("ee"+i).value),t=document.getElementById("et"+i).value;
+function saveClip(i){
+  var s=parseT($("e_s"+i).value),e=parseT($("e_e"+i).value);
   if(isNaN(s)||isNaN(e)) return toast("Ungültige Zeit");
-  S.editing[i]=false;
-  api("POST","/api/jobs/"+S.job.id+"/clips/"+i,{start:s,end:e,title:t}).then(function(j){S.job=j;renderJob();toast("Clip wird neu gerendert")}).catch(function(err){toast(err.message)});
+  var body={start:s,end:e,title:$("e_t"+i).value,hook_text:$("e_h"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value};
+  var review=S.job.status==="prüfen";
+  if(!review) S.editing[i]=false;
+  document.activeElement.blur();
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+i,body).then(function(j){S.job=j;renderJob();toast(review?"Gespeichert":"Clip wird neu gerendert")}).catch(function(err){toast(err.message)});
+}
+function renderAll(){
+  // save open edits first so nothing typed is lost
+  var chain=Promise.resolve();
+  S.job.clips.forEach(function(c,i){
+    if(!$("e_s"+i)) return;
+    var body={start:parseT($("e_s"+i).value),end:parseT($("e_e"+i).value),title:$("e_t"+i).value,hook_text:$("e_h"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value};
+    chain=chain.then(function(){return api("POST","/api/jobs/"+S.job.id+"/clips/"+i,body)});
+  });
+  chain.then(function(){return api("POST","/api/jobs/"+S.job.id+"/render")}).then(function(j){S.job=j;renderJob();toast("Rendern gestartet")}).catch(function(e){toast(e.message)});
 }
 function delJob(){if(!confirm("Projekt mit allen Clips löschen?")) return;api("DELETE","/api/jobs/"+S.job.id).then(function(){toast("Gelöscht");go("home")})}
 
-function openSettings(){document.getElementById("keyHint").textContent=S.settings.has_key?"(hinterlegt: "+S.settings.key_hint+")":"(nicht hinterlegt)";document.getElementById("sErr").textContent="";document.getElementById("settingsModal").classList.add("on")}
-function closeSettings(){document.getElementById("settingsModal").classList.remove("on");document.getElementById("sKey").value="";document.getElementById("sPw").value=""}
-function saveSettings(){
-  var b={},k=document.getElementById("sKey").value.trim(),p=document.getElementById("sPw").value;
-  if(k) b.anthropic_key=k; if(p) b.new_password=p;
-  api("POST","/api/settings",b).then(function(){return api("GET","/api/settings")}).then(function(s){S.settings=s;closeSettings();toast("Gespeichert");if(S.view==="home") renderHome()}).catch(function(e){document.getElementById("sErr").textContent=e.message});
+// ---------------------------------------------------------------- postiz
+function pad(n){return (n<10?"0":"")+n}
+function openPostiz(i){
+  var c=S.job.clips[i];S.pzClip=i;
+  var d=new Date();d.setDate(d.getDate()+1);d.setHours(18,0,0,0);
+  $("pzDate").value=d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+"T18:00";
+  $("pzContent").value=(c.title||"")+(c.caption?"\n\n"+c.caption:"");
+  $("pzErr").textContent="";$("pzList").innerHTML='<span class="muted small">Lade Kanäle …</span>';
+  $("pzModal").classList.add("on");
+  api("GET","/api/postiz/integrations").then(function(list){
+    S.pzChannels=list;
+    $("pzList").innerHTML=list.length?list.map(function(ch,k){return '<label class="item"><input type="checkbox" id="pz'+k+'">'+(ch.picture?'<img src="'+esc(ch.picture)+'" onerror="this.remove()">':'')+'<span style="flex:1">'+esc(ch.name)+'</span><span class="muted small">'+esc(ch.provider)+'</span></label>'}).join(""):'<span class="muted small">In Postiz sind noch keine Kanäle verbunden.</span>';
+  }).catch(function(e){$("pzList").innerHTML='';$("pzErr").textContent=e.message});
 }
-function removeKey(){api("POST","/api/settings",{anthropic_key:""}).then(function(){return api("GET","/api/settings")}).then(function(s){S.settings=s;openSettings();toast("Schlüssel entfernt")})}
+function sendPostiz(){
+  var chans=(S.pzChannels||[]).filter(function(ch,k){return $("pz"+k)&&$("pz"+k).checked});
+  if(!chans.length){$("pzErr").textContent="Bitte mindestens einen Kanal wählen.";return}
+  var when=document.querySelector('input[name=pzWhen]:checked').value;
+  var date=new Date($("pzDate").value);
+  if(when==="schedule"&&(isNaN(date)||date<new Date())){$("pzErr").textContent="Bitte ein Datum in der Zukunft wählen.";return}
+  $("pzSend").disabled=true;$("pzSend").textContent="Wird gesendet …";
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+S.pzClip+"/postiz",{channels:chans,when:when,date:date.toISOString(),content:$("pzContent").value})
+    .then(function(){closeModal("pzModal");toast(when==="now"?"An Postiz gesendet – wird veröffentlicht":"In Postiz eingeplant");loadJob(S.job.id,true)})
+    .catch(function(e){$("pzErr").textContent=e.message})
+    .then(function(){$("pzSend").disabled=false;$("pzSend").textContent="An Postiz senden"});
+}
+
+// ---------------------------------------------------------------- settings
+var SECRETS=["anthropic_key","nc_pass","pz_key"],TEXTS=["vocabulary","nc_url","nc_user","nc_folder","pz_url"];
+function openSettings(){
+  var s=S.settings;
+  SECRETS.forEach(function(k){$("s_"+k).value="";$("hint_"+k).textContent=s["has_"+k]?"(hinterlegt)":"(nicht hinterlegt)"});
+  TEXTS.forEach(function(k){$("s_"+k).value=s[k]||""});
+  $("s_nc_export").checked=!!s.nc_export;$("s_new_password").value="";$("sErr").textContent="";
+  $("settingsModal").classList.add("on");
+}
+function saveSettings(){
+  var b={nc_export:$("s_nc_export").checked};
+  TEXTS.forEach(function(k){b[k]=$("s_"+k).value});
+  SECRETS.forEach(function(k){var v=$("s_"+k).value.trim();if(v) b[k]=v});
+  if($("s_new_password").value) b.new_password=$("s_new_password").value;
+  api("POST","/api/settings",b).then(loadSettings).then(function(){closeModal("settingsModal");toast("Gespeichert");if(S.view==="home") renderHome()}).catch(function(e){$("sErr").textContent=e.message});
+}
+function clearSecrets(){
+  if(!confirm("Claude-, Nextcloud- und Postiz-Schlüssel entfernen?")) return;
+  api("POST","/api/settings",{anthropic_key:"",nc_pass:"",pz_key:""}).then(loadSettings).then(function(){openSettings();toast("Schlüssel entfernt")});
+}
 function logout(){api("POST","/api/logout").then(boot)}
 boot();
 </script>

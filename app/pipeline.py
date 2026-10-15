@@ -1,10 +1,10 @@
 """Video pipeline: audio extraction, transcription, highlight detection, clip rendering."""
 import gc
 import json
-import math
 import os
 import re
 import subprocess
+import time
 
 import httpx
 
@@ -49,7 +49,7 @@ def extract_audio(video, wav):
 
 # ---------------------------------------------------------------- transcription
 
-def transcribe(wav, duration, preset, progress):
+def transcribe(wav, duration, preset, progress, vocabulary=""):
     from faster_whisper import WhisperModel
 
     cfg = WHISPER_PRESETS.get(preset, WHISPER_PRESETS["ausgewogen"])
@@ -69,6 +69,8 @@ def transcribe(wav, duration, preset, progress):
             word_timestamps=True,
             vad_filter=True,
             condition_on_previous_text=False,
+            # known names and terms steer the spelling of the whole transcript
+            initial_prompt=("Wichtige Begriffe: " + vocabulary.strip()) if vocabulary and vocabulary.strip() else None,
         )
         result = []
         for seg in segments:
@@ -230,6 +232,208 @@ def find_highlights(segments, api_key, n, min_len, max_len, context, log):
     return snapped, source
 
 
+# ---------------------------------------------------------------- transcript editing
+
+def realign(old, new_text):
+    """Map corrected text onto the timings of the original words.
+
+    Unchanged words keep their timing; replaced or inserted words share the time span of what they replace."""
+    import difflib
+
+    tokens = new_text.split()
+    if not old:
+        return []
+    sm = difflib.SequenceMatcher(a=[w["w"].lower() for w in old], b=[t.lower() for t in tokens], autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out += [{**old[i1 + k], "w": tokens[j1 + k]} for k in range(i2 - i1)]
+        elif tag in ("replace", "insert"):
+            if i2 > i1:
+                s, e = old[i1]["s"], old[i2 - 1]["e"]
+            else:
+                s = old[i1 - 1]["e"] if i1 > 0 else old[0]["s"]
+                e = old[i1]["s"] if i1 < len(old) else old[-1]["e"]
+            n = j2 - j1
+            if e - s < 0.15 * n:
+                e = s + 0.15 * n
+            step = (e - s) / n
+            out += [{"w": tokens[j1 + k], "s": round(s + k * step, 2), "e": round(s + (k + 1) * step, 2)} for k in range(n)]
+    for a, b in zip(out, out[1:]):  # keep timings monotonic
+        if b["s"] < a["s"]:
+            b["s"] = a["s"]
+        b["e"] = max(b["e"], b["s"] + 0.05)
+    return out
+
+
+def replace_words(segments, start, end, new_words):
+    """Replace all words between start and end (absolute seconds) in the transcript."""
+    target = None
+    for idx, seg in enumerate(segments):
+        keep = [w for w in seg["words"] if not (w["e"] > start and w["s"] < end)]
+        if len(keep) != len(seg["words"]) and target is None:
+            target = idx
+        seg["words"] = keep
+    if target is None:
+        target = next((i for i, s in enumerate(segments) if s["s"] >= start), len(segments) - 1)
+    seg = segments[target]
+    seg["words"] = sorted(seg["words"] + new_words, key=lambda w: w["s"])
+    for seg in segments:
+        seg["text"] = " ".join(w["w"] for w in seg["words"])
+    return [s for s in segments if s["words"]]
+
+
+# ---------------------------------------------------------------- pauses and fillers
+
+FILLERS = {"äh", "ähm", "ähh", "ähmm", "öh", "öhm", "hm", "hmm", "mhm", "ehm", "em", "uh", "um", "uhm"}
+
+
+def is_filler(word):
+    return re.sub(r"[^\wäöüß]", "", word.lower()) in FILLERS
+
+
+def keep_intervals(words, duration, remove_pauses, max_pause=0.35, pad=0.1):
+    """Parts of the clip (relative seconds) that stay after cutting pauses and filler words."""
+    if not remove_pauses:
+        return [(0.0, duration)]
+    spoken = [w for w in words if not is_filler(w["w"])]
+    if not spoken:
+        return [(0.0, duration)]
+    out = []
+    for w in spoken:
+        a, b = max(0.0, w["s"] - pad), min(duration, w["e"] + pad)
+        if out and a - out[-1][1] < max_pause:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    out[-1][1] = min(duration, out[-1][1] + 0.25)
+    return [(round(a, 3), round(b, 3)) for a, b in out if b - a > 0.05]
+
+
+def remap(t, intervals):
+    """Time in the original clip -> time in the cut clip."""
+    acc = 0.0
+    for a, b in intervals:
+        if t <= a:
+            return acc
+        if t <= b:
+            return acc + t - a
+        acc += b - a
+    return acc
+
+
+def remap_words(words, intervals):
+    out = []
+    for w in words:
+        mid = (w["s"] + w["e"]) / 2
+        if is_filler(w["w"]) or not any(a <= mid <= b for a, b in intervals):
+            continue
+        out.append({"w": w["w"], "s": remap(w["s"], intervals), "e": remap(w["e"], intervals)})
+    return out
+
+
+# ---------------------------------------------------------------- speaker tracking
+
+def track_speaker(video, info, start, end):
+    """Find who is talking and return crop positions [(t0, t1, x)] in clip time, or None for a centre crop.
+
+    Faces are detected on a few frames per second; the face whose mouth area moves most within each second
+    is treated as the speaker, and short switches are smoothed away so the framing does not jump around."""
+    import cv2
+    import numpy as np
+
+    W, H = info["width"], info["height"]
+    if W / H <= 9 / 16 + 0.01:
+        return None
+    fps, aw = 5, 480
+    ah = int(round(H * aw / W / 2)) * 2
+    p = subprocess.run(
+        [FFMPEG, "-v", "error", "-ss", "%.2f" % start, "-t", "%.2f" % (end - start), "-i", video,
+         "-vf", "fps=%d,scale=%d:%d" % (fps, aw, ah), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        capture_output=True,
+    )
+    if p.returncode != 0 or not p.stdout:
+        return None
+    frames = np.frombuffer(p.stdout, np.uint8)
+    frames = frames[: len(frames) // (aw * ah) * aw * ah].reshape(-1, ah, aw)
+    frontal = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+    min_size = (max(20, ah // 9),) * 2
+
+    tracks = []  # {"cx": [..], "last": x, "seen": n, "motion": {frame: v}, "patch": (frame, arr)}
+    for i, img in enumerate(frames):
+        faces = list(frontal.detectMultiScale(img, 1.1, 5, minSize=min_size))
+        if not faces:
+            faces = list(profile.detectMultiScale(img, 1.1, 5, minSize=min_size))
+        used = set()
+        for x, y, w, h in faces:
+            cx = x + w / 2
+            best = min((t for t in tracks if id(t) not in used), key=lambda t: abs(t["last"] - cx), default=None)
+            if best is None or abs(best["last"] - cx) > 0.12 * aw:
+                best = {"cx": [], "last": cx, "seen": 0, "motion": {}, "patch": None}
+                tracks.append(best)
+            used.add(id(best))
+            best["cx"].append(cx)
+            best["last"] = cx
+            best["seen"] += 1
+            mouth = img[y + int(h * 0.62): y + h, x + int(w * 0.2): x + int(w * 0.8)]
+            if mouth.size:
+                patch = cv2.resize(mouth, (24, 12)).astype(np.float32)
+                if best["patch"] is not None and best["patch"][0] == i - 1:
+                    best["motion"][i] = float(np.mean(np.abs(patch - best["patch"][1])))
+                best["patch"] = (i, patch)
+
+    tracks = [t for t in tracks if t["seen"] >= max(3, len(frames) * 0.15)]
+    if not tracks:
+        return None
+    cw = int(H * 9 / 16) // 2 * 2
+
+    def crop_x(track):
+        cx = float(np.median(track["cx"])) * W / aw
+        return int(min(max(0, cx - cw / 2), W - cw))
+
+    duration = end - start
+    if len(tracks) == 1:
+        return [(0.0, duration, crop_x(tracks[0]))]
+
+    windows = max(1, int(np.ceil(len(frames) / fps)))
+    choice, prev = [], max(range(len(tracks)), key=lambda k: tracks[k]["seen"])
+    for wi in range(windows):
+        rng = range(wi * fps, (wi + 1) * fps)
+        scores = [sum(t["motion"].get(f, 0) for f in rng) for t in tracks]
+        if max(scores) > 0:
+            prev = int(np.argmax(scores))
+        choice.append(prev)
+    # merge runs shorter than two seconds into the previous shot
+    runs = []
+    for k in choice:
+        if runs and runs[-1][0] == k:
+            runs[-1][1] += 1
+        else:
+            runs.append([k, 1])
+    merged = []
+    for k, n in runs:
+        if merged and (n < 2 or merged[-1][0] == k):
+            merged[-1][1] += n
+        else:
+            merged.append([k, n])
+    segs, t = [], 0.0
+    for k, n in merged:
+        segs.append((t, min(duration, t + n), crop_x(tracks[k])))
+        t += n
+    return segs
+
+
+def crop_filter(segs, W, H):
+    cw = int(H * 9 / 16) // 2 * 2
+    if not segs:
+        return "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'"
+    expr = str(segs[-1][2])
+    for t0, t1, x in reversed(segs[:-1]):
+        expr = "if(lt(t,%.2f),%d,%s)" % (t1, x, expr)
+    return "crop=%d:%d:'%s':0" % (cw, H, expr)
+
+
 # ---------------------------------------------------------------- subtitles
 
 def ass_time(t):
@@ -252,7 +456,7 @@ def hex_to_ass(color):
 
 def chunk_words(words, max_words, max_chars=20):
     chunks, cur = [], []
-    for i, w in enumerate(words):
+    for w in words:
         if cur:
             gap = w["s"] - cur[-1]["e"]
             length = len(" ".join(x["w"] for x in cur + [w]))
@@ -273,7 +477,11 @@ def clip_words(segments, start, end):
     return out
 
 
-def write_subtitles(words, ass_path, srt_path, style):
+def ass_escape(text):
+    return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ")
+
+
+def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0):
     upper = style.get("uppercase", True)
     hl = hex_to_ass(style.get("highlight", "#FFE600"))
     size = int(style.get("font_size", 78))
@@ -282,7 +490,7 @@ def write_subtitles(words, ass_path, srt_path, style):
     max_words = int(style.get("words_per_line", 3))
 
     def txt(w):
-        return (w.upper() if upper else w).replace("{", "(").replace("}", ")")
+        return ass_escape(w.upper() if upper else w)
 
     header = (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 0\n"
@@ -290,10 +498,16 @@ def write_subtitles(words, ass_path, srt_path, style):
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
         "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,Montserrat,%d,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,7,3,2,70,70,%d,1\n\n"
+        "Style: Default,Montserrat,%d,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,1,0,1,7,3,2,70,70,%d,1\n"
+        "Style: Hook,Montserrat,72,&H00111111,&H00111111,%s,&H00000000,-1,0,0,0,100,100,0,0,3,16,0,8,110,110,250,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    ) % (size, margin_v)
+    ) % (size, margin_v, hl)
     events, srt = [], []
+    hook_secs = float(style.get("hook_seconds", 3))
+    if style.get("hook", True) and hook_text.strip():
+        end = min(hook_secs, total) if total else hook_secs
+        events.append("Dialogue: 1,%s,%s,Hook,,0,0,0,,{\\fad(120,250)\\fscx90\\fscy90\\t(0,150,\\fscx100\\fscy100)}%s"
+                      % (ass_time(0), ass_time(end), ass_escape(hook_text.strip())))
     for n, chunk in enumerate(chunk_words(words, max_words), 1):
         c_end = chunk[-1]["e"]
         srt.append("%d\n%s --> %s\n%s\n" % (n, srt_time(chunk[0]["s"]), srt_time(c_end), " ".join(w["w"] for w in chunk)))
@@ -312,34 +526,83 @@ def write_subtitles(words, ass_path, srt_path, style):
         f.write(header + "\n".join(events) + "\n")
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(srt))
+    return bool(events)
 
 
 # ---------------------------------------------------------------- rendering
 
-def render_clip(video, info, start, end, workdir, name, mode, ass_name, burn):
+def select_expr(intervals):
+    return "+".join("between(t,%.3f,%.3f)" % (a, b) for a, b in intervals)
+
+
+def render_clip(video, info, start, end, workdir, name, mode, ass_name, burn, intervals=None, crop_segs=None):
     w, h = info["width"], info["height"]
+    duration = end - start
+    cut = intervals and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
+    sel = (",select='%s',setpts=N/30/TB" % select_expr(intervals)) if cut else ""
     sub = (",ass=" + ass_name) if burn else ""
-    if mode == "blur" and w / h > 9 / 16 + 0.01:
+    portrait = w / h <= 9 / 16 + 0.01
+    if mode == "blur" and not portrait:
         vf = (
-            "[0:v]split=2[a][b];"
+            "[0:v]fps=30" + sel + ",split=2[a][b];"
             "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:3,eq=brightness=-0.08[bg];"
             "[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1" + sub + "[v]"
         )
     else:
-        vf = (
-            "[0:v]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920,setsar=1" + sub + "[v]"
-        )
+        crop = crop_filter(crop_segs if mode == "auto" else None, w, h)
+        vf = "[0:v]fps=30," + crop + sel + ",scale=1080:1920,setsar=1" + sub + "[v]"
+    af = ("aselect='%s',asetpts=N/SR/TB," % select_expr(intervals)) if cut else ""
+    af += "loudnorm=I=-14:TP=-1.5:LRA=11"
     out = name + ".mp4"
     run(
         [
-            FFMPEG, "-y", "-ss", "%.2f" % start, "-i", video, "-t", "%.2f" % (end - start),
+            FFMPEG, "-y", "-ss", "%.2f" % start, "-t", "%.2f" % duration, "-i", video,
             "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", "30",
-            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", af,
             "-movflags", "+faststart", "-threads", str(THREADS), out,
         ],
         cwd=workdir,
     )
-    run([FFMPEG, "-y", "-ss", "%.2f" % min(1.0, (end - start) / 2), "-i", out, "-frames:v", "1", "-vf", "scale=360:-2", name + ".jpg"], cwd=workdir)
-    return out
+    out_len = sum(b - a for a, b in intervals) if cut else duration
+    run([FFMPEG, "-y", "-ss", "%.2f" % min(1.0, out_len / 2), "-i", out, "-frames:v", "1", "-vf", "scale=360:-2", name + ".jpg"], cwd=workdir)
+    return out_len
+
+
+# ---------------------------------------------------------------- downloads
+
+def download_youtube(url, workdir, progress):
+    import yt_dlp
+
+    state = {"last": 0}
+
+    def hook(d):
+        if d.get("status") == "downloading" and time.time() - state["last"] > 2:
+            state["last"] = time.time()
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            pct = d.get("downloaded_bytes", 0) / total * 100 if total else None
+            progress(pct, "Lade Video von YouTube … " + (("%d %%" % pct) if pct is not None else ""))
+
+    opts = {
+        "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
+        "outtmpl": os.path.join(workdir, "source.%(ext)s"),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [hook],
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        msg = str(e)
+        if "confirm you" in msg or "bot" in msg.lower() or "429" in msg:
+            raise RuntimeError("YouTube blockiert gerade Downloads von diesem Server. Bitte lade das Video selbst "
+                               "herunter und lade es hoch oder lege es in Nextcloud ab.")
+        raise RuntimeError("YouTube-Download fehlgeschlagen: " + re.sub(r"\x1b\[[0-9;]*m", "", msg)[:300])
+    files = [f for f in os.listdir(workdir) if f.startswith("source.")]
+    if not files:
+        raise RuntimeError("YouTube-Download fehlgeschlagen: keine Datei erhalten.")
+    return files[0], (info or {}).get("title") or "YouTube-Video"

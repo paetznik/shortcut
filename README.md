@@ -4,13 +4,17 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 
 ## Ablauf
 
-1. Video in der Weboberfläche hochladen (in 8-MB-Stücken, daher auch große Dateien).
-2. Transkription auf Deutsch mit [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (lokal, CPU).
+1. Video holen: Upload im Browser (in 8-MB-Stücken, daher auch große Dateien), YouTube-Link (nur eigene Videos; YouTube blockiert Server-IPs zeitweise) oder Datei aus einem Nextcloud-Ordner.
+2. Transkription auf Deutsch mit [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (lokal, CPU). Eine Liste mit Fachbegriffen und Namen in den Einstellungen verbessert die Schreibweise.
 3. Highlight-Auswahl:
    - mit Anthropic-API-Schlüssel (in den Einstellungen hinterlegen): Claude wählt die Ausschnitte und schreibt Titel und Beschreibungen,
    - ohne Schlüssel: automatische Auswahl nach Sprechtempo, Fragen und Schlüsselwörtern.
-4. Schnitt mit ffmpeg: Zuschnitt auf 9:16 (Mitte oder ganzes Bild mit unscharfem Hintergrund), eingebrannte Untertitel, Lautstärke-Normalisierung.
-5. Download als MP4 plus SRT; Start, Ende und Titel lassen sich pro Clip anpassen und neu rendern.
+4. Optional Prüfmodus: Titel, Hook-Text und Untertitel jedes Clips vor dem Rendern korrigieren.
+5. Schnitt mit ffmpeg:
+   - 9:16-Zuschnitt, der dem Sprecher folgt (Gesichtserkennung mit OpenCV, Mundbewegung entscheidet bei mehreren Personen), alternativ Mitte oder ganzes Bild mit unscharfem Hintergrund,
+   - Pausen und Füllwörter werden herausgeschnitten,
+   - Hook-Text in den ersten Sekunden, animierte Wort-für-Wort-Untertitel, Lautstärke-Normalisierung.
+6. Download als MP4 plus SRT, automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Start, Ende, Titel und Text lassen sich pro Clip nachträglich ändern und neu rendern.
 
 ## Deployment
 

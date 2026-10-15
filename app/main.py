@@ -11,10 +11,12 @@ import threading
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+import integrations
 import pipeline
 
 DATA = os.environ.get("DATA_DIR", "/data")
@@ -27,9 +29,15 @@ os.makedirs(JOBS, exist_ok=True)
 os.makedirs(UPLOADS, exist_ok=True)
 
 DEFAULTS = {
-    "clips": 5, "min_len": 20, "max_len": 60, "mode": "crop", "quality": "ausgewogen",
+    "clips": 5, "min_len": 20, "max_len": 60, "mode": "auto", "quality": "ausgewogen",
     "highlight": "#FFE600", "uppercase": True, "font_size": 78, "position": "unten", "words_per_line": 3,
+    "remove_pauses": True, "hook": True, "hook_seconds": 3, "review": False,
 }
+# settings stored in config.json; secrets are never sent back to the browser
+CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
+CONFIG_SECRET = ("anthropic_key", "nc_pass", "pz_key")
+CONFIG_DEFAULTS = {"nc_url": "https://cloud.paetze.digital", "nc_folder": "ShortCut", "nc_export": False,
+                   "pz_url": "https://postiz.srv2011660.hstgr.cloud/api/public/v1", "vocabulary": ""}
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 lock = threading.Lock()
@@ -41,9 +49,9 @@ work = queue.Queue()
 def load_config():
     try:
         with open(CONFIG, encoding="utf-8") as f:
-            return json.load(f)
+            return {**CONFIG_DEFAULTS, **json.load(f)}
     except FileNotFoundError:
-        return {}
+        return dict(CONFIG_DEFAULTS)
 
 
 def save_config(cfg):
@@ -135,7 +143,13 @@ def get_settings(request: Request):
     require_auth(request)
     cfg = load_config()
     key = cfg.get("anthropic_key", "")
-    return {"has_key": bool(key), "key_hint": ("…" + key[-4:]) if key else "", "defaults": {**DEFAULTS, **cfg.get("defaults", {})}}
+    out = {"has_key": bool(key), "key_hint": ("…" + key[-4:]) if key else "",
+           "defaults": {**DEFAULTS, **cfg.get("defaults", {})}, "nc_export": bool(cfg.get("nc_export"))}
+    for k in CONFIG_TEXT:
+        out[k] = cfg.get(k, "")
+    for k in CONFIG_SECRET:
+        out["has_" + k] = bool(cfg.get(k))
+    return out
 
 
 @app.post("/api/settings")
@@ -144,12 +158,18 @@ async def set_settings(request: Request):
     body = await request.json()
     with lock:
         cfg = load_config()
-        if "anthropic_key" in body:
-            key = (body["anthropic_key"] or "").strip()
-            if key:
-                cfg["anthropic_key"] = key
-            else:
-                cfg.pop("anthropic_key", None)
+        for k in CONFIG_SECRET:
+            if k in body:
+                v = (body[k] or "").strip()
+                if v:
+                    cfg[k] = v
+                else:
+                    cfg.pop(k, None)
+        for k in CONFIG_TEXT:
+            if k in body:
+                cfg[k] = str(body[k] or "").strip()[:2000]
+        if "nc_export" in body:
+            cfg["nc_export"] = bool(body["nc_export"])
         if "defaults" in body:
             cfg["defaults"] = clean_settings(body["defaults"])
         if body.get("new_password"):
@@ -181,8 +201,9 @@ def clean_settings(s):
     out["max_len"] = max(out["min_len"] + 5, min(180, out["max_len"]))
     out["font_size"] = max(40, min(140, out["font_size"]))
     out["words_per_line"] = max(1, min(6, out["words_per_line"]))
-    if out["mode"] not in ("crop", "blur"):
-        out["mode"] = "crop"
+    out["hook_seconds"] = max(1, min(10, out["hook_seconds"]))
+    if out["mode"] not in ("auto", "crop", "blur"):
+        out["mode"] = "auto"
     if out["quality"] not in pipeline.WHISPER_PRESETS:
         out["quality"] = "ausgewogen"
     if not re.fullmatch(r"#[0-9A-Fa-f]{6}", out["highlight"]):
@@ -210,8 +231,42 @@ def save_job(job):
     os.replace(path + ".tmp", path)
 
 
-def public_job(job):
-    return {k: v for k, v in job.items() if k not in ("log",)} | {"log": job.get("log", [])[-5:]}
+def load_transcript(jid):
+    path = os.path.join(JOBS, jid, "transcript.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_transcript(jid, segments):
+    path = os.path.join(JOBS, jid, "transcript.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+
+
+def public_job(job, with_text=False):
+    out = {k: v for k, v in job.items() if k not in ("log",)} | {"log": job.get("log", [])[-5:]}
+    if with_text and job.get("clips"):
+        segments = load_transcript(job["id"])
+        if segments:
+            out["clips"] = [dict(c, text=" ".join(w["w"] for w in pipeline.clip_words(segments, c["start"], c["end"])))
+                            for c in job["clips"]]
+    return out
+
+
+def new_job(name, settings, context, source=None, remote=None, size=0):
+    jid = uuid.uuid4().hex[:12]
+    os.makedirs(os.path.join(JOBS, jid))
+    job = {
+        "id": jid, "name": name, "created": time.time(), "status": "wartet", "progress": 0,
+        "message": "In der Warteschlange", "settings": settings, "context": context, "source": source,
+        "remote": remote, "size": size, "clips": [], "log": [], "selector": None,
+    }
+    save_job(job)
+    work.put(("process", jid, None))
+    return job
 
 
 @app.get("/api/jobs")
@@ -231,7 +286,7 @@ def list_jobs(request: Request):
 def get_job(jid: str, request: Request):
     require_auth(request)
     try:
-        return public_job(load_job(jid))
+        return public_job(load_job(jid), with_text=True)
     except FileNotFoundError:
         raise HTTPException(404, "Unbekannt")
 
@@ -269,6 +324,11 @@ async def upload_chunk(uid: str, request: Request, offset: int = 0):
     return {"size": os.path.getsize(path)}
 
 
+def source_name(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return "source" + (ext if re.fullmatch(r"\.[a-z0-9]{2,5}", ext) else ".mp4")
+
+
 @app.post("/api/jobs")
 async def create_job(request: Request):
     require_auth(request)
@@ -277,24 +337,45 @@ async def create_job(request: Request):
     if not os.path.exists(part) or os.path.getsize(part) < 1000:
         raise HTTPException(400, "Upload fehlt oder ist leer")
     filename = os.path.basename(str(body.get("filename") or "video.mp4"))[:120] or "video.mp4"
-    context = str(body.get("context") or "")[:1000]
-    settings = clean_settings(body.get("settings"))
-    jid = uuid.uuid4().hex[:12]
-    d = os.path.join(JOBS, jid)
-    os.makedirs(d)
-    ext = os.path.splitext(filename)[1].lower()
-    if not re.fullmatch(r"\.[a-z0-9]{2,5}", ext):
-        ext = ".mp4"
-    src = os.path.join(d, "source" + ext)
-    os.replace(part, src)
-    size = os.path.getsize(src)
-    job = {
-        "id": jid, "name": filename, "created": time.time(), "status": "wartet", "progress": 0,
-        "message": "In der Warteschlange", "settings": settings, "context": context, "source": os.path.basename(src),
-        "size": size, "clips": [], "log": [], "selector": None,
-    }
-    save_job(job)
-    work.put(("process", jid, None))
+    src = source_name(filename)
+    size = os.path.getsize(part)
+    job = new_job(filename, clean_settings(body.get("settings")), str(body.get("context") or "")[:1000], src, None, size)
+    os.replace(part, os.path.join(JOBS, job["id"], src))
+    return public_job(job)
+
+
+@app.post("/api/import/youtube")
+async def import_youtube(request: Request):
+    require_auth(request)
+    body = await request.json()
+    url = str(body.get("url") or "").strip()
+    if not re.match(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", url):
+        raise HTTPException(400, "Bitte einen gültigen YouTube-Link einfügen.")
+    job = new_job("YouTube-Video", clean_settings(body.get("settings")), str(body.get("context") or "")[:1000],
+                  None, {"type": "youtube", "url": url})
+    return public_job(job)
+
+
+@app.get("/api/nextcloud/files")
+def nextcloud_files(request: Request):
+    require_auth(request)
+    try:
+        return integrations.Nextcloud(load_config()).list_videos()
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, "Nextcloud nicht erreichbar: " + str(e)[:200])
+
+
+@app.post("/api/import/nextcloud")
+async def import_nextcloud(request: Request):
+    require_auth(request)
+    body = await request.json()
+    name = os.path.basename(str(body.get("name") or ""))
+    if not name.lower().endswith(integrations.VIDEO_EXT):
+        raise HTTPException(400, "Keine Videodatei")
+    job = new_job(name, clean_settings(body.get("settings")), str(body.get("context") or "")[:1000],
+                  None, {"type": "nextcloud", "name": name})
     return public_job(job)
 
 
@@ -303,7 +384,7 @@ def delete_job(jid: str, request: Request):
     require_auth(request)
     d = job_dir(jid)
     job = load_job(jid)
-    if job["status"] not in ("fertig", "fehler"):
+    if job["status"] not in ("fertig", "fehler", "prüfen"):
         job["cancel"] = True
         save_job(job)
     shutil.rmtree(d, ignore_errors=True)
@@ -311,28 +392,98 @@ def delete_job(jid: str, request: Request):
 
 
 @app.post("/api/jobs/{jid}/clips/{idx}")
-async def rerender_clip(jid: str, idx: int, request: Request):
-    """Adjust start/end/title of a clip and render it again."""
+async def edit_clip(jid: str, idx: int, request: Request):
+    """Change timing, titles or transcript of a clip; renders it again unless the job is still in review."""
+    require_auth(request)
+    body = await request.json()
+    with lock:
+        job = load_job(jid)
+        if job["status"] not in ("fertig", "fehler", "prüfen") or idx >= len(job["clips"]):
+            raise HTTPException(400, "Clip kann gerade nicht bearbeitet werden")
+        clip = job["clips"][idx]
+        try:
+            s, e = float(body.get("start", clip["start"])), float(body.get("end", clip["end"]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Ungültige Zeit")
+        if e - s < 3 or e - s > 180 or s < 0:
+            raise HTTPException(400, "Clip muss zwischen 3 und 180 Sekunden lang sein")
+        if "text" in body:
+            segments = load_transcript(jid)
+            old = [w for w in pipeline.all_words(segments) if w["e"] > clip["start"] and w["s"] < clip["end"]]
+            new_text = re.sub(r"\s+", " ", str(body["text"])).strip()
+            if new_text != " ".join(w["w"] for w in old):
+                save_transcript(jid, pipeline.replace_words(segments, clip["start"], clip["end"],
+                                                            pipeline.realign(old, new_text)))
+        clip.update({"start": round(s, 2), "end": round(e, 2)})
+        for k in ("title", "hook_text", "caption"):
+            if k in body:
+                clip[k] = str(body[k])[:2000]
+        if "style" in body:
+            job["settings"] = clean_settings({**job["settings"], **body["style"]})
+        if job["status"] != "prüfen":
+            clip["status"] = "wartet"
+            job["status"] = "wartet"
+            job["message"] = "Clip %d wird neu gerendert" % (idx + 1)
+            work.put(("render", jid, idx))
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.post("/api/jobs/{jid}/render")
+def render_all(jid: str, request: Request):
+    """Leave review mode and render every clip."""
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if job["status"] != "prüfen":
+            raise HTTPException(400, "Projekt ist nicht im Prüfmodus")
+        job["status"], job["message"] = "wartet", "Clips werden gerendert"
+        save_job(job)
+    work.put(("render_all", jid, None))
+    return public_job(job, with_text=True)
+
+
+@app.get("/api/postiz/integrations")
+def postiz_integrations(request: Request):
+    require_auth(request)
+    try:
+        return integrations.Postiz(load_config()).integrations()
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, "Postiz nicht erreichbar: " + str(e)[:200])
+
+
+@app.post("/api/jobs/{jid}/clips/{idx}/postiz")
+async def send_to_postiz(jid: str, idx: int, request: Request):
     require_auth(request)
     body = await request.json()
     job = load_job(jid)
-    if job["status"] not in ("fertig", "fehler") or idx >= len(job["clips"]):
-        raise HTTPException(400, "Clip kann gerade nicht bearbeitet werden")
+    if idx >= len(job["clips"]) or not job["clips"][idx].get("file"):
+        raise HTTPException(400, "Clip ist noch nicht fertig")
     clip = job["clips"][idx]
+    channels = [c for c in body.get("channels", []) if isinstance(c, dict) and c.get("id")]
+    if not channels:
+        raise HTTPException(400, "Bitte mindestens einen Kanal wählen.")
+    now = body.get("when") == "now"
     try:
-        s, e = float(body.get("start", clip["start"])), float(body.get("end", clip["end"]))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "Ungültige Zeit")
-    if e - s < 3 or e - s > 180 or s < 0:
-        raise HTTPException(400, "Clip muss zwischen 3 und 180 Sekunden lang sein")
-    clip.update({"start": round(s, 2), "end": round(e, 2), "title": str(body.get("title", clip["title"]))[:200], "status": "wartet"})
-    if "style" in body:
-        job["settings"] = clean_settings({**job["settings"], **body["style"]})
-    job["status"] = "wartet"
-    job["message"] = "Clip %d wird neu gerendert" % (idx + 1)
-    save_job(job)
-    work.put(("render", jid, idx))
-    return public_job(job)
+        date = datetime.fromisoformat(str(body.get("date"))).astimezone(timezone.utc) if not now else datetime.now(timezone.utc)
+    except ValueError:
+        raise HTTPException(400, "Ungültiges Datum")
+    content = str(body.get("content") or (clip.get("title", "") + "\n\n" + clip.get("caption", ""))).strip()
+    try:
+        integrations.Postiz(load_config()).post(os.path.join(job_dir(jid), clip["file"]), content, clip.get("title", ""),
+                                                 channels, date.strftime("%Y-%m-%dT%H:%M:%S.000Z"), now)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, "Postiz nicht erreichbar: " + str(e)[:200])
+    with lock:
+        job = load_job(jid)
+        job["clips"][idx]["postiz"] = {"at": time.time(), "date": date.timestamp(), "now": now,
+                                       "channels": [c.get("name", "") for c in channels]}
+        save_job(job)
+    return {"ok": True}
 
 
 @app.get("/files/{jid}/{name}")
@@ -377,18 +528,28 @@ def log(jid, msg):
         save_job(job)
 
 
-def render_one(jid, job, idx, info):
+def render_one(jid, idx, info):
+    """Render one clip: subtitles, speaker framing, pause cuts and the hook text."""
     d = os.path.join(JOBS, jid)
+    job = load_job(jid)
     clip = job["clips"][idx]
-    with open(os.path.join(d, "transcript.json"), encoding="utf-8") as f:
-        segments = json.load(f)
+    s = job["settings"]
+    segments = load_transcript(jid)
     version = clip.get("version", 0) + 1
     name = "clip%02d" % (idx + 1) + ("_v%d" % version if version > 1 else "")
+    duration = clip["end"] - clip["start"]
     words = pipeline.clip_words(segments, clip["start"], clip["end"])
+    intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True))
+    out_words = pipeline.remap_words(words, intervals)
+    out_len = sum(b - a for a, b in intervals)
     ass = name + ".ass"
-    pipeline.write_subtitles(words, os.path.join(d, ass), os.path.join(d, name + ".srt"), job["settings"])
-    pipeline.render_clip(os.path.join(d, job["source"]), info, clip["start"], clip["end"], d, name,
-                         job["settings"]["mode"], ass, burn=bool(words))
+    burn = pipeline.write_subtitles(out_words, os.path.join(d, ass), os.path.join(d, name + ".srt"), s,
+                                    clip.get("hook_text", clip.get("title", "")), out_len)
+    crop_segs = None
+    if s.get("mode") == "auto":
+        crop_segs = pipeline.track_speaker(os.path.join(d, job["source"]), info, clip["start"], clip["end"])
+    out_len = pipeline.render_clip(os.path.join(d, job["source"]), info, clip["start"], clip["end"], d, name,
+                                   s["mode"], ass, burn, intervals, crop_segs)
     for old in (clip.get("file"), clip.get("thumb"), clip.get("srt")):
         if old and old.split(".")[0] != name:
             try:
@@ -399,20 +560,65 @@ def render_one(jid, job, idx, info):
         os.remove(os.path.join(d, ass))
     except OSError:
         pass
-    clip.update({"file": name + ".mp4", "thumb": name + ".jpg", "srt": name + ".srt", "version": version,
-                 "status": "fertig", "text": " ".join(w["w"] for w in words)})
+    with lock:
+        job = load_job(jid)
+        job["clips"][idx].update({
+            "file": name + ".mp4", "thumb": name + ".jpg", "srt": name + ".srt", "version": version,
+            "status": "fertig", "duration_out": round(out_len, 1), "speakers": len({x for _, _, x in crop_segs or []}),
+        })
+        save_job(job)
+    export_clip(jid, idx)
+
+
+def export_clip(jid, idx):
+    cfg = load_config()
+    if not cfg.get("nc_export"):
+        return
+    job = load_job(jid)
+    clip = job["clips"][idx]
+    try:
+        nc = integrations.Nextcloud(cfg)
+        folder = "Shorts/" + re.sub(r"[^\w\- ]+", "_", os.path.splitext(job["name"])[0])[:60].strip()
+        nc.mkdirs(folder)
+        for k in ("file", "srt"):
+            nc.upload(folder + "/" + clip[k], os.path.join(JOBS, jid, clip[k]))
+        log(jid, "Clip %d in Nextcloud gespeichert (%s/%s)" % (idx + 1, nc.folder, folder))
+    except Exception as e:
+        log(jid, "Nextcloud-Export fehlgeschlagen: " + str(e)[:200])
+
+
+def fetch_source(jid, job):
+    """Download the video for imported jobs (YouTube link or Nextcloud file)."""
+    d = os.path.join(JOBS, jid)
+    remote = job.get("remote") or {}
+
+    def prog(p, msg):
+        update(jid, message=msg, **({"progress": round(p * 0.03, 1)} if p is not None else {}))
+
+    if remote.get("type") == "youtube":
+        update(jid, message="Lade Video von YouTube …")
+        src, title = pipeline.download_youtube(remote["url"], d, prog)
+        return update(jid, source=src, name=title[:120], size=os.path.getsize(os.path.join(d, src)))
+    if remote.get("type") == "nextcloud":
+        update(jid, message="Lade Video aus Nextcloud …")
+        src = source_name(remote["name"])
+        integrations.Nextcloud(load_config()).download(remote["name"], os.path.join(d, src), prog)
+        return update(jid, source=src, size=os.path.getsize(os.path.join(d, src)))
+    raise RuntimeError("Keine Videodatei vorhanden.")
 
 
 def process(jid):
     d = os.path.join(JOBS, jid)
     job = update(jid, status="läuft", progress=1, message="Analysiere Video …", started=time.time())
+    if not job.get("source") or not os.path.exists(os.path.join(d, job["source"])):
+        job = fetch_source(jid, job)
     src = os.path.join(d, job["source"])
     info = pipeline.probe(src)
     job = update(jid, info=info)
     log(jid, "Video: %dx%d, %s" % (info["width"], info["height"], pipeline.fmt_time(info["duration"])))
 
-    tpath = os.path.join(d, "transcript.json")
-    if not os.path.exists(tpath):
+    segments = load_transcript(jid)
+    if segments is None:
         update(jid, progress=3, message="Extrahiere Audio …")
         wav = os.path.join(d, "audio.wav")
         pipeline.extract_audio(src, wav)
@@ -423,14 +629,11 @@ def process(jid):
                 fields["progress"] = round(5 + p * 0.65, 1)
             update(jid, **fields)
 
-        segments = pipeline.transcribe(wav, info["duration"], job["settings"]["quality"], prog)
+        segments = pipeline.transcribe(wav, info["duration"], job["settings"]["quality"], prog,
+                                       load_config().get("vocabulary", ""))
         os.remove(wav)
-        with open(tpath, "w", encoding="utf-8") as f:
-            json.dump(segments, f, ensure_ascii=False)
+        save_transcript(jid, segments)
         log(jid, "Transkript: %d Abschnitte" % len(segments))
-    else:
-        with open(tpath, encoding="utf-8") as f:
-            segments = json.load(f)
     if not segments:
         raise RuntimeError("Im Video wurde keine Sprache erkannt.")
 
@@ -442,22 +645,29 @@ def process(jid):
     if not clips:
         raise RuntimeError("Keine passenden Highlights gefunden. Versuche eine kürzere Mindestlänge.")
     for c in clips:
-        c["status"] = "wartet"
-    job = update(jid, clips=clips, selector=source)
+        c["status"] = "entwurf" if s.get("review") else "wartet"
+        c["hook_text"] = c.get("title", "")
+    update(jid, clips=clips, selector=source)
     log(jid, "%d Highlights gefunden (%s)" % (len(clips), "Claude KI" if source == "claude" else "Automatik"))
+    if s.get("review"):
+        update(jid, status="prüfen", progress=75, message="Bitte Clips prüfen und dann rendern")
+        return
+    render_clips(jid, info)
 
-    for i in range(len(clips)):
-        job = update(jid, progress=round(75 + i / len(clips) * 24, 1), message="Rendere Clip %d von %d …" % (i + 1, len(clips)))
-        render_one(jid, job, i, info)
-        update(jid, clips=job["clips"])
-    update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % len(clips), finished=time.time())
+
+def render_clips(jid, info):
+    job = load_job(jid)
+    n = len(job["clips"])
+    for i in range(n):
+        update(jid, status="läuft", progress=round(75 + i / n * 24, 1), message="Rendere Clip %d von %d …" % (i + 1, n))
+        render_one(jid, i, info)
+    update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % n, finished=time.time())
 
 
 def rerender(jid, idx):
     job = update(jid, status="läuft", message="Rendere Clip %d neu …" % (idx + 1))
-    render_one(jid, job, idx, job["info"])
-    job["clips"][idx]["status"] = "fertig"
-    update(jid, clips=job["clips"], status="fertig", progress=100, message="Fertig – %d Clips" % len(job["clips"]))
+    render_one(jid, idx, job["info"])
+    update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % len(job["clips"]))
 
 
 def worker():
@@ -466,7 +676,12 @@ def worker():
         try:
             if not os.path.exists(os.path.join(JOBS, jid, "job.json")):
                 continue
-            process(jid) if kind == "process" else rerender(jid, idx)
+            if kind == "process":
+                process(jid)
+            elif kind == "render_all":
+                render_clips(jid, load_job(jid)["info"])
+            else:
+                rerender(jid, idx)
         except Cancelled:
             pass
         except Exception as e:
@@ -508,6 +723,8 @@ def start():
         if job.get("info") and job["clips"] and all(c.get("file") for c in job["clips"]):
             job["status"], job["message"] = "fertig", "Fertig – %d Clips" % len(job["clips"])
             save_job(job)
+        elif job.get("info") and job["clips"]:
+            work.put(("render_all", job["id"], None))
         else:
             work.put(("process", job["id"], None))
     threading.Thread(target=worker, daemon=True).start()
