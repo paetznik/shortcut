@@ -106,6 +106,14 @@ body.safe .sz{display:block}
 .cropbox img{width:100%;display:block;opacity:.45;pointer-events:none}
 .cropsel{position:absolute;top:0;bottom:0;border:2px solid var(--accent);background:rgba(255,255,255,.14);pointer-events:none;border-radius:4px}
 .tr{display:flex;flex-direction:column;gap:6px;border-top:1px solid var(--line);padding-top:8px}
+.tl{width:100%;height:90px;display:block;margin-top:8px}
+.tl-line{fill:none;stroke:var(--accent2);stroke-width:1.6;vector-effect:non-scaling-stroke}
+.tl-base{stroke:var(--line);stroke-dasharray:4 4;vector-effect:non-scaling-stroke}
+.tl-clip{fill:rgba(255,61,110,.18)}
+.tl-num{fill:var(--accent);font-size:11px;font-weight:700}
+.tl-react{fill:#8ab4ff}
+.tl-key-clip,.tl-key-react{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px}
+.tl-key-clip{background:rgba(255,61,110,.5)}.tl-key-react{background:#8ab4ff;border-radius:50%}
 @media (max-width:600px){header{padding:12px 16px}.job{flex-wrap:wrap}.thumbs{display:none}h1{font-size:22px}}
 </style>
 </head>
@@ -265,7 +273,7 @@ function renderHome(){
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
       '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
     '</div>'+
-    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
+    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
     '<details><summary>Untertitel, Hook und Qualität</summary><div class="grid">'+
       '<div><label>Untertitel-Stil</label><select id="o_sub_style">'+opt("pop",d.sub_style,"Pop – Wort für Wort")+opt("box",d.sub_style,"Box – mit Hintergrund")+opt("minimal",d.sub_style,"Minimal")+opt("satz",d.sub_style,"Ganze Sätze")+'</select></div>'+
       '<div><label>Hervorhebung (aktives Wort)</label><input id="o_highlight" type="color" value="'+d.highlight+'"></div>'+
@@ -298,7 +306,7 @@ function renderHome(){
 
 function readOpts(){
   var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1"].forEach(function(k){o[k]=$("o_"+k).checked});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
@@ -417,6 +425,7 @@ function renderJob(){
   if(running||j.status==="fertig") html+='<div class="log">'+(j.log||[]).map(esc).join("<br>")+'</div>';
   if(j.status==="fehler") html+='<div class="hint" style="margin-top:14px;background:#2a1616;border-color:#5a2525;color:#ffb3b3">'+esc(j.message)+'</div>';
   if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Hook, Titelbild-Text und Untertitel jedes Clips. Wörter anklicken schneidet sie heraus, Tippfehler korrigierst du im Textfeld. Dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
+  html+=energyTimeline(j);
   html+=bestofCard(j);
   html+='<div class="clips">'+(j.clips||[]).map(function(c,i){
     var done=c.file&&c.status==="fertig";
@@ -427,7 +436,7 @@ function renderJob(){
     var pz=c.postiz?'<div class="tag">✓ An Postiz gesendet'+(c.postiz.now?' (sofort)':' – geplant für '+new Date(c.postiz.date*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"}))+(c.postiz.channels&&c.postiz.channels.length?': '+esc(c.postiz.channels.join(", ")):'')+'</div>':'';
     var f=c.formats||{},dl=function(file,label,cls){return '<a class="btn sm'+(cls||"")+'" href="/files/'+j.id+'/'+file+'?dl=1">'+label+'</a>'};
     return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+(c.variant_of!=null?' · Variante von Clip '+(c.variant_of+1):'')+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
-      lengthNote(outLen)+
+      lengthNote(outLen)+audioBadge(c)+
       '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
       (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+pz+
       (done&&!review?'<div class="row" style="margin-top:auto;gap:8px">'+dl(c.file,"MP4 9:16"," primary")+(f["4x5"]?dl(f["4x5"],"4:5"):'')+(f["1x1"]?dl(f["1x1"],"1:1"):'')+(c.cover?dl(c.cover,"Titelbild"):'')+dl(c.srt,"SRT")+
@@ -514,6 +523,28 @@ function cropTime(i){
 }
 function delCropKey(i,n){cropState(i).keys.splice(n,1);$("ck"+i).innerHTML=cropList(i)}
 function clearCrop(i){cropState(i).keys=[];$("ck"+i).innerHTML=cropList(i);toast("Bildausschnitt wieder automatisch – Speichern nicht vergessen")}
+
+// ---------------------------------------------------------------- audio analysis
+var TAGS={laut:"laut",lebhaft:"lebhafte Stimme",schnell:"schnell gesprochen",reaktion:"Lachen/Reaktion"};
+function audioBadge(c){
+  var a=c.audio;if(!a) return '';
+  var lvl=a.mean>0.8?["hoch","ok"]:a.mean>0?["mittel","run"]:["ruhig",""];
+  var tags=(a.tags||[]).map(function(t){return TAGS[t]||t});
+  if(c.reaction) tags.push("endet mit Reaktion");
+  return '<div class="small"><span class="pill '+lvl[1]+'">Tonenergie: '+lvl[0]+'</span> <span class="muted">'+esc(tags.join(" · "))+'</span></div>';
+}
+function energyTimeline(j){
+  var cv=j.audio_curve;if(!cv||!cv.values||!cv.values.length||!j.info) return '';
+  var W=1000,H=90,n=cv.values.length,dur=j.info.duration||n*cv.step;
+  var y=function(v){v=Math.max(-2,Math.min(3,v));return H-6-((v+2)/5)*(H-12)};
+  var x=function(t){return Math.max(0,Math.min(W,t/dur*W))};
+  var pts=cv.values.map(function(v,i){return x(i*cv.step).toFixed(1)+","+y(v).toFixed(1)}).join(" ");
+  var clips=(j.clips||[]).map(function(c,i){return '<rect x="'+x(c.start)+'" y="0" width="'+Math.max(2,x(c.end)-x(c.start))+'" height="'+H+'" class="tl-clip"/><text x="'+(x(c.start)+3)+'" y="12" class="tl-num">'+(i+1)+'</text>'}).join("");
+  var ev=(j.audio_events||[]).filter(function(e){return e.type==="reaktion"}).map(function(e){return '<circle cx="'+x((e.s+e.e)/2)+'" cy="'+(H-5)+'" r="3.5" class="tl-react"><title>Lachen/Reaktion '+fmt(e.s)+'</title></circle>'}).join("");
+  return '<div class="card" style="margin-top:16px;padding:14px 16px"><div class="row" style="justify-content:space-between"><b>Tonenergie im Video</b><span class="muted small">Lautstärke, lebhafte Stimme und Tempo · <span class="tl-key-clip"></span> Clips · <span class="tl-key-react"></span> Lachen/Reaktion</span></div>'+
+    '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" class="tl" role="img" aria-label="Verlauf der Tonenergie">'+clips+'<line x1="0" x2="'+W+'" y1="'+y(0)+'" y2="'+y(0)+'" class="tl-base"/><polyline points="'+pts+'" class="tl-line"/>'+ev+'</svg>'+
+    '<div class="row muted small" style="justify-content:space-between"><span>0:00</span><span>'+fmt(dur)+'</span></div></div>';
+}
 
 // ---------------------------------------------------------------- best-of
 function bestofCard(j){

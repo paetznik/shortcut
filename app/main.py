@@ -35,7 +35,7 @@ DEFAULTS = {
     "highlight": "#FFE600", "uppercase": True, "font_size": 78, "position": "unten", "words_per_line": 3,
     "remove_pauses": True, "hook": True, "hook_seconds": 3, "review": False,
     "sub_style": "pop", "keyword_color": "#4ADE80", "zoom": True, "enhance_audio": True, "music": "", "music_volume": 15,
-    "fmt_4x5": False, "fmt_1x1": False, "cover": True,
+    "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -713,6 +713,7 @@ def prepare(jid, idx, info):
     words = pipeline.clip_words(load_transcript(jid), clip["start"], clip["end"])
     removed = [r - clip["start"] for r in clip.get("removed", [])]
     intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True), removed)
+    intervals = pipeline.add_spans(intervals, reaction_spans(jid, clip["start"], clip["end"]), duration)
     out_words = pipeline.remap_words(words, intervals)
     out_len = sum(b - a for a, b in intervals)
     crop_segs = manual_crop(clip, info)
@@ -820,6 +821,7 @@ def render_bestof(jid, target):
         clip = {"start": a, "end": b, "removed": [], "crop_keys": c.get("crop_keys")}
         words = pipeline.clip_words(segments, a, b)
         intervals = pipeline.keep_intervals(words, b - a, s.get("remove_pauses", True))
+        intervals = pipeline.add_spans(intervals, reaction_spans(jid, a, b), b - a)
         out_words = pipeline.remap_words(words, intervals)
         out_len = sum(y - x for x, y in intervals)
         crop = manual_crop(clip, info) or (pipeline.track_speaker(os.path.join(d, job["source"]), info, a, b)
@@ -922,6 +924,42 @@ def fetch_source(jid, job):
     raise RuntimeError("Keine Videodatei vorhanden.")
 
 
+def load_audio(jid):
+    path = os.path.join(JOBS, jid, "audio.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run_audio_analysis(jid, wav, segments):
+    """Loudness, liveliness and speech rate over the whole video; kept in audio.json, a small curve goes to the job."""
+    update(jid, progress=71, message="Analysiere Ton (Lautstärke, Stimme, Tempo, Reaktionen) …")
+    try:
+        audio = pipeline.analyze_audio(wav, pipeline.all_words(segments))
+    except Exception as e:
+        log(jid, "Tonanalyse fehlgeschlagen: " + str(e)[:200])
+        return
+    if not audio:
+        return
+    with open(os.path.join(JOBS, jid, "audio.json"), "w", encoding="utf-8") as f:
+        json.dump(audio, f)
+    counts = {}
+    for ev in audio["events"]:
+        counts[ev["type"]] = counts.get(ev["type"], 0) + 1
+    update(jid, audio_curve=pipeline.audio_curve(audio), audio_events=audio["events"][:300])
+    log(jid, "Tonanalyse: " + (", ".join("%d× %s" % (n, pipeline.TAG_LABELS[k]) for k, n in counts.items()) or "keine Auffälligkeiten"))
+
+
+def reaction_spans(jid, start, end):
+    """Laughter/applause inside a clip (clip time), so the pause cutter keeps them."""
+    audio = load_audio(jid)
+    if not audio:
+        return []
+    return [(ev["s"] - start, ev["e"] - start) for ev in audio["events"]
+            if ev["type"] == "reaktion" and ev["e"] > start and ev["s"] < end]
+
+
 def process(jid):
     d = os.path.join(JOBS, jid)
     job = update(jid, status="läuft", progress=1, message="Analysiere Video …", started=time.time())
@@ -946,17 +984,25 @@ def process(jid):
 
         segments = pipeline.transcribe(wav, info["duration"], job["settings"]["quality"], prog,
                                        load_config().get("vocabulary", ""))
-        os.remove(wav)
         save_transcript(jid, segments)
         log(jid, "Transkript: %d Abschnitte" % len(segments))
+        if job["settings"].get("audio_analysis", True):
+            run_audio_analysis(jid, wav, segments)
+        os.remove(wav)
     if not segments:
         raise RuntimeError("Im Video wurde keine Sprache erkannt.")
+    if job["settings"].get("audio_analysis", True) and load_audio(jid) is None:
+        wav = os.path.join(d, "audio.wav")
+        pipeline.extract_audio(src, wav)
+        run_audio_analysis(jid, wav, segments)
+        os.remove(wav)
 
     s = job["settings"]
     update(jid, progress=72, message="Suche die besten Highlights …")
     key = load_config().get("anthropic_key", "")
+    audio = load_audio(jid) if s.get("audio_analysis", True) else None
     clips, source = pipeline.find_highlights(segments, key, s["clips"], s["min_len"], s["max_len"], job.get("context", ""),
-                                             lambda m: log(jid, m))
+                                             lambda m: log(jid, m), audio)
     if not clips:
         raise RuntimeError("Keine passenden Highlights gefunden. Versuche eine kürzere Mindestlänge.")
     for c in clips:

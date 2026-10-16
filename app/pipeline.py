@@ -128,9 +128,27 @@ def remove_overlaps(clips):
     return out
 
 
-def highlights_claude(segments, api_key, n, min_len, max_len, context):
-    lines = ["[%.1f-%.1f] %s" % (s["s"], s["e"], s["text"]) for s in segments]
-    transcript = "\n".join(lines)
+def annotated_transcript(segments, audio):
+    """Transcript lines with hints from the audio analysis, e.g. ⟨laut, lebhafte Stimme⟩ or ⟨Lachen/Reaktion⟩."""
+    lines = []
+    for seg in segments:
+        line = "[%.1f-%.1f] %s" % (seg["s"], seg["e"], seg["text"])
+        w = audio_window(audio, seg["s"], seg["e"]) if audio else None
+        if w:
+            tags = [TAG_LABELS[t] for t in w["tags"] if t != "reaktion"]
+            if w["mean"] > 1.2 and not tags:
+                tags.append("energiegeladen")
+            if tags:
+                line += " ⟨" + ", ".join(tags) + "⟩"
+        lines.append((seg["s"], line))
+    for ev in (audio or {}).get("events", []):
+        if ev["type"] == "reaktion":
+            lines.append((ev["s"], "[%.1f-%.1f] ⟨Lachen/Reaktion, keine Sprache⟩" % (ev["s"], ev["e"])))
+    return "\n".join(l for _, l in sorted(lines, key=lambda x: x[0]))
+
+
+def highlights_claude(segments, api_key, n, min_len, max_len, context, audio=None):
+    transcript = annotated_transcript(segments, audio)
     extra = ("\nZusätzlicher Kontext vom Ersteller: " + context.strip()) if context and context.strip() else ""
     prompt = (
         "Du bist ein erfahrener Social-Media-Editor für TikTok, Instagram Reels und YouTube Shorts.\n"
@@ -141,7 +159,10 @@ def highlights_claude(segments, api_key, n, min_len, max_len, context):
         "- Er beginnt mit einem starken Hook (Frage, steile These, Überraschung, Emotion) und braucht keinen Vorkontext.\n"
         "- Er endet an einem natürlichen Satzende mit einer Pointe oder einem abgeschlossenen Gedanken.\n"
         "- Ausschnitte überlappen sich nicht.\n"
-        "- Start und Ende müssen exakt auf Zeitstempeln aus dem Transkript liegen.%s\n\n"
+        "- Start und Ende müssen exakt auf Zeitstempeln aus dem Transkript liegen.\n"
+        "- Hinweise in ⟨⟩ stammen aus einer automatischen Tonanalyse (Lautstärke, lebhafte Stimme, Sprechtempo, "
+        "Lachen/Applaus). Emotionale Stellen und Momente kurz vor einer Reaktion sind oft starke Highlights – "
+        "der Inhalt geht aber vor.%s\n\n"
         "Antworte NUR mit einem JSON-Array, ohne weiteren Text, in diesem Format:\n"
         '[{"start": 12.3, "end": 55.0, "title": "kurzer, packender Titel", '
         '"hook": "warum das funktioniert (1 Satz)", "score": 1-100, '
@@ -179,7 +200,7 @@ HOOK_WORDS = [
 ]
 
 
-def highlights_heuristic(segments, n, min_len, max_len):
+def highlights_heuristic(segments, n, min_len, max_len, audio=None):
     """Fallback without AI: score windows by speech density, emphasis and hook words."""
     target = (min_len + max_len) / 2
     cands = []
@@ -201,6 +222,17 @@ def highlights_heuristic(segments, n, min_len, max_len):
                 if segments[j]["text"].strip()[-1:] in ".!?":
                     score += 5
                 score -= abs(dur - target) / target * 5
+                if audio:
+                    end = segments[j]["e"]
+                    aw = audio_window(audio, start, end)
+                    hook = audio_window(audio, start, min(end, start + 5))
+                    after = audio_window(audio, end, end + 3)
+                    if aw:
+                        score += 4 * aw["mean"] + 2 * len(aw["tags"])
+                    if hook:
+                        score += 3 * max(0.0, hook["peak"])
+                    if after and "reaktion" in after["tags"]:
+                        score += 6
                 cands.append({"start": start, "end": segments[j]["e"], "score": score, "text": text.strip()})
             j += 1
     clips = remove_overlaps(cands)[:n]
@@ -222,20 +254,28 @@ def highlights_heuristic(segments, n, min_len, max_len):
     return clips
 
 
-def find_highlights(segments, api_key, n, min_len, max_len, context, log):
+def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=None):
     words = all_words(segments)
     clips, source = None, "heuristik"
     if api_key:
         try:
-            clips = highlights_claude(segments, api_key, n, min_len, max_len, context)
+            clips = highlights_claude(segments, api_key, n, min_len, max_len, context, audio)
             source = "claude"
         except Exception as e:  # fall back to heuristic
             log("KI-Auswahl fehlgeschlagen, nutze automatische Auswahl: " + str(e)[:200])
     if not clips:
-        clips = highlights_heuristic(segments, n, min_len, max_len)
+        clips = highlights_heuristic(segments, n, min_len, max_len, audio)
     snapped = [c for c in (snap(c, words, min_len, max_len) for c in clips) if c]
     snapped = remove_overlaps(snapped)[:n]
     snapped.sort(key=lambda c: c["start"])
+    for k, c in enumerate(snapped):
+        if audio:  # keep the laugh or applause that follows the punchline
+            nxt = snapped[k + 1]["start"] if k + 1 < len(snapped) else float("inf")
+            ev = next((e for e in audio["events"] if e["type"] == "reaktion" and c["end"] - 0.5 <= e["s"] <= c["end"] + 1.5), None)
+            if ev:
+                c["end"] = round(min(ev["e"] + 0.3, c["end"] + 3.5, nxt), 2)
+                c["reaction"] = True
+            c["audio"] = audio_window(audio, c["start"], c["end"])
     for c in snapped:
         c["score"] = int(c.get("score") or 50)
         c.setdefault("title", "")
@@ -872,3 +912,141 @@ def frame_jpeg(video, t, width=640):
     if p.returncode != 0 or not p.stdout:
         raise RuntimeError("Standbild konnte nicht erstellt werden.")
     return p.stdout
+
+
+# ---------------------------------------------------------------- audio analysis
+
+def _robust_z(x, mask=None):
+    import numpy as np
+
+    ref = x[mask] if mask is not None and mask.any() else x
+    med = float(np.median(ref)) if len(ref) else 0.0
+    mad = float(np.median(np.abs(ref - med))) * 1.4826 if len(ref) else 1.0
+    return (x - med) / (mad if mad > 1e-6 else 1.0)
+
+
+def _merge_events(flags, step, kind, min_len):
+    out, start = [], None
+    for i, f in enumerate(list(flags) + [False]):
+        if f and start is None:
+            start = i
+        elif not f and start is not None:
+            if (i - start) * step >= min_len:
+                out.append({"s": round(start * step, 2), "e": round(i * step, 2), "type": kind})
+            start = None
+    return out
+
+
+def analyze_audio(wav, words, step=0.5):
+    """Cheap prosody analysis of the whole recording (CPU, numpy only).
+
+    Per `step` seconds: loudness, pitch variation (how lively the voice is) and speech rate, each relative to the
+    speaker's own typical level, combined into one energy value. Loud stretches without words are reported as
+    reactions (laughter, applause, shouting)."""
+    import wave
+
+    import numpy as np
+
+    with wave.open(wav, "rb") as f:
+        sr = f.getframerate()
+        a = np.frombuffer(f.readframes(f.getnframes()), np.int16).astype(np.float32) / 32768.0
+    hop = int(sr * step)
+    n = len(a) // hop
+    if n < 4:
+        return None
+
+    # loudness per window
+    win = a[: n * hop].reshape(n, hop)
+    db = 20 * np.log10(np.sqrt((win ** 2).mean(1)) + 1e-6)
+
+    # pitch per 20 ms frame via autocorrelation (70-400 Hz), only where there is signal
+    fl, fh = int(sr * 0.04), int(sr * 0.02)
+    nf = (len(a) - fl) // fh
+    f0 = np.zeros(max(nf, 0), np.float32)
+    lo, hi = sr // 400, sr // 70
+    gate = 10 ** ((np.median(db) - 10) / 20)
+    for c0 in range(0, nf, 4000):
+        idx = np.arange(c0, min(nf, c0 + 4000))
+        frames = a[idx[:, None] * fh + np.arange(fl)[None, :]]
+        frames = frames - frames.mean(1, keepdims=True)
+        loud = np.sqrt((frames ** 2).mean(1)) > gate
+        if not loud.any():
+            continue
+        spec = np.fft.rfft(frames[loud] * np.hanning(fl), 1024)
+        ac = np.fft.irfft(np.abs(spec) ** 2, 1024)[:, : hi + 1]
+        lag = ac[:, lo:].argmax(1) + lo
+        strength = ac[np.arange(len(lag)), lag] / (ac[:, 0] + 1e-9)
+        vals = np.where(strength > 0.35, sr / lag, 0.0)
+        f0[idx[loud]] = vals
+    per = max(1, int(step / 0.02))
+    pitch_var = np.zeros(n, np.float32)
+    for i in range(n):
+        seg = f0[i * per:(i + 1) * per]
+        seg = seg[seg > 0]
+        if len(seg) >= 5:
+            pitch_var[i] = float(np.std(12 * np.log2(seg / np.median(seg))))
+
+    # speech rate and where words are
+    rate = np.zeros(n, np.float32)
+    has_words = np.zeros(n, bool)
+    for w in words:
+        i = int(w["s"] / step)
+        if 0 <= i < n:
+            rate[i] += 1
+        for j in range(int(w["s"] / step), min(n, int(w["e"] / step) + 1)):
+            has_words[j] = True
+    k = max(1, int(2 / step))  # 2 s moving window for the rate
+    rate = np.convolve(rate, np.ones(k) / (k * step), "same")
+
+    speech = has_words & (db > np.median(db) - 20)
+    z_loud = _robust_z(db, speech)
+    z_pitch = _robust_z(pitch_var, speech & (pitch_var > 0))
+    z_rate = _robust_z(rate, speech)
+    energy = 0.5 * np.clip(z_loud, -3, 4) + 0.3 * np.clip(z_pitch, -3, 4) + 0.2 * np.clip(z_rate, -3, 4)
+    energy = np.where(speech, energy, np.where(db > np.median(db[speech]) - 6 if speech.any() else False, 1.0, -1.0))
+    energy = np.convolve(energy, np.ones(3) / 3, "same")
+
+    events = (_merge_events(speech & (z_loud > 1.8), step, "laut", 1.0)
+              + _merge_events(speech & (z_pitch > 1.8), step, "lebhaft", 1.0)
+              + _merge_events(speech & (z_rate > 1.8), step, "schnell", 2.0))
+    if speech.any():  # loud without words: laughter, applause, shouting
+        ref = float(np.median(db[speech]))
+        events += _merge_events(~has_words & (db > ref - 4), step, "reaktion", 1.0)
+    events.sort(key=lambda e: e["s"])
+    return {"step": step, "energy": [round(float(x), 2) for x in energy], "events": events}
+
+
+def audio_window(audio, s, e):
+    """Mean and peak energy plus the event types inside [s, e]."""
+    if not audio:
+        return None
+    st, en = audio["step"], audio["energy"]
+    vals = en[int(s / st): max(int(s / st) + 1, int(e / st))]
+    if not vals:
+        return None
+    kinds = sorted({ev["type"] for ev in audio["events"] if ev["e"] > s and ev["s"] < e})
+    return {"mean": round(sum(vals) / len(vals), 2), "peak": round(max(vals), 2), "tags": kinds}
+
+
+def audio_curve(audio, points=600):
+    """Downsampled energy curve for the timeline in the web interface."""
+    if not audio:
+        return None
+    en = audio["energy"]
+    k = max(1, len(en) // points)
+    return {"step": audio["step"] * k, "values": [round(max(en[i:i + k]), 2) for i in range(0, len(en), k)]}
+
+
+TAG_LABELS = {"laut": "laut", "lebhaft": "lebhafte Stimme", "schnell": "schnell gesprochen", "reaktion": "Lachen/Reaktion"}
+
+
+def add_spans(intervals, spans, duration):
+    """Union of kept intervals with spans that must stay (e.g. a laugh after the punchline)."""
+    allv = sorted([list(i) for i in intervals] + [[max(0.0, a), min(duration, b)] for a, b in spans if b > a])
+    out = []
+    for a, b in allv:
+        if out and a <= out[-1][1] + 0.05:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(round(a, 3), round(b, 3)) for a, b in out]
