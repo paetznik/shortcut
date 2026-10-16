@@ -33,10 +33,10 @@ class Nextcloud:
             raise RuntimeError("Nextcloud-Fehler %d" % r.status_code)
         return r
 
-    def list_videos(self):
+    def list_videos(self, sub=""):
         body = ('<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getcontentlength/>'
                 '<d:getlastmodified/><d:resourcetype/></d:prop></d:propfind>')
-        r = self.check(httpx.request("PROPFIND", self.url() + "/", auth=self.auth, headers={"Depth": "1"},
+        r = self.check(httpx.request("PROPFIND", self.url(sub) + "/", auth=self.auth, headers={"Depth": "1"},
                                      content=body, timeout=30))
         ns = {"d": "DAV:"}
         out = []
@@ -72,6 +72,10 @@ class Nextcloud:
             r = httpx.request("MKCOL", self.url(cur), auth=self.auth, timeout=30)
             if r.status_code not in (201, 405):  # 405 = exists
                 self.check(r)
+
+    def move(self, src, dst):
+        self.check(httpx.request("MOVE", self.url(src), auth=self.auth, timeout=60,
+                                 headers={"Destination": self.url(dst), "Overwrite": "F"}))
 
     def upload(self, path, local):
         with open(local, "rb") as f:

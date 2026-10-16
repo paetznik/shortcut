@@ -4,7 +4,7 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 
 ## Ablauf
 
-1. Video holen: Upload im Browser (in 8-MB-Stücken, daher auch große Dateien) oder Datei aus einem Nextcloud-Ordner.
+1. Video holen: Upload im Browser (in 8-MB-Stücken, daher auch große Dateien), Datei aus einem Nextcloud-Ordner oder automatisch: neue Videos im Nextcloud-Unterordner `Eingang` werden erkannt, nach `Eingang/Verarbeitet` verschoben und mit den Standard-Einstellungen verarbeitet.
 2. Transkription auf Deutsch mit [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (lokal, CPU). Eine Liste mit Fachbegriffen und Namen in den Einstellungen verbessert die Schreibweise.
 3. Highlight-Auswahl:
    - mit Anthropic-API-Schlüssel (in den Einstellungen hinterlegen): Claude wählt die Ausschnitte und schreibt Titel und Beschreibungen,
@@ -16,7 +16,9 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
    - Hook-Text in den ersten Sekunden, Untertitel in vier Stilen (Pop, Box, Minimal, ganze Sätze) mit farbigen Schlüsselwörtern, innerhalb der Sicherheitszonen der Plattformen,
    - Tonaufbereitung (Rumpelfilter, Rauschunterdrückung, De-Esser, Kompressor, Lautheit −14 LUFS) und optionale Hintergrundmusik, die unter Sprache leiser wird,
    - Titelbild mit großem Text für das Profilraster.
-6. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
+6. Bildausschnitt von Hand: im Editor auf einem Standbild den 9:16-Rahmen ziehen, auch mit Wechseln ab bestimmten Sekunden.
+7. Best-of-Trailer (30–60 s) aus den stärksten Sätzen mehrerer Clips; übersetzte Versionen jedes Clips (Untertitel, Hook, Titel, Beschreibung) per Claude in Englisch, Spanisch, Französisch, Italienisch, Türkisch oder Polnisch.
+8. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
 
 ## Deployment
 

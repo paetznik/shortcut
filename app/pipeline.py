@@ -151,16 +151,21 @@ def highlights_claude(segments, api_key, n, min_len, max_len, context):
         "TRANSKRIPT:\n%s"
     ) % (n, min_len, max_len, extra, transcript)
 
+    return claude_json(api_key, prompt, r"\[.*\]")
+
+
+def claude_json(api_key, prompt, pattern=r"\{.*\}", max_tokens=4000):
+    """Ask Claude and parse the first JSON array/object in the answer."""
     r = httpx.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json={"model": CLAUDE_MODEL, "max_tokens": 4000, "messages": [{"role": "user", "content": prompt}]},
+        json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
         timeout=300,
     )
     if r.status_code != 200:
         raise RuntimeError("Claude-API-Fehler %d: %s" % (r.status_code, r.text[:300]))
     text = "".join(b.get("text", "") for b in r.json().get("content", []))
-    m = re.search(r"\[.*\]", text, re.S)
+    m = re.search(pattern, text, re.S)
     if not m:
         raise RuntimeError("Claude hat kein gültiges JSON geliefert.")
     return json.loads(m.group(0))
@@ -748,3 +753,122 @@ def render_cover(video, info, start, rel, workdir, name, style, crop_segs, text)
     run([FFMPEG, "-y", "-ss", "%.2f" % at, "-i", video, "-filter_complex", graph, "-map", "[v]", "-frames:v", "1",
          "-q:v", "3", name + ".jpg"], cwd=workdir)
     os.remove(os.path.join(workdir, ass))
+
+
+# ---------------------------------------------------------------- translation
+
+LANGUAGES = {"en": "Englisch", "es": "Spanisch", "fr": "Französisch", "it": "Italienisch", "tr": "Türkisch", "pl": "Polnisch"}
+
+
+def sentences(words):
+    out, cur = [], []
+    for w in words:
+        cur.append(w)
+        if w["w"][-1:] in ".!?" or len(cur) >= 25:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def translate_clip(out_words, api_key, lang, meta):
+    """Translate subtitles sentence by sentence; each translated sentence keeps the time span of the original,
+    its words spread evenly across it. Returns (words, translated meta)."""
+    sents = sentences(out_words)
+    payload = {
+        "sentences": [" ".join(w["w"] for w in s) for s in sents],
+        "hook": meta.get("hook", ""), "title": meta.get("title", ""), "caption": meta.get("caption", ""),
+        "cover": meta.get("cover", ""), "keywords": meta.get("keywords", []),
+    }
+    prompt = (
+        "Übersetze die folgenden Texte eines deutschsprachigen Kurzvideos ins %s. Die Sätze sind Untertitel und "
+        "müssen kurz, natürlich und gesprochen klingen; behalte Anzahl und Reihenfolge der Sätze exakt bei. "
+        "Übersetze Hashtags sinnvoll. \"keywords\" sind Wörter, die farbig hervorgehoben werden: gib die "
+        "entsprechenden Wörter aus deiner Übersetzung an.\n"
+        "Antworte NUR mit JSON im selben Format:\n%s"
+    ) % (LANGUAGES.get(lang, lang), json.dumps(payload, ensure_ascii=False))
+    res = claude_json(api_key, prompt, max_tokens=6000)
+    trans = res.get("sentences") or []
+    if len(trans) != len(sents):
+        raise RuntimeError("Übersetzung unvollständig (%d von %d Sätzen)." % (len(trans), len(sents)))
+    words = []
+    for src, text in zip(sents, trans):
+        tokens = str(text).split()
+        if not tokens:
+            continue
+        s, e = src[0]["s"], src[-1]["e"]
+        step = (e - s) / len(tokens)
+        words += [{"w": t, "s": s + k * step, "e": s + (k + 1) * step} for k, t in enumerate(tokens)]
+    return words, {k: res.get(k, "") for k in ("hook", "title", "caption", "cover", "keywords")}
+
+
+# ---------------------------------------------------------------- best-of trailer
+
+def bestof_segments(segments, clips, target=45.0):
+    """Strongest clip first: take its opening sentence, then the next clip's, and so on; if one round is not long
+    enough, further sentences of the same clips follow. Each part stays in story order within its clip."""
+    words = all_words(segments)
+    ranked = [c for c in sorted(clips, key=lambda c: -c.get("score", 0)) if c.get("variant_of") is None]
+    sents = {}
+    for c in ranked:
+        cw = [w for w in words if w["s"] >= c["start"] - 0.01 and w["e"] <= c["end"] + 0.01]
+        merged = []
+        for s in sentences(cw):  # sentences under 2.5 s are joined with the next one
+            if merged and merged[-1][-1]["e"] - merged[-1][0]["s"] < 2.5:
+                merged[-1] = merged[-1] + s
+            else:
+                merged.append(s)
+        sents[id(c)] = merged
+    picks, total = [], 0.0
+    for rnd in range(4):
+        for c in ranked:
+            if total >= target or rnd >= len(sents[id(c)]):
+                continue
+            sent = sents[id(c)][rnd]
+            a, b = sent[0]["s"], sent[-1]["e"]
+            if b - a > 14:
+                b = next((w["e"] for w in sent if w["e"] - a >= 10), a + 14)
+            if total + (b - a) > target + 5 and picks:
+                continue
+            picks.append((round(max(0, a - 0.1), 2), round(b + 0.3, 2), c))
+            total += b - a
+        if total >= target * 0.85:
+            break
+    # within the trailer, keep the clips in score order but each clip's sentences in their natural order
+    order = {id(c): k for k, c in enumerate(ranked)}
+    picks.sort(key=lambda p: (order[id(p[2])], p[0]))
+    joined = []
+    for a, b, c in picks:  # neighbouring sentences of the same clip become one part (no needless cut)
+        if joined and joined[-1][2] is c and a - joined[-1][1] < 0.8:
+            joined[-1] = (joined[-1][0], b, c)
+        else:
+            joined.append((a, b, c))
+    return joined
+
+
+def concat_parts(workdir, parts, out, music=None, music_volume=15):
+    """Join rendered parts (same encoding settings) losslessly; optional music is mixed over the whole trailer."""
+    lst = out + ".txt"
+    with open(os.path.join(workdir, lst), "w", encoding="utf-8") as f:
+        f.write("".join("file '%s'\n" % p for p in parts))
+    joined = out if not music else "joined_" + out
+    run([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", "-movflags", "+faststart", joined], cwd=workdir)
+    if music:
+        graph = ("[0:a]asplit=2[vs][vm];[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=%.2f[m];"
+                 "[m][vs]sidechaincompress=threshold=0.03:ratio=10:attack=15:release=400[md];"
+                 "[vm][md]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.9[a]" % (music_volume / 100))
+        run([FFMPEG, "-y", "-i", joined, "-stream_loop", "-1", "-i", music, "-filter_complex", graph, "-map", "0:v",
+             "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", out],
+            cwd=workdir)
+        os.remove(os.path.join(workdir, joined))
+    os.remove(os.path.join(workdir, lst))
+
+
+def frame_jpeg(video, t, width=640):
+    p = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.2f" % max(0, t), "-i", video, "-frames:v", "1",
+                        "-vf", "scale=%d:-2" % width, "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "4", "-"],
+                       capture_output=True)
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError("Standbild konnte nicht erstellt werden.")
+    return p.stdout
