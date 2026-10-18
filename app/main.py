@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import json
 import os
-import queue
+import io
 import re
 import secrets
 import shutil
@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
@@ -35,7 +36,7 @@ DEFAULTS = {
     "highlight": "#FFE600", "uppercase": True, "font_size": 78, "position": "unten", "words_per_line": 3,
     "remove_pauses": True, "hook": True, "hook_seconds": 3, "review": False,
     "sub_style": "pop", "keyword_color": "#4ADE80", "zoom": True, "enhance_audio": True, "music": "", "music_volume": 15,
-    "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True,
+    "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -45,7 +46,50 @@ CONFIG_DEFAULTS = {"nc_url": "https://cloud.paetze.digital", "nc_folder": "Short
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 lock = threading.Lock()
-work = queue.Queue()
+
+
+class WorkQueue:
+    """FIFO of (kind, job id, argument) that the web interface can inspect, reorder and thin out."""
+
+    def __init__(self):
+        self.items, self.cond = [], threading.Condition()
+
+    def put(self, item):
+        with self.cond:
+            self.items.append(item)
+            self.cond.notify()
+
+    def get(self):
+        with self.cond:
+            while not self.items:
+                self.cond.wait()
+            return self.items.pop(0)
+
+    def snapshot(self):
+        with self.cond:
+            return list(self.items)
+
+    def remove_job(self, jid):
+        with self.cond:
+            before = len(self.items)
+            self.items = [i for i in self.items if i[1] != jid]
+            return before - len(self.items)
+
+    def move_job(self, jid, delta):
+        """Move all entries of a job up (-1) or down (+1) past the neighbouring job."""
+        with self.cond:
+            order = list(dict.fromkeys(i[1] for i in self.items))
+            if jid not in order:
+                return False
+            k = order.index(jid)
+            j = max(0, min(len(order) - 1, k + delta))
+            order.insert(j, order.pop(k))
+            self.items.sort(key=lambda i: order.index(i[1]))
+            return True
+
+
+work = WorkQueue()
+CURRENT = {"jid": None, "kind": None, "since": None}
 
 
 # ---------------------------------------------------------------- config & auth
@@ -262,6 +306,8 @@ def save_transcript(jid, segments):
 
 def public_job(job, with_text=False):
     out = {k: v for k, v in job.items() if k not in ("log",)} | {"log": job.get("log", [])[-5:]}
+    if job.get("status") in ("wartet", "läuft"):
+        out["eta"] = eta_for(job)
     if with_text and job.get("clips"):
         segments = load_transcript(job["id"])
         if segments:
@@ -273,7 +319,7 @@ def public_job(job, with_text=False):
     return out
 
 
-def new_job(name, settings, context, source=None, remote=None, size=0):
+def new_job(name, settings, context, source=None, remote=None, size=0, enqueue=True):
     jid = uuid.uuid4().hex[:12]
     os.makedirs(os.path.join(JOBS, jid))
     job = {
@@ -282,7 +328,8 @@ def new_job(name, settings, context, source=None, remote=None, size=0):
         "remote": remote, "size": size, "clips": [], "log": [], "selector": None,
     }
     save_job(job)
-    work.put(("process", jid, None))
+    if enqueue:
+        work.put(("process", jid, None))
     return job
 
 
@@ -356,8 +403,14 @@ async def create_job(request: Request):
     filename = os.path.basename(str(body.get("filename") or "video.mp4"))[:120] or "video.mp4"
     src = source_name(filename)
     size = os.path.getsize(part)
-    job = new_job(filename, clean_settings(body.get("settings")), str(body.get("context") or "")[:1000], src, None, size)
+    job = new_job(filename, clean_settings(body.get("settings")), str(body.get("context") or "")[:1000], src, None, size,
+                  enqueue=False)
     os.replace(part, os.path.join(JOBS, job["id"], src))
+    try:  # the length is known right away, so the queue can estimate the waiting time
+        job = update(job["id"], info=pipeline.probe(os.path.join(JOBS, job["id"], src)))
+    except Exception:
+        pass
+    work.put(("process", job["id"], None))
     return public_job(job)
 
 
@@ -389,11 +442,51 @@ def delete_job(jid: str, request: Request):
     require_auth(request)
     d = job_dir(jid)
     job = load_job(jid)
-    if job["status"] not in ("fertig", "fehler", "prüfen"):
+    work.remove_job(jid)
+    if job["status"] not in ("fertig", "fehler", "prüfen", "abgebrochen"):
         job["cancel"] = True
         save_job(job)
     shutil.rmtree(d, ignore_errors=True)
     return {"ok": True}
+
+
+@app.post("/api/jobs/{jid}/cancel")
+def cancel_job(jid: str, request: Request):
+    """Stop a waiting or running job; a running one stops at the next step (after the current clip or segment)."""
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if job["status"] not in ("wartet", "läuft"):
+            raise HTTPException(400, "Projekt läuft gerade nicht")
+        removed = work.remove_job(jid)
+        if CURRENT["jid"] == jid:
+            job["cancel"] = True
+            job["message"] = "Wird abgebrochen …"
+        else:
+            job.update(status="abgebrochen", message="Abgebrochen")
+            job["clips"] = [dict(c, status="fertig") if c.get("file") else c for c in job.get("clips", [])]
+        save_job(job)
+    return public_job(job)
+
+
+@app.post("/api/jobs/{jid}/restart")
+def restart_job(jid: str, request: Request):
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if job["status"] not in ("abgebrochen", "fehler"):
+            raise HTTPException(400, "Nur abgebrochene oder fehlgeschlagene Projekte lassen sich neu starten")
+        require_source(job)
+        job.pop("cancel", None)
+        job.update(status="wartet", message="In der Warteschlange", progress=0)
+        save_job(job)
+    work.put(("render_all", jid, None) if job.get("clips") and job.get("info") else ("process", jid, None))
+    return public_job(job)
+
+
+def require_source(job):
+    if job.get("source_deleted"):
+        raise HTTPException(400, "Das Originalvideo wurde gelöscht. Lade das Video neu hoch, um Clips neu zu rendern.")
 
 
 @app.post("/api/jobs/{jid}/clips/{idx}")
@@ -405,6 +498,7 @@ async def edit_clip(jid: str, idx: int, request: Request):
         job = load_job(jid)
         if job["status"] not in ("fertig", "fehler", "prüfen") or idx >= len(job["clips"]):
             raise HTTPException(400, "Clip kann gerade nicht bearbeitet werden")
+        require_source(job)
         clip = job["clips"][idx]
         try:
             s, e = float(body.get("start", clip["start"])), float(body.get("end", clip["end"]))
@@ -489,6 +583,8 @@ def source_frame(jid: str, request: Request, t: float = 0.0):
 def queue_extra(jid, kind, arg, message):
     with lock:
         job = load_job(jid)
+        if kind != "texts":
+            require_source(job)
         if job["status"] not in ("fertig", "fehler"):
             raise HTTPException(400, "Bitte warten, bis das Projekt fertig ist.")
         job["status"], job["message"] = "wartet", message
@@ -563,6 +659,231 @@ def create_texts(jid: str, request: Request):
     return queue_extra(jid, "texts", None, "Erstelle Texte zum Video")
 
 
+def eta_for(job):
+    """Rough remaining seconds, from measured speeds of earlier runs on this server."""
+    sp = load_config().get("speed", {})
+    s = job.get("settings", {})
+    dur = (job.get("info") or {}).get("duration") or 0
+    clip_len = (s.get("min_len", 20) + s.get("max_len", 60)) / 2
+    formats = 1 + sum(1 for f in ("fmt_4x5", "fmt_1x1") if s.get(f))
+    render = sp.get("render", 4.0) * clip_len * s.get("clips", 5) * formats
+    transcribe = 0 if os.path.exists(os.path.join(JOBS, job["id"], "transcript.json")) else \
+        sp.get("transcribe_" + s.get("quality", "ausgewogen"), {"schnell": 0.35, "ausgewogen": 0.9, "genau": 2.2}.get(s.get("quality"), 0.9)) * dur
+    total = transcribe + render + 30
+    if job["status"] == "läuft" and job.get("started") and job.get("progress", 0) > 3:
+        elapsed = time.time() - job["started"]
+        by_progress = elapsed / job["progress"] * (100 - job["progress"])
+        return int(max(10, 0.5 * by_progress + 0.5 * max(0, total - elapsed)))
+    return int(total) if dur else None
+
+
+def learn_speed(key, seconds, media_seconds):
+    if media_seconds <= 0:
+        return
+    with lock:
+        cfg = load_config()
+        sp = cfg.setdefault("speed", {})
+        rate = seconds / media_seconds
+        sp[key] = round(0.7 * sp[key] + 0.3 * rate, 3) if key in sp else round(rate, 3)
+        save_config(cfg)
+
+
+@app.get("/api/queue")
+def queue_state(request: Request):
+    require_auth(request)
+    out, seen = [], set()
+    for kind, jid, _ in ([("cur", CURRENT["jid"], None)] if CURRENT["jid"] else []) + work.snapshot():
+        if jid in seen:
+            continue
+        seen.add(jid)
+        try:
+            job = load_job(jid)
+        except Exception:
+            continue
+        out.append({"id": jid, "name": job["name"], "status": job["status"], "progress": job.get("progress", 0),
+                    "message": job.get("message", ""), "running": jid == CURRENT["jid"], "eta": eta_for(job)})
+    # the waiting time of each entry includes everything in front of it
+    acc = 0
+    for q in out:
+        acc += q["eta"] or 0
+        q["eta_total"] = acc
+    return out
+
+
+@app.post("/api/queue/move")
+async def queue_move(request: Request):
+    require_auth(request)
+    body = await request.json()
+    if not work.move_job(str(body.get("id")), -1 if body.get("dir") == "up" else 1):
+        raise HTTPException(400, "Projekt wartet nicht in der Warteschlange")
+    return {"ok": True}
+
+
+def dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+@app.get("/api/storage")
+def storage(request: Request):
+    require_auth(request)
+    du = shutil.disk_usage(DATA)
+    projects = []
+    for jid in os.listdir(JOBS):
+        try:
+            job = load_job(jid)
+        except Exception:
+            continue
+        src = os.path.join(JOBS, jid, job.get("source") or "")
+        src_size = os.path.getsize(src) if job.get("source") and os.path.isfile(src) else 0
+        projects.append({"id": jid, "name": job["name"], "status": job["status"], "created": job["created"],
+                         "source": src_size, "total": dir_size(os.path.join(JOBS, jid)),
+                         "source_deleted": bool(job.get("source_deleted"))})
+    projects.sort(key=lambda x: -x["total"])
+    models = os.environ.get("HF_HOME", "/models")
+    return {"disk_total": du.total, "disk_free": du.free, "disk_used": du.used, "projects": projects,
+            "projects_total": sum(x["total"] for x in projects), "music": dir_size(MUSIC),
+            "models": dir_size(models) if os.path.isdir(models) else 0, "retention_days": RETENTION_DAYS}
+
+
+def delete_source(jid):
+    with lock:
+        job = load_job(jid)
+        if job["status"] in ("wartet", "läuft"):
+            raise HTTPException(400, "Projekt läuft noch")
+        if job.get("source"):
+            try:
+                os.remove(os.path.join(JOBS, jid, job["source"]))
+            except FileNotFoundError:
+                pass
+        job["source_deleted"] = True
+        save_job(job)
+    log(jid, "Originalvideo gelöscht (Clips bleiben erhalten)")
+
+
+@app.post("/api/jobs/{jid}/delete-source")
+def delete_source_endpoint(jid: str, request: Request):
+    require_auth(request)
+    delete_source(jid)
+    return public_job(load_job(jid))
+
+
+@app.post("/api/storage/cleanup")
+def storage_cleanup(request: Request):
+    """Delete the originals of all finished projects; clips, subtitles and texts stay."""
+    require_auth(request)
+    freed = 0
+    for jid in os.listdir(JOBS):
+        try:
+            job = load_job(jid)
+        except Exception:
+            continue
+        if job["status"] == "fertig" and not job.get("source_deleted") and job.get("source"):
+            path = os.path.join(JOBS, jid, job["source"])
+            freed += os.path.getsize(path) if os.path.isfile(path) else 0
+            delete_source(jid)
+    return {"freed": freed}
+
+
+COSTS = os.path.join(DATA, "costs.json")
+cost_lock = threading.Lock()
+
+
+def record_usage(feature, model, tin, tout, usd):
+    """Called by the pipeline after every Claude request: totals per project and per month."""
+    jid = CURRENT["jid"]
+    with cost_lock:
+        try:
+            with open(COSTS, encoding="utf-8") as f:
+                costs = json.load(f)
+        except (FileNotFoundError, ValueError):
+            costs = {}
+        month = costs.setdefault(time.strftime("%Y-%m"), {})
+        e = month.setdefault(feature, {"usd": 0.0, "calls": 0, "in": 0, "out": 0})
+        e["usd"] = round(e["usd"] + usd, 6)
+        e["calls"] += 1
+        e["in"] += tin
+        e["out"] += tout
+        with open(COSTS + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(costs, f)
+        os.replace(COSTS + ".tmp", COSTS)
+    if jid:
+        with lock:
+            try:
+                job = load_job(jid)
+            except Exception:
+                return
+            c = job.setdefault("costs", {}).setdefault(feature, {"usd": 0.0, "calls": 0})
+            c["usd"] = round(c["usd"] + usd, 6)
+            c["calls"] += 1
+            save_job(job)
+
+
+pipeline.USAGE_HOOK = record_usage
+
+
+@app.get("/api/costs")
+def costs(request: Request):
+    require_auth(request)
+    try:
+        with open(COSTS, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        data = {}
+    months = [{"month": m, "usd": round(sum(v["usd"] for v in feats.values()), 4),
+               "features": {k: {"usd": round(v["usd"], 4), "calls": v["calls"]} for k, v in feats.items()}}
+              for m, feats in sorted(data.items(), reverse=True)]
+    return {"model": pipeline.CLAUDE_MODEL, "prices": pipeline.PRICES.get(pipeline.CLAUDE_MODEL), "months": months[:12]}
+
+
+@app.get("/api/jobs/{jid}/export")
+def export_project(jid: str, request: Request):
+    """ZIP for editing software: EDL per clip (Premiere, DaVinci), one FCPXML (Final Cut, DaVinci), SRTs, notes."""
+    require_auth(request)
+    job = load_job(jid)
+    if not job.get("clips") or not job.get("info"):
+        raise HTTPException(400, "Noch keine Clips vorhanden")
+    info = job["info"]
+    segments = load_transcript(jid)
+    src_name = job["name"] if os.path.splitext(job["name"])[1] else (job["name"] + ".mp4")
+    base = re.sub(r"[^\w\- ]+", "_", os.path.splitext(job["name"])[0])[:50].strip() or "projekt"
+    buf = io.BytesIO()
+    entries = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, c in enumerate(job["clips"]):
+            dur = c["end"] - c["start"]
+            words = pipeline.clip_words(segments, c["start"], c["end"])
+            iv = pipeline.keep_intervals(words, dur, job["settings"].get("remove_pauses", True),
+                                         [r - c["start"] for r in c.get("removed", [])])
+            iv = pipeline.add_spans(iv, reaction_spans(jid, c["start"], c["end"]), dur)
+            name = "clip%02d" % (i + 1)
+            title = "%s – %s" % (name, c.get("title", ""))
+            entries.append((title[:80], c["start"], iv))
+            z.writestr(name + ".edl", pipeline.edl(title, src_name, c["start"], iv, info.get("fps", 30)))
+            if c.get("srt") and os.path.exists(os.path.join(JOBS, jid, c["srt"])):
+                z.write(os.path.join(JOBS, jid, c["srt"]), name + ".srt")
+        z.writestr(base + ".fcpxml", pipeline.fcpxml(base, src_name, info, entries))
+        z.writestr("LIESMICH.txt", (
+            "Export aus ShortCut – %s\n\n"
+            "Die Schnittlisten verweisen auf das Originalvideo „%s“ (%.3g fps). Lege es in denselben Ordner oder "
+            "verknüpfe es nach dem Import neu (Premiere: Medien verknüpfen, DaVinci: Relink, Final Cut: Neu verbinden).\n\n"
+            "Premiere Pro:   Datei > Importieren > clipNN.edl\n"
+            "DaVinci Resolve: Datei > Importieren > Timeline > clipNN.edl oder %s.fcpxml\n"
+            "Final Cut Pro:   Ablage > Importieren > XML > %s.fcpxml (ein Projekt je Clip)\n\n"
+            "Enthalten sind alle Schnitte (Pausen, Füllwörter, gestrichene Wörter) und die Untertitel als SRT "
+            "(clipNN.srt, passend zur geschnittenen Zeitachse). Hochformat-Zuschnitt, Zooms, Untertitel-Design und "
+            "Musik werden nicht übertragen – die Sequenz ist 1080×1920, den Bildausschnitt setzt du im Schnittprogramm.\n"
+        ) % (job["name"], src_name, info.get("fps", 30), base, base))
+    return Response(buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="%s_schnitt.zip"' % base})
+
+
 @app.post("/api/jobs/{jid}/render")
 def render_all(jid: str, request: Request):
     """Leave review mode and render every clip."""
@@ -571,6 +892,7 @@ def render_all(jid: str, request: Request):
         job = load_job(jid)
         if job["status"] != "prüfen":
             raise HTTPException(400, "Projekt ist nicht im Prüfmodus")
+        require_source(job)
         job["status"], job["message"] = "wartet", "Clips werden gerendert"
         save_job(job)
     work.put(("render_all", jid, None))
@@ -1005,6 +1327,43 @@ def reaction_spans(jid, start, end):
             if ev["type"] == "reaktion" and ev["e"] > start and ev["s"] < end]
 
 
+QUALITY_RANK = {"schnell": 0, "ausgewogen": 1, "genau": 2}
+
+
+def reuse_transcript(jid, job):
+    """Same video processed before (same fingerprint, at least the same recognition quality): copy its transcript
+    and audio analysis instead of transcribing again."""
+    want = QUALITY_RANK.get(job["settings"].get("quality"), 1)
+    best = None
+    for other in os.listdir(JOBS):
+        if other == jid:
+            continue
+        try:
+            o = load_job(other)
+        except Exception:
+            continue
+        if o.get("hash") != job["hash"] or not os.path.exists(os.path.join(JOBS, other, "transcript.json")):
+            continue
+        if QUALITY_RANK.get(o.get("settings", {}).get("quality"), 1) < want:
+            continue
+        if best is None or o["created"] > best["created"]:
+            best = o
+    if not best:
+        return None
+    for f in ("transcript.json", "audio.json"):
+        if os.path.exists(os.path.join(JOBS, best["id"], f)):
+            shutil.copy(os.path.join(JOBS, best["id"], f), os.path.join(JOBS, jid, f))
+    audio = load_audio(jid)
+    if audio:
+        update(jid, audio_curve=pipeline.audio_curve(audio), audio_events=audio["events"][:300])
+    update(jid, vocabulary=best.get("vocabulary", ""), reused_from=best["name"])
+    note = ""
+    if best.get("vocabulary", "") != load_config().get("vocabulary", ""):
+        note = " Die Fachbegriffe wurden seitdem geändert – für eine neue Erkennung den Haken „Transkript wiederverwenden“ abwählen."
+    log(jid, "Transkript vom Projekt „%s“ übernommen – spart die Spracherkennung.%s" % (best["name"], note))
+    return load_transcript(jid)
+
+
 def process(jid):
     d = os.path.join(JOBS, jid)
     job = update(jid, status="läuft", progress=1, message="Analysiere Video …", started=time.time())
@@ -1015,8 +1374,13 @@ def process(jid):
     job = update(jid, info=info)
     log(jid, "Video: %dx%d, %s" % (info["width"], info["height"], pipeline.fmt_time(info["duration"])))
 
+    if not job.get("hash"):
+        job = update(jid, hash=pipeline.quick_hash(src))
     segments = load_transcript(jid)
+    if segments is None and job["settings"].get("reuse_transcript", True):
+        segments = reuse_transcript(jid, job)
     if segments is None:
+        t0 = time.time()
         update(jid, progress=3, message="Extrahiere Audio …")
         wav = os.path.join(d, "audio.wav")
         pipeline.extract_audio(src, wav)
@@ -1030,6 +1394,8 @@ def process(jid):
         segments = pipeline.transcribe(wav, info["duration"], job["settings"]["quality"], prog,
                                        load_config().get("vocabulary", ""))
         save_transcript(jid, segments)
+        learn_speed("transcribe_" + job["settings"].get("quality", "ausgewogen"), time.time() - t0, info["duration"])
+        update(jid, vocabulary=load_config().get("vocabulary", ""))
         log(jid, "Transkript: %d Abschnitte" % len(segments))
         if job["settings"].get("audio_analysis", True):
             run_audio_analysis(jid, wav, segments)
@@ -1090,7 +1456,11 @@ def render_clips(jid, info):
     n = len(job["clips"])
     for i in range(n):
         update(jid, status="läuft", progress=round(75 + i / n * 24, 1), message="Rendere Clip %d von %d …" % (i + 1, n))
+        t0 = time.time()
         render_one(jid, i, info)
+        c = load_job(jid)["clips"][i]
+        formats = 1 + len(c.get("formats") or {})
+        learn_speed("render", (time.time() - t0) / formats, c.get("duration_out") or 0)
     update(jid, message="Prüfe Rechtschreibung …")
     spelling(jid, range(n))
     update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % n, finished=time.time())
@@ -1132,6 +1502,7 @@ def extra_task(jid, kind, arg):
 def worker():
     while True:
         kind, jid, idx = work.get()
+        CURRENT.update(jid=jid, kind=kind, since=time.time())
         try:
             if not os.path.exists(os.path.join(JOBS, jid, "job.json")):
                 continue
@@ -1144,13 +1515,23 @@ def worker():
             else:
                 rerender(jid, idx)
         except Cancelled:
-            pass
+            with lock:
+                try:
+                    job = load_job(jid)
+                    job.pop("cancel", None)
+                    job.update(status="abgebrochen", message="Abgebrochen")
+                    job["clips"] = [dict(c, status="fertig") if c.get("file") else c for c in job.get("clips", [])]
+                    save_job(job)
+                except Exception:
+                    pass
         except Exception as e:
             traceback.print_exc()
             try:
                 update(jid, status="fehler", message=str(e)[:500])
             except Exception:
                 pass
+        finally:
+            CURRENT.update(jid=None, kind=None, since=None)
 
 
 def cleanup():

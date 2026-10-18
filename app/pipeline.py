@@ -40,7 +40,13 @@ def probe(path):
     if rot in (90, 270):
         w, h = h, w
     has_audio = any(s.get("codec_type") == "audio" for s in info["streams"])
-    return {"duration": float(info["format"].get("duration", 0)), "width": w, "height": h, "has_audio": has_audio}
+    try:
+        num, den = (v.get("avg_frame_rate") or v.get("r_frame_rate") or "30/1").split("/")
+        fps = round(float(num) / float(den), 3) if float(den) else 30.0
+    except (ValueError, ZeroDivisionError):
+        fps = 30.0
+    return {"duration": float(info["format"].get("duration", 0)), "width": w, "height": h, "has_audio": has_audio,
+            "fps": fps if 10 <= fps <= 120 else 30.0}
 
 
 def extract_audio(video, wav):
@@ -188,11 +194,21 @@ def highlights_claude(segments, api_key, n, min_len, max_len, context, audio=Non
         "TRANSKRIPT:\n%s"
     ) % (n + 3, min_len, max_len, extra, transcript)
 
-    return claude_json(api_key, prompt, r"\[.*\]")
+    return claude_json(api_key, prompt, r"\[.*\]", feature="KI-Auswahl")
 
 
-def claude_json(api_key, prompt, pattern=r"\{.*\}", max_tokens=4000):
-    """Ask Claude and parse the first JSON array/object in the answer."""
+# US-$ per million tokens (input, output), Anthropic API list prices
+PRICES = {"claude-sonnet-5-5": (2.0, 10.0), "claude-opus-5-5": (4.0, 20.0), "claude-haiku-5-5": (0.10, 0.50)}
+USAGE_HOOK = None  # set by the app: fn(feature, model, input_tokens, output_tokens, usd)
+
+
+def cost_usd(model, tokens_in, tokens_out):
+    pin, pout = PRICES.get(model, PRICES["claude-sonnet-5-5"])
+    return (tokens_in * pin + tokens_out * pout) / 1e6
+
+
+def claude_json(api_key, prompt, pattern=r"\{.*\}", max_tokens=4000, feature="Sonstiges"):
+    """Ask Claude and parse the first JSON array/object in the answer; usage is reported to USAGE_HOOK."""
     r = httpx.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
@@ -201,6 +217,13 @@ def claude_json(api_key, prompt, pattern=r"\{.*\}", max_tokens=4000):
     )
     if r.status_code != 200:
         raise RuntimeError("Claude-API-Fehler %d: %s" % (r.status_code, r.text[:300]))
+    usage = r.json().get("usage") or {}
+    if USAGE_HOOK:
+        tin, tout = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+        try:
+            USAGE_HOOK(feature, CLAUDE_MODEL, tin, tout, cost_usd(CLAUDE_MODEL, tin, tout))
+        except Exception:
+            pass
     text = "".join(b.get("text", "") for b in r.json().get("content", []))
     m = re.search(pattern, text, re.S)
     if not m:
@@ -931,7 +954,7 @@ def translate_clip(out_words, api_key, lang, meta):
         "entsprechenden Wörter aus deiner Übersetzung an.\n"
         "Antworte NUR mit JSON im selben Format:\n%s"
     ) % (LANGUAGES.get(lang, lang), json.dumps(payload, ensure_ascii=False))
-    res = claude_json(api_key, prompt, max_tokens=6000)
+    res = claude_json(api_key, prompt, max_tokens=6000, feature="Übersetzung")
     trans = res.get("sentences") or []
     if len(trans) != len(sents):
         raise RuntimeError("Übersetzung unvollständig (%d von %d Sätzen)." % (len(trans), len(sents)))
@@ -1188,7 +1211,7 @@ def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context,
         '[{"start": 12.3, "end": 48.0, "scores": {"hook": 7, "standalone": 8, "value": 6, "payoff": 7}, '
         '"reason": "ein Satz, warum der Ausschnitt funktioniert"}]\n\nTRANSKRIPT:\n%s'
     ) % (extra, k, min_len, max_len, annotated_transcript(segments, audio))
-    cands = claude_json(api_key, prompt1, r"\[.*\]", max_tokens=6000)
+    cands = claude_json(api_key, prompt1, r"\[.*\]", max_tokens=6000, feature="KI-Auswahl")
     rated = []
     for c in cands:
         try:
@@ -1225,7 +1248,8 @@ def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context,
         '"hooks": ["...", "...", "..."], "caption": "...", "keywords": ["..."]}]\n\n%s'
     ) % (len(best), extra, min_len, max_len, "\n\n".join(blocks))
     try:
-        refined = {int(r.get("id", -1)): r for r in claude_json(api_key, prompt2, r"\[.*\]", max_tokens=6000)}
+        refined = {int(r.get("id", -1)): r for r in claude_json(api_key, prompt2, r"\[.*\]", max_tokens=6000,
+                                                                  feature="KI-Feinschnitt")}
     except Exception as e:  # the stage-1 result is still usable
         log("KI-Feinschnitt fehlgeschlagen, nutze Durchgang 1: " + str(e)[:200])
         refined = {}
@@ -1316,7 +1340,7 @@ def spelling_check(api_key, texts, vocabulary=""):
         "Ignoriere Umgangssprache, fehlende Kommas und Stil. \"wrong\" muss wörtlich im Text vorkommen (1-3 Wörter).\n"
         "Antworte NUR mit JSON: {\"0\": [{\"wrong\": \"...\", \"suggestion\": \"...\"}], \"1\": []}\n\n%s"
     ) % (vocab, "\n\n".join("### %s\n%s" % (k, t) for k, t in texts.items()))
-    res = claude_json(api_key, prompt, max_tokens=3000)
+    res = claude_json(api_key, prompt, max_tokens=3000, feature="Rechtschreibung")
     out = {}
     for k, items in (res or {}).items():
         try:
@@ -1350,7 +1374,7 @@ def generate_texts(api_key, segments, context="", titles=()):
         "\"blog\": {\"title\": \"...\", \"text\": \"...\"}, \"carousel\": [{\"title\": \"...\", \"text\": \"...\"}]}\n\n"
         "TRANSKRIPT:\n%s"
     ) % (extra, lines)
-    res = claude_json(api_key, prompt, max_tokens=6000)
+    res = claude_json(api_key, prompt, max_tokens=6000, feature="Texte")
 
     def secs(t):
         parts = [float(x) for x in str(t).split(":")]
@@ -1377,3 +1401,71 @@ def generate_texts(api_key, segments, context="", titles=()):
         "carousel": [{"title": str(s.get("title", "")), "text": str(s.get("text", ""))}
                      for s in (res.get("carousel") or []) if isinstance(s, dict)][:10],
     }
+
+
+# ---------------------------------------------------------------- re-use and export
+
+def quick_hash(path):
+    """Fingerprint of a video file (size + first and last 8 MB) to recognise the same video uploaded again."""
+    import hashlib
+
+    size = os.path.getsize(path)
+    h = hashlib.sha1(str(size).encode())
+    with open(path, "rb") as f:
+        h.update(f.read(8 << 20))
+        if size > 16 << 20:
+            f.seek(-(8 << 20), 2)
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def _tc(sec, fps):
+    fr = int(round(sec * fps))
+    f = fr % fps
+    s_ = fr // fps
+    return "%02d:%02d:%02d:%02d" % (s_ // 3600, s_ // 60 % 60, s_ % 60, f)
+
+
+def edl(title, source_name, start, intervals, fps):
+    """CMX3600 edit list: every kept part of the clip as an event, laid out back to back (Premiere, DaVinci, Avid)."""
+    fps = int(round(fps))
+    out = ["TITLE: %s" % title[:60], "FCM: NON-DROP FRAME", ""]
+    rec = 0.0
+    for n, (a, b) in enumerate(intervals, 1):
+        out.append("%03d  AX       B     C        %s %s %s %s" % (n, _tc(start + a, fps), _tc(start + b, fps),
+                                                                 _tc(rec, fps), _tc(rec + b - a, fps)))
+        out.append("* FROM CLIP NAME: %s" % source_name)
+        out.append("")
+        rec += b - a
+    return "\n".join(out)
+
+
+def fcpxml(project_name, source_name, info, clips):
+    """Final Cut Pro / DaVinci Resolve project: one vertical project per clip with all its cut parts.
+
+    `clips` = [(name, start, intervals)]. The source has to be relinked to the original file after import."""
+    from xml.sax.saxutils import quoteattr
+
+    fps = int(round(info.get("fps", 30)))
+
+    def t(sec):
+        return "%d/%ds" % (int(round(sec * fps)), fps)
+
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<!DOCTYPE fcpxml>", '<fcpxml version="1.9">', "  <resources>",
+             '    <format id="r1" frameDuration="1/%ds" width="%d" height="%d"/>' % (fps, info["width"], info["height"]),
+             '    <format id="r2" frameDuration="1/%ds" width="1080" height="1920"/>' % fps,
+             '    <asset id="r3" name=%s start="0s" duration="%s" hasVideo="1" hasAudio="1" format="r1">'
+             % (quoteattr(source_name), t(info.get("duration", 0))),
+             '      <media-rep kind="original-media" src=%s/>' % quoteattr("file:///" + source_name),
+             "    </asset>", "  </resources>", "  <library>", "    <event name=%s>" % quoteattr(project_name)]
+    for name, start, intervals in clips:
+        total = sum(b - a for a, b in intervals)
+        parts.append('      <project name=%s><sequence format="r2" duration="%s"><spine>' % (quoteattr(name), t(total)))
+        off = 0.0
+        for a, b in intervals:
+            parts.append('        <asset-clip ref="r3" offset="%s" start="%s" duration="%s" name=%s/>'
+                         % (t(off), t(start + a), t(b - a), quoteattr(name)))
+            off += b - a
+        parts.append("      </spine></sequence></project>")
+    parts += ["    </event>", "  </library>", "</fcpxml>"]
+    return "\n".join(parts)

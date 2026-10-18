@@ -21,7 +21,9 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 8. Best-of-Trailer (30–60 s) aus den stärksten Sätzen mehrerer Clips; übersetzte Versionen jedes Clips (Untertitel, Hook, Titel, Beschreibung) per Claude in Englisch, Spanisch, Französisch, Italienisch, Türkisch oder Polnisch.
 9. Qualitäts-Check nach dem Rendern: Lautstärke, Schnitt mitten im Wort, angeschnittene Personen, fehlende Gesichter; mit Claude-Schlüssel zusätzlich Rechtschreibprüfung der Untertitel mit Ein-Klick-Korrektur.
 10. Texte zum Video per Claude: YouTube-Kapitel, LinkedIn-Beitrag, Blog-/Newsletter-Text und Karussell-Folien.
-11. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
+11. Export für Schnittprogramme: ZIP mit EDL je Clip (Premiere, DaVinci), FCPXML (Final Cut, DaVinci), SRTs und Anleitung.
+12. Betrieb: Warteschlange mit Restzeit (lernt die Geschwindigkeit des Servers), Umsortieren und Abbrechen; Transkript und Tonanalyse werden übernommen, wenn dasselbe Video erneut hochgeladen wird; Speicheranzeige mit Löschen der Originalvideos; Claude-Kosten pro Projekt und pro Monat.
+13. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
 
 ## Deployment
 

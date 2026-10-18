@@ -108,6 +108,8 @@ body.safe .sz{display:block}
 .tr{display:flex;flex-direction:column;gap:6px;border-top:1px solid var(--line);padding-top:8px}
 .tl{width:100%;height:90px;display:block;margin-top:8px}
 .crit{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-size:12px}
+.qrow{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}
+.qn{width:22px;text-align:center;font-weight:800;color:var(--accent2)}
 .qc{display:flex;flex-direction:column;gap:4px;font-size:13px;background:var(--panel2);border-radius:8px;padding:8px 10px}
 .qw{color:var(--accent2)}.qi{color:var(--muted)}
 .qs{display:flex;align-items:center;justify-content:space-between;gap:8px}
@@ -164,6 +166,9 @@ details.txt pre{white-space:pre-wrap;font:14px/1.55 inherit;font-family:inherit;
     <div style="grid-column:1/-1"><label>API-Schlüssel <span id="hint_pz_key"></span></label><input id="s_pz_key" type="password" placeholder="leer lassen = unverändert" autocomplete="off"></div>
   </div>
 
+  <h3>KI-Kosten</h3>
+  <div id="costInfo"></div>
+
   <h3>Musikbibliothek</h3>
   <p class="muted small" style="margin-top:0">Lizenzfreie Musik (z. B. aus der YouTube Audio Library) als MP3 hochladen. Sie wird unter die Stimme gemischt und automatisch leiser, sobald gesprochen wird.</p>
   <div class="list" id="musicList" style="max-height:none"></div>
@@ -196,6 +201,13 @@ details.txt pre{white-space:pre-wrap;font:14px/1.55 inherit;font-family:inherit;
   <div class="row" style="justify-content:flex-end"><button class="btn primary" id="pzSend" onclick="sendPostiz()">An Postiz senden</button></div>
 </div></div>
 
+<div class="modal" id="storageModal"><div class="card">
+  <div class="row" style="justify-content:space-between"><h2 style="margin:0">Speicher aufräumen</h2><button class="btn ghost sm" onclick="closeModal('storageModal')">Schließen</button></div>
+  <p class="muted small" id="stInfo"></p>
+  <button class="btn primary" id="stAll" onclick="cleanupAll()">Originale löschen</button>
+  <div class="list" id="stList" style="margin-top:14px"></div>
+</div></div>
+
 <div class="toast" id="toast"></div>
 <script>
 var S = {view: "home", job: null, jobs: [], settings: null, timer: null, editing: {}, srcTab: "file"};
@@ -218,6 +230,7 @@ function statusPill(j){
   if(j.status==="fertig") return '<span class="pill ok">Fertig</span>';
   if(j.status==="fehler") return '<span class="pill err">Fehler</span>';
   if(j.status==="prüfen") return '<span class="pill rev">Prüfen</span>';
+  if(j.status==="abgebrochen") return '<span class="pill">Abgebrochen</span>';
   if(j.status==="wartet") return '<span class="pill">Wartet</span>';
   return '<span class="pill run">'+Math.round(j.progress)+' %</span>';
 }
@@ -258,7 +271,7 @@ function route(){
   var m=location.hash.match(/^#job\/([0-9a-f]{12})/);
   if(m){S.view="job";S.job=null;S.editing={};S.crop={};S.removed={};loadJob(m[1])}else{S.view="home";renderHome();loadJobs()}
   S.timer=setInterval(function(){
-    if(S.view==="home") loadJobs();
+    if(S.view==="home"){loadJobs();loadQueue();if(!S.stTick||Date.now()-S.stTick>30000) loadStorage()}
     else if(S.job && isRunning(S.job)) loadJob(S.job.id, true);
   },3000);
 }
@@ -286,7 +299,7 @@ function renderHome(){
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
       '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("split",d.mode,"Geteilt bei 2 Personen")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
     '</div>'+
-    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_two_stage",d.two_stage,"Gründliche KI-Auswahl (2 Durchgänge)")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
+    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_two_stage",d.two_stage,"Gründliche KI-Auswahl (2 Durchgänge)")+chk("o_reuse_transcript",d.reuse_transcript,"Transkript wiederverwenden, wenn das Video schon verarbeitet wurde")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
     '<details><summary>Untertitel, Hook und Qualität</summary><div class="grid">'+
       '<div><label>Untertitel-Stil</label><select id="o_sub_style">'+opt("pop",d.sub_style,"Pop – Wort für Wort")+opt("box",d.sub_style,"Box – mit Hintergrund")+opt("minimal",d.sub_style,"Minimal")+opt("satz",d.sub_style,"Ganze Sätze")+'</select></div>'+
       '<div><label>Hervorhebung (aktives Wort)</label><input id="o_highlight" type="color" value="'+d.highlight+'"></div>'+
@@ -305,7 +318,7 @@ function renderHome(){
     '</div><p class="muted small">Musik lädst du in den <a href="#" onclick="openSettings();return false">Einstellungen</a> hoch. Sie wird automatisch leiser, sobald gesprochen wird. Jedes zusätzliche Format verlängert das Rendern.</p></details>'+
     '<div style="margin-top:14px"><label>Worum geht es im Video? (optional, hilft der KI)</label><textarea id="o_context" placeholder="z. B. Podcast über Selbstständigkeit, Zielgruppe junge Gründer"></textarea></div>'+
     '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="saveDefaults()">Einstellungen als Standard speichern</button></div>'+
-    '</div><div class="jobs" id="jobs"></div>');
+    '</div><div id="storage"></div><div id="queue"></div><div class="jobs" id="jobs"></div>');
   if(S.srcTab==="file"){
     var drop=$("drop"),file=$("file");
     drop.onclick=function(){file.click()};
@@ -314,12 +327,12 @@ function renderHome(){
     drop.ondragleave=function(){drop.classList.remove("over")};
     drop.ondrop=function(e){e.preventDefault();drop.classList.remove("over");if(e.dataTransfer.files[0]) upload(e.dataTransfer.files[0])};
   }
-  renderJobs();
+  renderJobs();loadQueue();loadStorage();
 }
 
 function readOpts(){
   var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage"].forEach(function(k){o[k]=$("o_"+k).checked});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
@@ -434,6 +447,15 @@ function renderJob(){
     '<h1 style="word-break:break-word">'+esc(j.name)+'</h1><div class="row muted small">'+statusPill(j)+'<span>'+esc(j.message)+'</span>'+
     (j.info?'<span>· '+fmt(j.info.duration)+' · '+j.info.width+'×'+j.info.height+'</span>':'')+
     (j.selector?'<span>· Auswahl: '+(j.selector==="claude"?"Claude KI":"Automatik")+'</span>':'')+'</div>';
+  var cost=j.costs?Object.keys(j.costs).reduce(function(a,k){return a+j.costs[k].usd},0):0;
+  html+='<div class="row small" style="margin-top:10px;gap:8px">'+
+    (running?'<span class="muted">'+(j.eta?"noch ca. "+fmtEta(j.eta):"")+'</span><button class="btn sm danger" onclick="cancelJob()">Abbrechen</button>':'')+
+    ((j.status==="abgebrochen"||j.status==="fehler")&&!j.source_deleted?'<button class="btn sm primary" onclick="restartJob()">Neu starten</button>':'')+
+    ((j.clips||[]).length&&j.info?'<a class="btn sm" href="/api/jobs/'+j.id+'/export">Export für Schnittprogramme</a>':'')+
+    (!running&&!j.source_deleted&&j.source&&j.status!=="prüfen"?'<button class="btn sm ghost" onclick="deleteSource()">Original löschen'+(j.size?' ('+size(j.size)+')':'')+'</button>':'')+
+    (cost?'<span class="muted" title="Claude-Kosten dieses Projekts">KI-Kosten: '+fmtUsd(cost)+'</span>':'')+
+    (j.reused_from?'<span class="muted">Transkript übernommen aus „'+esc(j.reused_from)+'“</span>':'')+'</div>';
+  if(j.source_deleted) html+='<div class="hint" style="margin-top:12px">Das Originalvideo wurde gelöscht, um Speicher zu sparen. Clips, Untertitel und Texte bleiben erhalten; zum Neu-Rendern lade das Video erneut hoch.</div>';
   if(running) html+='<div class="bar" style="height:8px;margin-top:12px"><i style="width:'+j.progress+'%"></i></div>';
   if(running||j.status==="fertig") html+='<div class="log">'+(j.log||[]).map(esc).join("<br>")+'</div>';
   if(j.status==="fehler") html+='<div class="hint" style="margin-top:14px;background:#2a1616;border-color:#5a2525;color:#ffb3b3">'+esc(j.message)+'</div>';
@@ -537,6 +559,65 @@ function cropTime(i){
 }
 function delCropKey(i,n){cropState(i).keys.splice(n,1);$("ck"+i).innerHTML=cropList(i)}
 function clearCrop(i){cropState(i).keys=[];$("ck"+i).innerHTML=cropList(i);toast("Bildausschnitt wieder automatisch – Speichern nicht vergessen")}
+
+// ---------------------------------------------------------------- queue, storage, costs
+function fmtEta(sec){if(sec==null) return "";if(sec<90) return "1 Min.";var m=Math.round(sec/60);return m<60?m+" Min.":Math.floor(m/60)+" Std. "+(m%60)+" Min."}
+function fmtUsd(v){return (v<0.01?v.toFixed(4):v.toFixed(2)).replace(".",",")+" $"}
+function loadQueue(){
+  api("GET","/api/queue").then(function(q){
+    var el=$("queue");if(!el) return;
+    if(!q.length){el.innerHTML="";return}
+    el.innerHTML='<div class="card" style="margin-top:20px"><b>Warteschlange</b><div class="list" style="max-height:none">'+q.map(function(x,k){
+      return '<div class="qrow"><span class="qn">'+(x.running?"▶":(q[0].running?k:k+1))+'</span><div style="flex:1;min-width:0"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;cursor:pointer" onclick="go(\'job\',\''+x.id+'\')">'+esc(x.name)+'</div>'+
+        '<div class="muted small">'+esc(x.running?x.message:"wartet")+(x.eta_total?' · fertig in ca. '+fmtEta(x.eta_total):'')+'</div>'+(x.running?'<div class="bar"><i style="width:'+x.progress+'%"></i></div>':'')+'</div>'+
+        (!x.running&&k>(q[0].running?1:0)?'<button class="btn sm ghost" title="nach vorne" onclick="moveQ(\''+x.id+'\',\'up\')">↑</button>':'')+
+        (!x.running&&k<q.length-1?'<button class="btn sm ghost" title="nach hinten" onclick="moveQ(\''+x.id+'\',\'down\')">↓</button>':'')+
+        '<button class="btn sm danger" onclick="cancelJob(\''+x.id+'\')">Abbrechen</button></div>'}).join("")+'</div></div>';
+  }).catch(function(){});
+}
+function moveQ(id,dir){api("POST","/api/queue/move",{id:id,dir:dir}).then(loadQueue).catch(function(e){toast(e.message)})}
+function cancelJob(id){
+  id=id||S.job.id;if(!confirm("Verarbeitung abbrechen? Bereits fertige Clips bleiben erhalten.")) return;
+  api("POST","/api/jobs/"+id+"/cancel").then(function(){toast("Wird abgebrochen");if(S.view==="job") loadJob(id,true);else{loadQueue();loadJobs()}}).catch(function(e){toast(e.message)});
+}
+function restartJob(){api("POST","/api/jobs/"+S.job.id+"/restart").then(function(j){S.job=j;renderJob();toast("Neu gestartet")}).catch(function(e){toast(e.message)})}
+function deleteSource(){
+  if(!confirm("Originalvideo dieses Projekts löschen? Clips, Untertitel und Texte bleiben erhalten, neu rendern ist danach aber nicht mehr möglich.")) return;
+  api("POST","/api/jobs/"+S.job.id+"/delete-source").then(function(j){S.job=j;renderJob();toast("Original gelöscht")}).catch(function(e){toast(e.message)});
+}
+function loadStorage(){
+  S.stTick=Date.now();
+  api("GET","/api/storage").then(function(st){
+    S.storage=st;var el=$("storage");if(!el) return;
+    var usedPct=st.disk_used/st.disk_total*100,low=st.disk_free<10e9||st.disk_free/st.disk_total<0.1;
+    el.innerHTML='<div class="card" style="margin-top:20px;padding:14px 16px'+(low?';border-color:#5a4520':'')+'"><div class="row" style="justify-content:space-between"><span><b>Speicher</b> <span class="muted small">'+size(st.disk_free)+' frei von '+size(st.disk_total)+' · ShortCut belegt '+size(st.projects_total)+'</span></span><button class="btn sm" onclick="openStorage()">Aufräumen</button></div>'+
+      '<div class="bar" style="height:8px"><i style="width:'+usedPct.toFixed(1)+'%;'+(low?'background:var(--err)':'')+'"></i></div>'+
+      (low?'<div class="small" style="color:var(--accent2);margin-top:6px">Der Server wird knapp – lösche Originalvideos fertiger Projekte, sonst können auch Nextcloud und deine anderen Apps Probleme bekommen.</div>':'')+'</div>';
+  }).catch(function(){});
+}
+function openStorage(){
+  var st=S.storage;if(!st) return;
+  var src=st.projects.filter(function(x){return x.status==="fertig"&&!x.source_deleted}).reduce(function(a,x){return a+x.source},0);
+  $("stInfo").innerHTML='Projekte belegen '+size(st.projects_total)+', davon Originalvideos fertiger Projekte '+size(src)+'. Whisper-Modelle '+size(st.models)+', Musik '+size(st.music)+'. Projekte werden nach '+st.retention_days+' Tagen automatisch gelöscht.';
+  $("stAll").disabled=!src;$("stAll").textContent="Originale aller fertigen Projekte löschen ("+size(src)+")";
+  $("stList").innerHTML=st.projects.map(function(x){return '<div class="item" style="cursor:default"><div style="flex:1;min-width:0"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(x.name)+'</div><div class="muted small">'+size(x.total)+(x.source_deleted?' · Original gelöscht':x.source?' · davon Original '+size(x.source):'')+'</div></div>'+
+    (!x.source_deleted&&x.source&&x.status!=="läuft"&&x.status!=="wartet"?'<button class="btn sm ghost" onclick="delSrc(\''+x.id+'\')">Original löschen</button>':'')+'</div>'}).join("");
+  $("storageModal").classList.add("on");
+}
+function delSrc(id){api("POST","/api/jobs/"+id+"/delete-source").then(loadStorage).then(function(){setTimeout(openStorage,300);toast("Original gelöscht")}).catch(function(e){toast(e.message)})}
+function cleanupAll(){
+  if(!confirm("Originalvideos aller fertigen Projekte löschen? Clips bleiben erhalten.")) return;
+  api("POST","/api/storage/cleanup").then(function(r){toast(size(r.freed)+" freigegeben");return loadStorage()}).then(function(){setTimeout(openStorage,300)}).catch(function(e){toast(e.message)});
+}
+function loadCosts(){
+  api("GET","/api/costs").then(function(c){
+    var el=$("costInfo");if(!el) return;
+    if(!c.months.length){el.innerHTML='<span class="muted small">Noch keine KI-Kosten erfasst.</span>';return}
+    el.innerHTML=c.months.map(function(m,k){return '<details'+(k===0?" open":"")+'><summary style="margin:4px 0;color:var(--text)">'+m.month+': <b>'+fmtUsd(m.usd)+'</b></summary><div class="small muted" style="padding:2px 0 6px 14px">'+
+      Object.keys(m.features).map(function(f){return esc(f)+': '+fmtUsd(m.features[f].usd)+' ('+m.features[f].calls+' Aufrufe)'}).join("<br>")+'</div></details>'}).join("")+
+      '<div class="muted small" style="margin-top:6px">Modell '+esc(c.model)+(c.prices?' · '+c.prices[0]+' $ / '+c.prices[1]+' $ je Mio. Tokens Ein-/Ausgabe':'')+'. Abgerechnet wird in US-Dollar über dein Anthropic-Konto.</div>';
+  }).catch(function(){});
+}
 
 // ---------------------------------------------------------------- quality check
 function checksUI(c,i){
@@ -668,7 +749,7 @@ function openSettings(){
   TEXTS.forEach(function(k){$("s_"+k).value=s[k]||""});
   $("s_nc_export").checked=!!s.nc_export;$("s_nc_watch").checked=!!s.nc_watch;
   var w=s.watch||{};$("watchInfo").textContent=s.nc_watch?(w.at?"Zuletzt geprüft "+new Date(w.at*1000).toLocaleTimeString("de-DE")+": "+w.message:"Wird in den nächsten Minuten zum ersten Mal geprüft."):"Verarbeitete Videos landen in Eingang/Verarbeitet.";$("s_new_password").value="";$("sErr").textContent="";
-  renderMusic();
+  renderMusic();loadCosts();
   $("settingsModal").classList.add("on");
 }
 function renderMusic(){
