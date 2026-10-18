@@ -120,12 +120,27 @@ def snap(clip, words, min_len, max_len):
     return clip
 
 
-def remove_overlaps(clips):
+def overlap(a, b):
+    return max(0.0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
+
+
+def remove_overlaps(clips, tolerance=0.0):
+    """Best first; a clip is dropped only if it overlaps an accepted one by more than `tolerance` seconds."""
     out = []
     for c in sorted(clips, key=lambda c: -c.get("score", 0)):
-        if all(c["end"] <= o["start"] or c["start"] >= o["end"] for o in out):
+        if all(overlap(c, o) <= tolerance for o in out):
             out.append(c)
     return out
+
+
+def split_touching(clips):
+    """Clips that touch because of the cut padding share the boundary instead of overlapping."""
+    clips.sort(key=lambda c: c["start"])
+    for a, b in zip(clips, clips[1:]):
+        if b["start"] < a["end"]:
+            mid = round((a["end"] + b["start"]) / 2, 2)
+            a["end"], b["start"] = mid, mid
+    return clips
 
 
 def annotated_transcript(segments, audio):
@@ -153,7 +168,8 @@ def highlights_claude(segments, api_key, n, min_len, max_len, context, audio=Non
     prompt = (
         "Du bist ein erfahrener Social-Media-Editor für TikTok, Instagram Reels und YouTube Shorts.\n"
         "Unten steht das Transkript eines deutschsprachigen Videos mit Zeitstempeln in Sekunden.\n"
-        "Wähle die %d stärksten Ausschnitte, die als eigenständige Kurzvideos funktionieren.\n\n"
+        "Wähle die %d stärksten Ausschnitte, die als eigenständige Kurzvideos funktionieren, sortiert nach "
+        "Stärke (bester zuerst). Die letzten Vorschläge sind Reserve, falls einzelne nicht passen.\n\n"
         "Regeln:\n"
         "- Jeder Ausschnitt ist zwischen %d und %d Sekunden lang.\n"
         "- Er beginnt mit einem starken Hook (Frage, steile These, Überraschung, Emotion) und braucht keinen Vorkontext.\n"
@@ -170,7 +186,7 @@ def highlights_claude(segments, api_key, n, min_len, max_len, context, audio=Non
         '"hooks": ["3 unterschiedliche Hook-Texte für die ersten Sekunden, je max. 8 Wörter: z. B. Frage, steile These, Neugier"], '
         '"keywords": ["2-6 Wörter, die im Ausschnitt wörtlich vorkommen und hervorgehoben werden sollen, z. B. Zahlen, Kernbegriffe"]}]\n\n'
         "TRANSKRIPT:\n%s"
-    ) % (n, min_len, max_len, extra, transcript)
+    ) % (n + 3, min_len, max_len, extra, transcript)
 
     return claude_json(api_key, prompt, r"\[.*\]")
 
@@ -200,8 +216,9 @@ HOOK_WORDS = [
 ]
 
 
-def highlights_heuristic(segments, n, min_len, max_len, audio=None):
-    """Fallback without AI: score windows by speech density, emphasis and hook words."""
+def score_windows(segments, min_len, max_len, audio=None):
+    """All candidate windows (whole segments, min_len..max_len) with a score from speech density, emphasis,
+    hook words and the audio analysis."""
     target = (min_len + max_len) / 2
     cands = []
     for i, seg in enumerate(segments):
@@ -235,18 +252,27 @@ def highlights_heuristic(segments, n, min_len, max_len, audio=None):
                         score += 6
                 cands.append({"start": start, "end": segments[j]["e"], "score": score, "text": text.strip()})
             j += 1
-    clips = remove_overlaps(cands)[:n]
-    for c in clips:
-        sentences = [s for s in re.split(r"(?<=[.!?])\s", c["text"]) if s.strip()]
-        short = lambda s: (s[:70] + "…") if len(s) > 70 else s
-        c["title"] = short(sentences[0])
-        c["hook"] = "Automatisch gewählt (Sprechdichte, Fragen, Schlüsselwörter)"
-        c["caption"] = ""
-        # alternatives: the first question in the clip and the second sentence
-        alts = [s for s in sentences[1:] if s.endswith("?")][:1] + sentences[1:2]
-        c["hooks"] = list(dict.fromkeys([c["title"]] + [short(s) for s in alts]))[:3]
-        c["keywords"] = guess_keywords(c["text"])
-        del c["text"]
+    return cands
+
+
+def decorate(c):
+    """Title, hook ideas and keywords for a window chosen without AI."""
+    sentences = [s for s in re.split(r"(?<=[.!?])\s", c["text"]) if s.strip()] or [c["text"]]
+    short = lambda s: (s[:70] + "…") if len(s) > 70 else s
+    c["title"] = short(sentences[0])
+    c["hook"] = "Automatisch gewählt (Sprechdichte, Fragen, Schlüsselwörter)"
+    c["caption"] = ""
+    alts = [s for s in sentences[1:] if s.endswith("?")][:1] + sentences[1:2]
+    c["hooks"] = list(dict.fromkeys([c["title"]] + [short(s) for s in alts]))[:3]
+    c["keywords"] = guess_keywords(c["text"])
+    del c["text"]
+    return c
+
+
+def highlights_heuristic(segments, n, min_len, max_len, audio=None, cands=None):
+    """Fallback without AI: the best non-overlapping scored windows."""
+    cands = cands if cands is not None else score_windows(segments, min_len, max_len, audio)
+    clips = [decorate(dict(c)) for c in remove_overlaps(cands, 1.0)[:n]]
     if clips:
         top = max(c["score"] for c in clips) or 1
         for c in clips:
@@ -263,11 +289,49 @@ def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=
             source = "claude"
         except Exception as e:  # fall back to heuristic
             log("KI-Auswahl fehlgeschlagen, nutze automatische Auswahl: " + str(e)[:200])
+    cands = score_windows(segments, min_len, max_len, audio)
     if not clips:
-        clips = highlights_heuristic(segments, n, min_len, max_len, audio)
-    snapped = [c for c in (snap(c, words, min_len, max_len) for c in clips) if c]
-    snapped = remove_overlaps(snapped)[:n]
-    snapped.sort(key=lambda c: c["start"])
+        clips = highlights_heuristic(segments, n, min_len, max_len, audio, cands)
+    for rank, c in enumerate(clips):  # Claude lists the best first; keep that order if it gives no score
+        c.setdefault("score", 100 - rank)
+
+    def select(primary, pool, max_l):
+        chosen = [c for c in (snap(c, words, min_len, max_l) for c in primary) if c]
+        chosen = remove_overlaps(chosen, 1.5)[:n]
+        top = max([x["score"] for x in pool] or [1]) or 1
+        for c in sorted(pool, key=lambda c: -c["score"]):  # fill free stretches with the best remaining windows
+            if len(chosen) >= n:
+                break
+            sc = snap(dict(c), words, min_len, max_l)
+            if sc and all(overlap(sc, o) <= 1.5 for o in chosen):
+                sc = decorate(sc)
+                sc["score"] = max(1, round(c["score"] / top * 100))
+                sc["filled"] = True
+                if source == "claude":
+                    sc["hook"] = "Ergänzt durch die Automatik (KI hatte nicht genug passende Vorschläge)"
+                chosen.append(sc)
+        return chosen
+
+    snapped = select(clips, cands, max_len)
+    # not enough room for n clips of this length: try shorter ones, as long as that yields more clips
+    for frac in (0.6, 0.3, 0.0):
+        if len(snapped) >= n:
+            break
+        mx = min_len + (max_len - min_len) * frac + 5
+        short = [c for c in cands if c["end"] - c["start"] <= mx]
+        alt = select([dict(c) for c in clips if c["end"] - c["start"] <= mx + 1] if source == "claude"
+                      else highlights_heuristic(segments, n, min_len, mx, audio, short), short, mx)
+        if len(alt) > len(snapped):
+            snapped = alt
+    for c in snapped:
+        if source != "claude":
+            c.pop("filled", None)
+    if len(snapped) < n:
+        spoken = sum(s["e"] - s["s"] for s in segments)
+        log("Nur %d von %d Clips möglich – %s" % (len(snapped), n,
+            "das Video hat zu wenig Sprache für so viele Clips dieser Länge" if spoken < n * min_len * 1.3
+            else "versuche eine kürzere Mindestlänge"))
+    split_touching(snapped)
     for k, c in enumerate(snapped):
         if audio:  # keep the laugh or applause that follows the punchline
             nxt = snapped[k + 1]["start"] if k + 1 < len(snapped) else float("inf")
