@@ -1546,8 +1546,11 @@ def generate_texts(api_key, segments, context="", titles=()):
         "3. blog: Blog- bzw. Newsletter-Artikel mit title und text (300-500 Wörter, Zwischenüberschriften mit ##).\n"
         "4. carousel: 6-8 Folien für ein Instagram-Karussell, je title (max. 6 Wörter) und text (max. 25 Wörter); "
         "Folie 1 ist der Aufhänger, die letzte eine Aufforderung.\n"
+        "5. youtube: Titel für das ganze Video (max. 70 Zeichen, neugierig machend, kein Clickbait), summary "
+        "(2-4 Sätze: worum geht es, was lernt man) und 3-5 hashtags (ohne #).\n"
         "Antworte NUR mit JSON: {\"chapters\": [{\"time\": \"0:00\", \"title\": \"...\"}], \"linkedin\": \"...\", "
-        "\"blog\": {\"title\": \"...\", \"text\": \"...\"}, \"carousel\": [{\"title\": \"...\", \"text\": \"...\"}]}\n\n"
+        "\"blog\": {\"title\": \"...\", \"text\": \"...\"}, \"carousel\": [{\"title\": \"...\", \"text\": \"...\"}], "
+        "\"youtube\": {\"title\": \"...\", \"summary\": \"...\", \"hashtags\": [\"...\"]}}\n\n"
         "TRANSKRIPT:\n%s"
     ) % (extra, lines)
     res = claude_json(api_key, prompt, max_tokens=6000, feature="Texte")
@@ -1556,21 +1559,38 @@ def generate_texts(api_key, segments, context="", titles=()):
         parts = [float(x) for x in str(t).split(":")]
         return sum(v * 60 ** k for k, v in enumerate(reversed(parts)))
 
+    def sort_key(c):
+        try:
+            return secs(c.get("time", 0))
+        except ValueError:
+            return 1e9
+
+    starts = [s["s"] for s in segments]
     chapters, last = [], -999
-    for c in sorted(res.get("chapters") or [], key=lambda c: secs(c.get("time", 0))):
+    for c in sorted([c for c in res.get("chapters") or [] if isinstance(c, dict)], key=sort_key):
         try:
             t = secs(c.get("time", 0))
         except ValueError:
             continue
-        if not chapters:
-            t = 0
-        if t - last >= 10 and c.get("title"):
-            chapters.append({"time": fmt_time(t), "title": str(c["title"])[:80]})
+        near = [s for s in starts if abs(s - t) <= 15]
+        if near:  # start the chapter exactly where the sentence begins
+            t = min(near, key=lambda s: abs(s - t))
+        t = 0 if not chapters else int(t)
+        if t - last >= 10 and c.get("title"):  # YouTube needs at least 10 s per chapter
+            chapters.append({"time": fmt_time(t), "s": t, "title": str(c["title"])[:80]})
             last = t
-    if len(chapters) < 3:
+    if len(chapters) < 3:  # YouTube ignores fewer than three chapters
         chapters = []
     blog = res.get("blog") or {}
+    yt = res.get("youtube") if isinstance(res.get("youtube"), dict) else {}
+    tags = ["#" + str(h).lstrip("#").replace(" ", "") for h in (yt.get("hashtags") or []) if str(h).strip()][:5]
+    desc = str(yt.get("summary") or "").strip()
+    if chapters:
+        desc += "\n\nKapitel:\n" + "\n".join("%s %s" % (c["time"], c["title"]) for c in chapters)
+    if tags:
+        desc += "\n\n" + " ".join(tags)
     return {
+        "youtube": {"title": str(yt.get("title") or "")[:100], "description": desc.strip()},
         "chapters": chapters,
         "linkedin": str(res.get("linkedin") or ""),
         "blog": {"title": str(blog.get("title") or ""), "text": str(blog.get("text") or "")},

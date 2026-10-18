@@ -576,7 +576,7 @@ function renderJob(){
       (c.series?'<div><span class="pill rev">Teil '+c.series.part+'/'+c.series.total+'</span></div>':'')+(c.manual&&!c.series?'<div><span class="pill">Von Hand markiert</span></div>':'')+
       lengthNote(outLen)+audioBadge(c)+criteriaUI(c)+checksUI(c,i)+
       '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
-      (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+pz+
+      (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+(!review&&clipRef(c)?'<div class="muted small">📍 '+esc(refText(clipRef(c)))+'</div>':'')+pz+
       (done&&!review?'<div class="row" style="margin-top:auto;gap:8px">'+dl(c.file,"MP4 9:16"," primary")+(f["4x5"]?dl(f["4x5"],"4:5"):'')+(f["1x1"]?dl(f["1x1"],"1:1"):'')+(c.cover?dl(c.cover,"Titelbild"):'')+dl(c.srt,"SRT")+
         '<button class="btn sm" onclick="openPostiz('+i+')">An Postiz</button>'+
         (c.caption?'<button class="btn sm ghost" onclick="copyCap('+i+')">Text kopieren</button>':'')+'<button class="btn sm ghost" onclick="toggleEdit('+i+')">Anpassen</button></div>'+translationsUI(c,i):'')+
@@ -592,7 +592,7 @@ function renderJob(){
   if(scroll&&$("ft")) $("ft").scrollTop=scroll;
 }
 function toggleEdit(i){S.editing[i]=!S.editing[i];$("ed"+i).classList.toggle("on")}
-function copyCap(i){var c=S.job.clips[i];navigator.clipboard.writeText(c.title+"\n\n"+c.caption).then(function(){toast("Kopiert")})}
+function copyCap(i){var c=S.job.clips[i];navigator.clipboard.writeText(c.title+"\n\n"+c.caption+refLine(c)).then(function(){toast("Kopiert")})}
 function clipBody(i){
   return {start:parseT($("e_s"+i).value),end:parseT($("e_e"+i).value),title:$("e_t"+i).value,hook_text:$("e_h"+i).value,
     cover_text:$("e_cv"+i).value,keywords:$("e_k"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value,
@@ -739,15 +739,36 @@ function fixSpelling(i,k){
 function textsCard(j){
   if(j.status!=="fertig"&&!j.texts) return '';
   var t=j.texts;
-  var head='<div class="row" style="justify-content:space-between"><div><b>Texte zum Video</b><div class="muted small">YouTube-Kapitel, LinkedIn-Beitrag, Blog-/Newsletter-Text und Karussell-Folien aus dem Transkript.</div></div>'+
+  var head='<div class="row" style="justify-content:space-between"><div><b>Texte zum Video</b><div class="muted small">YouTube-Titel, Beschreibung mit Kapiteln, LinkedIn-Beitrag, Blog-/Newsletter-Text und Karussell-Folien aus dem Transkript.</div></div>'+
     '<div class="row" style="gap:8px">'+(t?'<button class="btn sm" onclick="downloadTexts()">Als Textdatei laden</button>':'')+'<button class="btn sm primary" onclick="makeTexts()">'+(t?"Neu erstellen":"Texte erstellen")+'</button></div></div>';
   if(!t) return '<div class="card" style="margin-top:16px">'+head+'</div>';
   var chap=(t.chapters||[]).map(function(c){return c.time+" "+c.title}).join("\n");
   var blog=t.blog&&t.blog.title?"# "+t.blog.title+"\n\n"+t.blog.text:"";
   var car=(t.carousel||[]).map(function(c,k){return "Folie "+(k+1)+": "+c.title+"\n"+c.text}).join("\n\n");
-  S.textParts={chapters:chap,linkedin:t.linkedin||"",blog:blog,carousel:car};
+  var yt=t.youtube||{};
+  S.textParts={yttitle:yt.title||"",ytdesc:yt.description||"",chapters:chap,linkedin:t.linkedin||"",blog:blog,carousel:car};
   function sec(key,label){return S.textParts[key]?'<details class="txt"><summary>'+label+'<button class="btn sm ghost" onclick="event.preventDefault();copyText(\''+key+'\')">Kopieren</button></summary><pre>'+esc(S.textParts[key])+'</pre></details>':''}
-  return '<div class="card" style="margin-top:16px">'+head+'<div style="margin-top:10px">'+sec("chapters","YouTube-Kapitel")+sec("linkedin","LinkedIn-Beitrag")+sec("blog","Blog / Newsletter")+sec("carousel","Karussell-Folien")+'</div></div>';
+  var link='<div style="margin:12px 0 4px"><label>Link zum veröffentlichten ganzen Video (optional)</label><div class="row" style="gap:8px"><input id="e_vurl" placeholder="https://youtu.be/…" value="'+esc(j.video_url||"")+'" style="flex:1;min-width:200px"><button class="btn sm" onclick="saveVideoUrl()">Speichern</button></div>'+
+    '<div class="muted small">Dann bekommt jeder Clip-Text eine Zeile „Ganzes Video ab 12:34 →“ mit Link direkt zur passenden Stelle.</div></div>';
+  return '<div class="card" style="margin-top:16px">'+head+link+'<div style="margin-top:10px">'+sec("yttitle","YouTube-Titel")+sec("ytdesc","YouTube-Beschreibung mit Kapiteln")+sec("chapters","Nur Kapitel")+sec("linkedin","LinkedIn-Beitrag")+sec("blog","Blog / Newsletter")+sec("carousel","Karussell-Folien")+'</div></div>';
+}
+// where a clip sits in the long video: chapter and time, with a jump link if the video is published
+function clipRef(c){
+  var ch=(S.job.texts&&S.job.texts.chapters)||[],url=S.job.video_url||"";
+  if(!ch.length&&!url) return null;
+  var cur=null;ch.forEach(function(x){var s=x.s!=null?x.s:parseT(x.time);if(s<=c.start+1) cur=x});
+  return {t:Math.floor(c.start),chapter:cur?cur.title:"",url:url?timeLink(url,Math.floor(c.start)):""};
+}
+function timeLink(url,t){
+  if(!/youtu\.?be/.test(url)) return url;
+  url=url.replace(/([?&])t=\d+s?&?/,"$1").replace(/[?&]$/,"");
+  return url+(url.indexOf("?")<0?"?":"&")+"t="+t;
+}
+function hms(t){var h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;return (h?h+":"+(m<10?"0":""):"")+m+":"+(s<10?"0":"")+s}
+function refText(r){return "Ganzes Video ab "+hms(r.t)+(r.chapter?" – Kapitel „"+r.chapter+"“":"")}
+function refLine(c){var r=clipRef(c);return r&&r.url?"\n\n▶ "+refText(r)+": "+r.url:""}
+function saveVideoUrl(){
+  api("POST","/api/jobs/"+S.job.id+"/video_url",{url:$("e_vurl").value.trim()}).then(function(j){S.job=j;renderJob();toast("Link gespeichert")}).catch(function(e){toast(e.message)});
 }
 function makeTexts(){
   if(!S.settings.has_anthropic_key) return toast("Für die Texte bitte zuerst einen Claude-API-Schlüssel in den Einstellungen hinterlegen");
@@ -755,7 +776,7 @@ function makeTexts(){
 }
 function copyText(k){navigator.clipboard.writeText(S.textParts[k]).then(function(){toast("Kopiert")})}
 function downloadTexts(){
-  var p=S.textParts,all="YOUTUBE-KAPITEL\n\n"+p.chapters+"\n\n\nLINKEDIN\n\n"+p.linkedin+"\n\n\nBLOG / NEWSLETTER\n\n"+p.blog+"\n\n\nKARUSSELL\n\n"+p.carousel+"\n";
+  var p=S.textParts,all="YOUTUBE-TITEL\n\n"+p.yttitle+"\n\n\nYOUTUBE-BESCHREIBUNG\n\n"+p.ytdesc+"\n\n\nYOUTUBE-KAPITEL\n\n"+p.chapters+"\n\n\nLINKEDIN\n\n"+p.linkedin+"\n\n\nBLOG / NEWSLETTER\n\n"+p.blog+"\n\n\nKARUSSELL\n\n"+p.carousel+"\n";
   var a=document.createElement("a");a.href=URL.createObjectURL(new Blob([all],{type:"text/plain;charset=utf-8"}));
   a.download=(S.job.name.replace(/\.[^.]+$/,"")||"video")+"_texte.txt";a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},2000);
 }
@@ -824,7 +845,7 @@ function openPostiz(i){
   var c=S.job.clips[i];S.pzClip=i;
   var d=new Date();d.setDate(d.getDate()+1);d.setHours(18,0,0,0);
   $("pzDate").value=d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+"T18:00";
-  $("pzContent").value=(c.title||"")+(c.caption?"\n\n"+c.caption:"");
+  $("pzContent").value=(c.title||"")+(c.caption?"\n\n"+c.caption:"")+refLine(c);
   $("pzErr").textContent="";$("pzList").innerHTML='<span class="muted small">Lade Kanäle …</span>';
   $("pzModal").classList.add("on");
   api("GET","/api/postiz/integrations").then(function(list){

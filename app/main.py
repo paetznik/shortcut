@@ -808,6 +808,21 @@ def create_texts(jid: str, request: Request):
     return queue_extra(jid, "texts", None, "Erstelle Texte zum Video")
 
 
+@app.post("/api/jobs/{jid}/video_url")
+async def set_video_url(jid: str, request: Request):
+    """Link to the published long video; clip texts then point to the matching moment in it."""
+    require_auth(request)
+    url = str((await request.json()).get("url") or "").strip()
+    if url and not re.fullmatch(r"https?://\S{4,300}", url):
+        raise HTTPException(400, "Bitte einen vollständigen Link angeben (https://…)")
+    try:
+        load_job(jid)
+    except FileNotFoundError:
+        raise HTTPException(404, "Unbekannt")
+    update(jid, video_url=url)
+    return public_job(load_job(jid), with_text=True)
+
+
 def eta_for(job):
     """Rough remaining seconds, from measured speeds of earlier runs on this server."""
     sp = load_config().get("speed", {})

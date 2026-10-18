@@ -39,6 +39,7 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 - Clip-Editor: „In Teile zerlegen“ teilt einen Clip an Satzenden in eine Serie; jeder Teil außer dem letzten endet mit „Teil x folgt →“.
 - Wörter überpiepen: im Editor auf „🔇 Überpiepen“ schalten und Wörter anklicken – Ton wird stummgeschaltet und mit 1-kHz-Piep überlagert, im Untertitel steht „a***“.
 - Titelbild: automatisch das beste Standbild (scharf, gut belichtet, großes Gesicht mit offenen Augen, mittig).
+- Texte zum Video: YouTube-Titel und fertige Beschreibung mit Kapiteln (Kapitel beginnen am Satzanfang, mind. 10 s, mind. 3). Mit dem Link zum veröffentlichten Video bekommt jeder Clip-Text „▶ Ganzes Video ab 12:34 – Kapitel …“ mit Sprungmarke.
 - App installieren (PWA): Android/Chrome „Zum Startbildschirm hinzufügen“, danach Videos per „Teilen → ShortCut“ direkt hochladen. iPhone: nur „Zum Home-Bildschirm“, ohne Teilen-Ziel.
 
 ## Deployment
