@@ -35,7 +35,7 @@ DEFAULTS = {
     "highlight": "#FFE600", "uppercase": True, "font_size": 78, "position": "unten", "words_per_line": 3,
     "remove_pauses": True, "hook": True, "hook_seconds": 3, "review": False,
     "sub_style": "pop", "keyword_color": "#4ADE80", "zoom": True, "enhance_audio": True, "music": "", "music_volume": 15,
-    "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True,
+    "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -1002,7 +1002,7 @@ def process(jid):
     key = load_config().get("anthropic_key", "")
     audio = load_audio(jid) if s.get("audio_analysis", True) else None
     clips, source = pipeline.find_highlights(segments, key, s["clips"], s["min_len"], s["max_len"], job.get("context", ""),
-                                             lambda m: log(jid, m), audio)
+                                             lambda m: log(jid, m), audio, s.get("two_stage", True))
     if not clips:
         raise RuntimeError("Keine passenden Highlights gefunden. Versuche eine kürzere Mindestlänge.")
     for c in clips:

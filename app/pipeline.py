@@ -127,7 +127,7 @@ def overlap(a, b):
 def remove_overlaps(clips, tolerance=0.0):
     """Best first; a clip is dropped only if it overlaps an accepted one by more than `tolerance` seconds."""
     out = []
-    for c in sorted(clips, key=lambda c: -c.get("score", 0)):
+    for c in sorted(clips, key=lambda c: (c.get("rejected", False), -c.get("score", 0))):
         if all(overlap(c, o) <= tolerance for o in out):
             out.append(c)
     return out
@@ -280,12 +280,15 @@ def highlights_heuristic(segments, n, min_len, max_len, audio=None, cands=None):
     return clips
 
 
-def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=None):
+def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=None, two_stage=True):
     words = all_words(segments)
     clips, source = None, "heuristik"
     if api_key:
         try:
-            clips = highlights_claude(segments, api_key, n, min_len, max_len, context, audio)
+            if two_stage:
+                clips = highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context, audio, log)
+            else:
+                clips = highlights_claude(segments, api_key, n, min_len, max_len, context, audio)
             source = "claude"
         except Exception as e:  # fall back to heuristic
             log("KI-Auswahl fehlgeschlagen, nutze automatische Auswahl: " + str(e)[:200])
@@ -1114,3 +1117,102 @@ def add_spans(intervals, spans, duration):
         else:
             out.append([a, b])
     return [(round(a, 3), round(b, 3)) for a, b in out]
+
+
+# ---------------------------------------------------------------- two-stage AI selection
+
+CRITERIA = (("hook", "Hook", 0.35), ("standalone", "Verständlich", 0.25), ("value", "Mehrwert/Emotion", 0.25),
+            ("payoff", "Pointe", 0.15))
+
+
+def sentence_lines(words, start, end):
+    """Sentences with timestamps for a stretch of the video, the material for the fine cut."""
+    sel = [w for w in words if w["e"] > start and w["s"] < end]
+    return "\n".join("[%.1f-%.1f] %s" % (s[0]["s"], s[-1]["e"], " ".join(w["w"] for w in s)) for s in sentences(sel))
+
+
+def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context, audio, log):
+    """Stage 1: many candidates, each rated on fixed criteria. Stage 2: the best ones get a sentence-level fine cut,
+    titles and hooks, and may be rejected after a closer look."""
+    words = all_words(segments)
+    k = min(20, max(12, n * 3))
+    extra = ("\nKontext vom Ersteller: " + context.strip()) if context and context.strip() else ""
+    prompt1 = (
+        "Du bist ein sehr anspruchsvoller Social-Media-Editor für TikTok, Instagram Reels und YouTube Shorts.\n"
+        "Unten steht das Transkript eines deutschsprachigen Videos mit Zeitstempeln in Sekunden. Hinweise in ⟨⟩ "
+        "stammen aus einer automatischen Tonanalyse (Lautstärke, lebhafte Stimme, Tempo, Lachen/Applaus).%s\n\n"
+        "Sammle die %d vielversprechendsten Kandidaten für eigenständige Kurzvideos (je %d-%d Sekunden, Start und Ende "
+        "auf Zeitstempeln des Transkripts, Überschneidungen erlaubt). Bewerte jeden streng von 0 bis 10:\n"
+        "- hook: Fesseln die ersten 3 Sekunden sofort (Frage, steile These, Überraschung, Konflikt, Emotion)?\n"
+        "- standalone: Versteht man den Ausschnitt ohne den Rest des Videos?\n"
+        "- value: Bietet er einen echten Mehrwert (Tipp, Erkenntnis, Geschichte) oder starke Emotion?\n"
+        "- payoff: Endet er mit Pointe, Auflösung oder abgeschlossenem Gedanken?\n"
+        "10 ist außergewöhnlich und selten, 5 ist Durchschnitt. Nutze die ganze Skala.\n\n"
+        "Antworte NUR mit einem JSON-Array: "
+        '[{"start": 12.3, "end": 48.0, "scores": {"hook": 7, "standalone": 8, "value": 6, "payoff": 7}, '
+        '"reason": "ein Satz, warum der Ausschnitt funktioniert"}]\n\nTRANSKRIPT:\n%s'
+    ) % (extra, k, min_len, max_len, annotated_transcript(segments, audio))
+    cands = claude_json(api_key, prompt1, r"\[.*\]", max_tokens=6000)
+    rated = []
+    for c in cands:
+        try:
+            sc = {key: max(0.0, min(10.0, float((c.get("scores") or {}).get(key, 5)))) for key, _, _ in CRITERIA}
+            start, end = float(c["start"]), float(c["end"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        total = sum(sc[key] * w for key, _, w in CRITERIA)
+        rated.append({"start": start, "end": end, "criteria": sc, "score": round(total * 10),
+                      "reason": str(c.get("reason", ""))[:300]})
+    if not rated:
+        raise RuntimeError("Claude hat keine Kandidaten geliefert.")
+    snapped = [x for x in (snap(c, words, min_len, max_len) for c in rated) if x]
+    best = remove_overlaps(snapped, 1.5)[: n + 2]
+    log("KI-Auswahl Durchgang 1: %d Kandidaten bewertet, %d in der engeren Wahl" % (len(rated), len(best)))
+
+    # stage 2: fine cut with sentence-level timestamps and some room before and after
+    blocks = []
+    for i, c in enumerate(best):
+        lo, hi = max(0.0, c["start"] - 20), c["end"] + 20
+        blocks.append("### Clip %d (Rohschnitt %.1f-%.1f, Note %d)\n%s" % (i, c["start"], c["end"], c["score"],
+                                                                         sentence_lines(words, lo, hi)))
+    prompt2 = (
+        "Du bekommst %d Rohschnitte für Kurzvideos aus einem deutschsprachigen Video, jeweils mit Sätzen davor und "
+        "danach (Zeitstempel in Sekunden).%s\nPrüfe jeden Rohschnitt genau und lege den finalen Schnitt fest:\n"
+        "- Start auf den Satz, der sofort fesselt; lass schwache Einleitungen, Begrüßungen und Füllsätze weg.\n"
+        "- Ende nach dem abgeschlossenen Gedanken bzw. der Pointe, nicht mitten in der Auflösung.\n"
+        "- Länge %d-%d Sekunden; Start und Ende exakt auf Satzgrenzen aus der Liste.\n"
+        "- \"keep\": false, wenn der Ausschnitt bei genauem Hinsehen schwach oder ohne Vorwissen unverständlich ist.\n"
+        "Schreibe außerdem Titel, eine Begründung, 3 Hook-Texte (max. 8 Wörter, unterschiedliche Ansätze), eine "
+        "Beschreibung mit 3-5 Hashtags und 2-6 Schlüsselwörter, die wörtlich im Clip vorkommen.\n\n"
+        "Antworte NUR mit einem JSON-Array: "
+        '[{"id": 0, "keep": true, "start": 14.2, "end": 51.8, "title": "...", "reason": "...", '
+        '"hooks": ["...", "...", "..."], "caption": "...", "keywords": ["..."]}]\n\n%s'
+    ) % (len(best), extra, min_len, max_len, "\n\n".join(blocks))
+    try:
+        refined = {int(r.get("id", -1)): r for r in claude_json(api_key, prompt2, r"\[.*\]", max_tokens=6000)}
+    except Exception as e:  # the stage-1 result is still usable
+        log("KI-Feinschnitt fehlgeschlagen, nutze Durchgang 1: " + str(e)[:200])
+        refined = {}
+    out, dropped = [], 0
+    for i, c in enumerate(best):
+        r = refined.get(i)
+        if r is not None and r.get("keep") is False:
+            dropped += 1
+            c["rejected"] = True
+        if r:
+            try:
+                c["start"], c["end"] = float(r.get("start", c["start"])), float(r.get("end", c["end"]))
+            except (TypeError, ValueError):
+                pass
+            for key in ("title", "caption", "hooks", "keywords"):
+                if r.get(key):
+                    c[key] = r[key]
+            c["reason"] = str(r.get("reason") or c["reason"])[:300]
+        c["hook"] = c["reason"]
+        c.setdefault("title", c["reason"][:70])
+        out.append(c)
+    # rejected ones go to the back: they are used only if nothing better is left
+    out.sort(key=lambda c: (c.get("rejected", False), -c["score"]))
+    if refined:
+        log("KI-Feinschnitt: %d Clips verfeinert%s" % (len(out) - dropped, (", %d verworfen" % dropped) if dropped else ""))
+    return out

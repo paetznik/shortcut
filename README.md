@@ -8,7 +8,7 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 2. Transkription auf Deutsch mit [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (lokal, CPU). Eine Liste mit Fachbegriffen und Namen in den Einstellungen verbessert die Schreibweise.
 3. Tonanalyse (CPU, wenige Minuten pro Stunde Video): Lautstärke, Tonhöhen-Schwankung (lebhafte Stimme) und Sprechtempo relativ zum normalen Sprechen, dazu laute Stellen ohne Sprache (Lachen, Applaus). Das fließt in die Auswahl ein; ein Lacher direkt nach einem Clip wird mitgenommen und beim Pausen-Schnitt nicht entfernt. Die Projektansicht zeigt den Energieverlauf mit den Clips.
 4. Highlight-Auswahl:
-   - mit Anthropic-API-Schlüssel (in den Einstellungen hinterlegen): Claude wählt die Ausschnitte und schreibt Titel und Beschreibungen,
+   - mit Anthropic-API-Schlüssel (in den Einstellungen hinterlegen): Claude wählt die Ausschnitte und schreibt Titel und Beschreibungen. Standardmäßig in zwei Durchgängen: erst 12–20 Kandidaten, streng bewertet nach Hook, Verständlichkeit ohne Vorwissen, Mehrwert/Emotion und Pointe; dann ein Feinschnitt der Besten auf Satzebene (schwache Einstiege weg, Ende nach der Pointe), bei dem schwache Kandidaten verworfen werden,
    - ohne Schlüssel: automatische Auswahl nach Sprechtempo, Fragen und Schlüsselwörtern.
 5. Optional Prüfmodus: Titel, Hook-Text (mit KI-Varianten), Titelbild-Text und Untertitel jedes Clips vor dem Rendern korrigieren; Wörter im Transkript anklicken schneidet sie heraus.
 6. Schnitt mit ffmpeg:
