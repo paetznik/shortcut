@@ -147,6 +147,18 @@ def index():
         return f.read()
 
 
+@app.get("/api/health")
+def health():
+    """Which optional quality components are available in this build (no data, no auth needed)."""
+    try:
+        import torchaudio
+        torch_ok = hasattr(torchaudio.pipelines, "MMS_FA")
+    except Exception:
+        torch_ok = False
+    return {"ok": True, "face_model": os.path.exists(pipeline.YUNET), "denoise_model": os.path.exists(pipeline.RNNOISE),
+            "aligner": torch_ok}
+
+
 @app.get("/api/state")
 def state(request: Request):
     cfg = load_config()
