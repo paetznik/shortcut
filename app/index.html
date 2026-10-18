@@ -98,6 +98,10 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
 .wd{cursor:pointer;border-radius:4px;padding:1px 2px}
 .wd:hover{background:var(--panel2)}
 .wd.cut{text-decoration:line-through;color:var(--err);opacity:.7}
+.cutl{margin:4px 0 2px}
+.cutl canvas{width:100%;height:86px;display:block;background:var(--bg);border:1px solid var(--line);border-radius:8px;touch-action:none}
+.cutl:focus{outline:none}
+.cutl:focus canvas{border-color:var(--accent)}
 .wd.beep{background:#111;color:#111;border-radius:3px;outline:1px solid #555}
 .chip.on{border-color:var(--accent);background:#2a1a22}
 .ft{max-height:320px;overflow:auto;line-height:1.9;font-size:14px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;user-select:none}
@@ -281,7 +285,7 @@ window.onhashchange=function(){route()};
 function route(){
   clearInterval(S.timer);
   var m=location.hash.match(/^#job\/([0-9a-f]{12})/);
-  if(m){S.view="job";S.job=null;S.editing={};S.crop={};S.removed={};S.beeped={};S.chipMode={};S.tw=null;S.tsel=null;S.trOpen=false;loadJob(m[1])}else{S.view="home";renderHome();loadJobs();handleShared()}
+  if(m){S.view="job";S.job=null;S.editing={};S.crop={};S.removed={};S.beeped={};S.chipMode={};S.tw=null;S.tsel=null;S.trOpen=false;tlStopAll();S.tl={};loadJob(m[1])}else{S.view="home";renderHome();loadJobs();handleShared()}
   S.timer=setInterval(function(){
     if(S.view==="home"){loadJobs();loadQueue();if(!S.stTick||Date.now()-S.stTick>30000) loadStorage()}
     else if(S.job && isRunning(S.job)) loadJob(S.job.id, true);
@@ -294,7 +298,7 @@ function chk(id,on,label){return '<label class="chk"><input type="checkbox" id="
 function renderHome(){
   var d=S.settings.defaults;
   var src={
-    file:'<div class="drop" id="drop"><b>Video hierher ziehen oder klicken</b><div class="muted small">MP4, MOV, MKV, WebM, beliebige Länge</div></div><input type="file" id="file" accept="video/*,.mkv" style="display:none">'+
+    file:'<div class="drop" id="drop"><b>Videos hierher ziehen oder klicken</b><div class="muted small">MP4, MOV, MKV, WebM, beliebige Länge – auch mehrere auf einmal, sie werden nacheinander mit denselben Einstellungen verarbeitet</div></div><input type="file" id="file" accept="video/*,.mkv" multiple style="display:none">'+
       '<div class="up" id="up"><div class="row" style="justify-content:space-between"><span id="upName"></span><span class="muted small" id="upPct"></span></div><div class="bar"><i id="upBar" style="width:0"></i></div></div>',
     nc:'<div class="row"><button class="btn primary" onclick="openNextcloud()">Video aus Nextcloud wählen</button><span class="muted small">Ordner „'+esc(S.settings.nc_folder||"ShortCut")+'“ in '+esc(S.settings.nc_url||"Nextcloud")+'</span></div>'+
       (!S.settings.has_nc_pass?'<p class="muted small">Noch nicht eingerichtet – trage Benutzer und App-Passwort in den <a href="#" onclick="openSettings();return false">Einstellungen</a> ein.</p>':'')
@@ -334,10 +338,10 @@ function renderHome(){
   if(S.srcTab==="file"){
     var drop=$("drop"),file=$("file");
     drop.onclick=function(){file.click()};
-    file.onchange=function(){if(file.files[0]) upload(file.files[0])};
+    file.onchange=function(){if(file.files.length) uploadFiles(file.files)};
     drop.ondragover=function(e){e.preventDefault();drop.classList.add("over")};
     drop.ondragleave=function(){drop.classList.remove("over")};
-    drop.ondrop=function(e){e.preventDefault();drop.classList.remove("over");if(e.dataTransfer.files[0]) upload(e.dataTransfer.files[0])};
+    drop.ondrop=function(e){e.preventDefault();drop.classList.remove("over");if(e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files)};
   }
   renderJobs();loadQueue();loadStorage();
 }
@@ -516,10 +520,193 @@ function handleShared(){
   })}).catch(function(){});
 }
 
+// ---------------------------------------------------------------- trash
+function trashCard(j){
+  var t=j.trash||[];if(!t.length) return '';
+  var items=t.map(function(e){
+    var c=e.clip,cur=-1;(j.clips||[]).forEach(function(x,k){if(x.uid&&x.uid===c.uid) cur=k});
+    var what=e.kind==="version"?(cur>=0?"Ältere Fassung von Clip "+(cur+1):"Ältere Fassung"):"Gelöschter Clip";
+    var ago=Math.max(0,Math.round((Date.now()/1000-e.deleted)/60)),agoT=ago<60?ago+" min":ago<1440?Math.round(ago/60)+" Std.":Math.round(ago/1440)+" Tagen";
+    return '<div class="row trash" style="gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line)">'+
+      (c.thumb?'<img src="/files/'+j.id+'/'+c.thumb+'" style="width:40px;height:70px;object-fit:cover;border-radius:6px">':'')+
+      '<div style="flex:1;min-width:0"><div class="small"><b>'+esc(c.title||"Clip")+'</b></div><div class="muted small">'+what+' · '+fmt(c.start)+'–'+fmt(c.end)+' · vor '+agoT+'</div></div>'+
+      (c.file?'<a class="btn sm ghost" href="/files/'+j.id+'/'+c.file+'" target="_blank">Ansehen</a>':'')+
+      '<button class="btn sm" onclick="trashRestore(\''+e.id+'\')">Wiederherstellen</button>'+
+      '<button class="btn sm ghost" onclick="trashDelete(\''+e.id+'\')">Endgültig löschen</button></div>';
+  }).join("");
+  return '<details class="card" style="margin-top:16px"'+(S.trashOpen?" open":"")+' ontoggle="S.trashOpen=this.open"><summary style="margin:0;color:var(--text)"><b>Papierkorb</b> <span class="muted small">('+t.length+') – gelöschte Clips und ältere Fassungen, wird nach 14 Tagen geleert</span></summary>'+
+    items+'<div class="row" style="margin-top:8px"><button class="btn sm danger" onclick="trashDelete(\'all\')">Papierkorb leeren</button></div></details>';
+}
+function trashRestore(id){
+  api("POST","/api/jobs/"+S.job.id+"/trash/"+id+"/restore").then(function(j){S.job=j;S.removed={};S.beeped={};S.crop={};S.editing={};renderJob();toast("Wiederhergestellt")}).catch(function(e){toast(e.message)});
+}
+function trashDelete(id){
+  if(!confirm(id==="all"?"Papierkorb endgültig leeren?":"Endgültig löschen? Das lässt sich nicht rückgängig machen.")) return;
+  api("DELETE","/api/jobs/"+S.job.id+"/trash/"+id).then(function(j){S.job=j;renderJob();toast("Endgültig gelöscht")}).catch(function(e){toast(e.message)});
+}
+
+// ---------------------------------------------------------------- several videos at once
+function uploadFiles(list){
+  var fs=Array.prototype.filter.call(list||[],function(f){return /^video\//.test(f.type)||/\.(mkv|mov|mp4|m4v|webm|avi)$/i.test(f.name)});
+  if(!fs.length) return toast("Keine Videodatei erkannt");
+  if(fs.length===1) return upload(fs[0]);
+  if(S.uploading) return toast("Es läuft bereits ein Upload");
+  var meta=jobMeta(),i=0,ok=0;
+  S.uploading=true;window.onbeforeunload=function(){return S.uploading?"Upload läuft":undefined};
+  function label(t){var u=$("up"),n=$("upName");if(u) u.style.display="block";if(n) n.textContent=t}
+  function next(){
+    if(i>=fs.length){
+      S.uploading=false;var u=$("up");if(u) u.style.display="none";
+      toast(ok+" von "+fs.length+" Videos hochgeladen – sie werden nacheinander verarbeitet");loadJobs();loadQueue();return;
+    }
+    var f=fs[i++];label("Video "+i+" von "+fs.length+": "+f.name+" ("+size(f.size)+")");showUp(0);
+    function fail(m){toast(f.name+": "+m);next()}
+    api("POST","/api/uploads").then(function(u){
+      sendChunk(u.id,f,0,0,function(){
+        api("POST","/api/jobs",Object.assign({},meta,{filename:f.name,upload_id:u.id})).then(function(){ok++;loadJobs();loadQueue();next()}).catch(function(e){fail(e.message)});
+      },fail);
+    }).catch(function(e){fail(e.message)});
+  }
+  next();
+}
+
+// ---------------------------------------------------------------- timeline with waveform
+function tlKey(i){var c=S.job.clips[i];return c.uid||("i"+i)}
+function tlUI(c,i){
+  return '<div class="cutl" id="e_tl'+i+'" tabindex="0" onkeydown="tlKeys('+i+',event)"><canvas id="tlc'+i+'"></canvas>'+
+    '<div class="row small" style="justify-content:space-between;gap:6px;margin-top:4px"><span class="muted" id="tlt'+i+'">Lade Tonwelle …</span>'+
+    '<span class="row" style="gap:6px"><button class="btn sm ghost" onclick="tlPlay('+i+',false)" title="Leertaste">▶ / ❚❚</button><button class="btn sm ghost" onclick="tlPlay('+i+',true)" title="P">Auswahl abspielen</button></span></div>'+
+    '<div class="muted small">Griffe ziehen = Anfang/Ende (rastet an Wortgrenzen ein, Alt = frei) · Klick = Abspielposition · Tasten: Leertaste abspielen, I/O Anfang/Ende setzen, ←/→ 1 s (mit Umschalt 0,1 s), P Auswahl abspielen</div></div>';
+}
+function tlAfterRender(){
+  if(!S.job||!S.job.clips) return;
+  S.job.clips.forEach(function(c,i){if($("tlc"+i)&&$("ed"+i)&&$("ed"+i).classList.contains("on")) tlInit(i)});
+}
+function tlInit(i){
+  if(!S.tl) S.tl={};
+  if(S.job.source_deleted){var m=$("tlt"+i);if(m) m.textContent="Originalvideo gelöscht – keine Tonwelle";return}
+  var k=tlKey(i),st=S.tl[k];
+  if(st&&st.peaks){tlBind(i);return tlDraw(i)}
+  if(st&&st.loading) return;
+  var c=S.job.clips[i],t0=Math.max(0,Math.floor(c.start-15)),t1=c.end+15;
+  if(S.job.info&&S.job.info.duration) t1=Math.min(t1,S.job.info.duration);
+  st=S.tl[k]={loading:true,t0:t0,t1:t1,play:c.start};
+  if(!(S.tw&&S.tw.id===S.job.id)) api("GET","/api/jobs/"+S.job.id+"/transcript").then(function(r){S.tw={id:S.job.id,words:r.words};}).catch(function(){});
+  api("GET","/api/jobs/"+S.job.id+"/waveform?start="+t0+"&end="+t1).then(function(r){
+    st.loading=false;st.peaks=r.peaks;st.rate=r.rate;st.t0=r.t0;st.t1=r.t0+r.peaks.length/r.rate;
+    tlBind(i);tlDraw(i);
+  }).catch(function(e){st.loading=false;var m=$("tlt"+i);if(m) m.textContent=e.message});
+}
+function tlRange(i){return [parseT($("e_s"+i).value),parseT($("e_e"+i).value)]}
+function tlX(st,w,t){return (t-st.t0)/(st.t1-st.t0)*w}
+function tlDraw(i){
+  var cv=$("tlc"+i),st=S.tl&&S.tl[tlKey(i)];if(!cv||!st||!st.peaks) return;
+  var dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=86;if(!w) return;
+  if(cv.width!==Math.round(w*dpr)){cv.width=Math.round(w*dpr);cv.height=h*dpr}
+  var g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);
+  var r=tlRange(i),xs=tlX(st,w,r[0]),xe=tlX(st,w,r[1]),css=getComputedStyle(document.body);
+  var accent=css.getPropertyValue("--accent").trim()||"#ff3d6e";
+  g.fillStyle="rgba(255,61,110,.12)";g.fillRect(xs,0,xe-xs,h);
+  var n=st.peaks.length,mid=h/2-6;
+  for(var x=0;x<w;x++){
+    var a=Math.floor(x/w*n),b=Math.max(a+1,Math.floor((x+1)/w*n)),m=0;
+    for(var q=a;q<b&&q<n;q++) if(st.peaks[q]>m) m=st.peaks[q];
+    var y=Math.max(1,m/100*(mid-2));g.fillStyle=(x>=xs&&x<=xe)?accent:"#4a5060";g.fillRect(x,mid-y,1,y*2);
+  }
+  g.fillStyle="#8a90a0";g.font="10px system-ui";
+  for(var t=Math.ceil(st.t0/5)*5;t<st.t1;t+=5){var tx=tlX(st,w,t);g.fillRect(tx,h-14,1,4);g.fillText(hms(t),tx+2,h-3)}
+  [[xs,"start"],[xe,"end"]].forEach(function(p){g.fillStyle="#fff";g.fillRect(p[0]-1,0,2,h-16);g.fillRect(p[1]==="start"?p[0]:p[0]-7,0,7,14)});
+  if(st.play!=null){var px=tlX(st,w,st.play);g.fillStyle="#ffb02e";g.fillRect(px-1,0,2,h-16)}
+  var info=$("tlt"+i);if(info) info.textContent="Auswahl "+fmt(r[0])+"–"+fmt(r[1])+" ("+(r[1]-r[0]).toFixed(1)+" s) · Position "+fmt(st.play);
+}
+function tlSnap(t,edge,free){
+  if(free||!(S.tw&&S.tw.id===S.job.id)) return t;
+  var best=t,bd=0.3;
+  S.tw.words.forEach(function(w){var v=edge==="start"?w[1]:w[2],d=Math.abs(v-t);if(d<bd){bd=d;best=v}});
+  return best;
+}
+function tlSet(i,edge,t,free){
+  var st=S.tl[tlKey(i)],r=tlRange(i);
+  t=Math.min(st.t1,Math.max(st.t0,tlSnap(t,edge,free)));
+  if(edge==="start") t=Math.min(t,r[1]-3); else t=Math.max(t,r[0]+3);
+  $(edge==="start"?"e_s"+i:"e_e"+i).value=fmt(t);tlDraw(i);
+}
+function tlBind(i){
+  var cv=$("tlc"+i);if(!cv||cv.dataset.bound) return;cv.dataset.bound="1";
+  var drag=null;
+  function tAt(e){var st=S.tl[tlKey(i)],b=cv.getBoundingClientRect();return st.t0+(e.clientX-b.left)/b.width*(st.t1-st.t0)}
+  cv.addEventListener("pointerdown",function(e){
+    var st=S.tl[tlKey(i)],b=cv.getBoundingClientRect(),w=b.width,r=tlRange(i),x=e.clientX-b.left;
+    if(Math.abs(x-tlX(st,w,r[0]))<10) drag="start"; else if(Math.abs(x-tlX(st,w,r[1]))<10) drag="end";
+    else {tlSeek(i,tAt(e));drag=null}
+    if(drag) cv.setPointerCapture(e.pointerId);
+    $("e_tl"+i).focus();e.preventDefault();
+  });
+  cv.addEventListener("pointermove",function(e){
+    if(drag) return tlSet(i,drag,tAt(e),e.altKey);
+    var st=S.tl[tlKey(i)],b=cv.getBoundingClientRect(),r=tlRange(i),x=e.clientX-b.left;
+    cv.style.cursor=(Math.abs(x-tlX(st,b.width,r[0]))<10||Math.abs(x-tlX(st,b.width,r[1]))<10)?"ew-resize":"pointer";
+  });
+  cv.addEventListener("pointerup",function(){drag=null});
+}
+function tlAudio(i){
+  // loaded once as a whole, so the browser can jump to any position
+  var st=S.tl[tlKey(i)];
+  if(!st.audioReady) st.audioReady=fetch("/api/jobs/"+S.job.id+"/listen?start="+st.t0+"&end="+st.t1,{credentials:"same-origin"})
+    .then(function(r){if(!r.ok) throw new Error("Ton konnte nicht geladen werden");return r.blob()})
+    .then(function(b){st.audio=new Audio(URL.createObjectURL(b));return new Promise(function(ok){st.audio.onloadedmetadata=function(){ok(st.audio)};st.audio.load()})})
+    .catch(function(e){st.audioReady=null;toast(e.message);throw e});
+  return st.audioReady;
+}
+function tlSeek(i,t){
+  var st=S.tl[tlKey(i)];st.play=Math.min(st.t1,Math.max(st.t0,t));
+  if(st.audio&&!st.audio.paused) st.audio.currentTime=st.play-st.t0;
+  tlDraw(i);
+}
+function tlPlay(i,selection){
+  var st=S.tl&&S.tl[tlKey(i)];if(!st||!st.peaks) return;
+  if(st.audio&&!st.audio.paused&&!selection){st.audio.pause();return}
+  tlStopAll(i);
+  var info=$("tlt"+i);if(!st.audio&&info) info.textContent="Lade Ton …";
+  tlAudio(i).then(function(a){
+    var r=tlRange(i);
+    if(selection) st.play=r[0];
+    st.stopAt=selection?r[1]:null;
+    a.currentTime=Math.max(0,st.play-st.t0);
+    return a.play().then(function(){
+      (function tick(){
+        if(a.paused) return tlDraw(i);
+        st.play=st.t0+a.currentTime;
+        if(st.stopAt!=null&&st.play>=st.stopAt){a.pause();st.play=st.stopAt}
+        tlDraw(i);requestAnimationFrame(tick);
+      })();
+    });
+  }).catch(function(){toast("Abspielen nicht möglich")});
+}
+function tlStopAll(except){
+  if(!S.tl) return;
+  Object.keys(S.tl).forEach(function(k){var st=S.tl[k];if(st.audio&&(except==null||k!==tlKey(except))) st.audio.pause()});
+}
+function tlKeys(i,e){
+  var st=S.tl&&S.tl[tlKey(i)];if(!st||!st.peaks) return;
+  var k=e.key,step=e.shiftKey?0.1:1;
+  if(k===" "){tlPlay(i,false)}
+  else if(k==="p"||k==="P"){tlPlay(i,true)}
+  else if(k==="i"||k==="I"){tlSet(i,"start",st.play,true)}
+  else if(k==="o"||k==="O"){tlSet(i,"end",st.play,true)}
+  else if(k==="ArrowLeft"){tlSeek(i,st.play-step)}
+  else if(k==="ArrowRight"){tlSeek(i,st.play+step)}
+  else if(k==="Home"){tlSeek(i,tlRange(i)[0])}
+  else if(k==="End"){tlSeek(i,tlRange(i)[1]-3)}
+  else return;
+  e.preventDefault();
+}
+
 function editor(c,i,review){
   var hooks=(c.hooks||[]).filter(function(h){return h});
   return '<div class="edit'+(review||S.editing[i]?" on":"")+'" id="ed'+i+'">'+
-    '<div class="row" style="gap:8px;flex-wrap:nowrap"><div style="flex:1"><label>Start</label><input id="e_s'+i+'" value="'+fmt(c.start)+'"></div><div style="flex:1"><label>Ende</label><input id="e_e'+i+'" value="'+fmt(c.end)+'"></div></div>'+
+    '<div class="row" style="gap:8px;flex-wrap:nowrap"><div style="flex:1"><label>Start</label><input id="e_s'+i+'" value="'+fmt(c.start)+'" oninput="tlDraw('+i+')"></div><div style="flex:1"><label>Ende</label><input id="e_e'+i+'" value="'+fmt(c.end)+'" oninput="tlDraw('+i+')"></div></div>'+
+    tlUI(c,i)+
     '<div><label>Titel</label><input id="e_t'+i+'" value="'+esc(c.title)+'"></div>'+
     '<div><label>Hook-Text (erste Sekunden)</label><input id="e_h'+i+'" value="'+esc(c.hook_text==null?c.title:c.hook_text)+'">'+
       (hooks.length>1?'<div class="chips">'+hooks.map(function(h,k){return '<button class="chip" onclick="$(\'e_h'+i+'\').value=S.job.clips['+i+'].hooks['+k+']">'+esc(h)+'</button>'}).join("")+'</div>':'')+
@@ -562,6 +749,7 @@ function renderJob(){
   if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Hook, Titelbild-Text und Untertitel jedes Clips. Wörter anklicken schneidet sie heraus, Tippfehler korrigierst du im Textfeld. Dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
   html+=energyTimeline(j);
   html+=transcriptCard(j);
+  html+=trashCard(j);
   html+=textsCard(j);
   html+=bestofCard(j);
   html+='<div class="clips">'+(j.clips||[]).map(function(c,i){
@@ -590,8 +778,9 @@ function renderJob(){
   var ft=$("ft"),scroll=ft?ft.scrollTop:0;
   app.innerHTML=shell(html);
   if(scroll&&$("ft")) $("ft").scrollTop=scroll;
+  tlAfterRender();
 }
-function toggleEdit(i){S.editing[i]=!S.editing[i];$("ed"+i).classList.toggle("on")}
+function toggleEdit(i){S.editing[i]=!S.editing[i];$("ed"+i).classList.toggle("on");if(S.editing[i]) tlInit(i); else tlStopAll()}
 function copyCap(i){var c=S.job.clips[i];navigator.clipboard.writeText(c.title+"\n\n"+c.caption+refLine(c)).then(function(){toast("Kopiert")})}
 function clipBody(i){
   return {start:parseT($("e_s"+i).value),end:parseT($("e_e"+i).value),title:$("e_t"+i).value,hook_text:$("e_h"+i).value,

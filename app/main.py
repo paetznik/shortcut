@@ -7,6 +7,7 @@ import io
 import re
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -513,6 +514,8 @@ async def edit_clip(jid: str, idx: int, request: Request):
             raise HTTPException(400, "Clip kann gerade nicht bearbeitet werden")
         require_source(job)
         clip = job["clips"][idx]
+        if job["status"] != "prüfen":
+            keep_previous(clip)
         try:
             s, e = float(body.get("start", clip["start"])), float(body.get("end", clip["end"]))
         except (TypeError, ValueError):
@@ -679,16 +682,139 @@ def delete_clip(jid: str, idx: int, request: Request):
         if idx >= len(job["clips"]):
             raise HTTPException(404, "Unbekannt")
         clip = job["clips"].pop(idx)
-        for f in clip_files(clip):
-            try:
-                os.remove(os.path.join(JOBS, jid, f))
-            except OSError:
-                pass
+        trash_add(job, "clip", clip, idx)  # files stay until the trash is emptied
         for c in job["clips"]:  # variants point at positions
             if c.get("variant_of") is not None:
                 c["variant_of"] = None if c["variant_of"] == idx else c["variant_of"] - (c["variant_of"] > idx)
         save_job(job)
     return public_job(job, with_text=True)
+
+
+# ---------------------------------------------------------------- trash: deleted clips and replaced versions
+
+TRASH_DAYS = 14
+
+
+def keep_previous(clip):
+    """Remember the rendered version before a change, so it lands in the trash instead of being overwritten."""
+    if clip.get("file") and not clip.get("prev"):
+        clip["prev"] = json.loads(json.dumps({k: v for k, v in clip.items() if k != "prev"}))
+
+
+def trash_add(job, kind, clip, idx):
+    clip = {k: v for k, v in clip.items() if k != "prev"}
+    if not clip.get("file") and kind == "version":
+        return
+    job.setdefault("trash", []).insert(0, {"id": uuid.uuid4().hex[:8], "kind": kind, "deleted": time.time(),
+                                           "index": idx, "clip": clip})
+
+
+def trash_purge(job, which):
+    """Remove trash entries for good, with every file that no clip or other entry still uses."""
+    gone = [t for t in job.get("trash", []) if which(t)]
+    if not gone:
+        return False
+    job["trash"] = [t for t in job["trash"] if t not in gone]
+    used = {f for c in job["clips"] for f in clip_files(c)} | \
+           {f for c in job["clips"] if c.get("prev") for f in clip_files(c["prev"])} | \
+           {f for t in job["trash"] for f in clip_files(t["clip"])}
+    for t in gone:
+        for f in clip_files(t["clip"]):
+            if f not in used:
+                try:
+                    os.remove(os.path.join(JOBS, job["id"], f))
+                except OSError:
+                    pass
+    return True
+
+
+def trash_entry(job, tid):
+    for t in job.get("trash", []):
+        if t["id"] == tid:
+            return t
+    raise HTTPException(404, "Nicht mehr im Papierkorb")
+
+
+@app.post("/api/jobs/{jid}/trash/{tid}/restore")
+def trash_restore(jid: str, tid: str, request: Request):
+    """A deleted clip comes back at the end of the list; an older version swaps places with the current one."""
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if job["status"] in ("wartet", "läuft"):
+            raise HTTPException(400, "Bitte warten, bis das Projekt fertig ist.")
+        t = trash_entry(job, tid)
+        job["trash"].remove(t)
+        clip = dict(t["clip"], status="fertig")
+        current = next((i for i, c in enumerate(job["clips"]) if t["kind"] == "version" and c.get("uid") == clip.get("uid")), None)
+        if current is not None:
+            trash_add(job, "version", job["clips"][current], current)
+            clip["variant_of"] = job["clips"][current].get("variant_of")
+            job["clips"][current] = clip
+        else:
+            if len(job["clips"]) >= 30:
+                raise HTTPException(400, "Zu viele Clips in diesem Projekt")
+            clip["variant_of"] = None
+            job["clips"].append(clip)
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.delete("/api/jobs/{jid}/trash/{tid}")
+def trash_delete(jid: str, tid: str, request: Request):
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if tid == "all":
+            trash_purge(job, lambda t: True)
+        else:
+            trash_entry(job, tid)
+            trash_purge(job, lambda t: t["id"] == tid)
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+# ---------------------------------------------------------------- timeline: waveform and audio of the source
+
+def source_window(jid, start, end):
+    job = load_job(jid)
+    require_source(job)
+    dur = (job.get("info") or {}).get("duration") or 0
+    t0 = max(0.0, float(start))
+    t1 = min(float(end), dur) if dur else float(end)
+    if t1 - t0 < 0.5 or t1 - t0 > 420:
+        raise HTTPException(400, "Ungültiger Ausschnitt")
+    return os.path.join(job_dir(jid), job["source"]), t0, t1
+
+
+@app.get("/api/jobs/{jid}/waveform")
+def waveform(jid: str, request: Request, start: float, end: float):
+    """Peak levels of the source audio, 50 per second, scaled to 0..100."""
+    require_auth(request)
+    import numpy as np
+
+    src, t0, t1 = source_window(jid, start, end)
+    p = subprocess.run([pipeline.FFMPEG, "-v", "error", "-ss", "%.3f" % t0, "-t", "%.3f" % (t1 - t0), "-i", src, "-vn",
+                        "-ac", "1", "-ar", "8000", "-f", "s16le", "-"], capture_output=True)
+    a = np.abs(np.frombuffer(p.stdout, np.int16).astype(np.float32))
+    n = len(a) // 160
+    if p.returncode != 0 or not n:
+        raise HTTPException(400, "Ton konnte nicht gelesen werden")
+    peaks = a[:n * 160].reshape(n, 160).max(axis=1)
+    peaks = np.minimum(100, peaks / max(1.0, float(np.percentile(peaks, 99))) * 100)
+    return {"t0": round(t0, 3), "rate": 50, "peaks": [int(x) for x in peaks]}
+
+
+@app.get("/api/jobs/{jid}/listen")
+def listen(jid: str, request: Request, start: float, end: float):
+    """The source audio of a stretch as MP3, for playing along the timeline."""
+    require_auth(request)
+    src, t0, t1 = source_window(jid, start, end)
+    p = subprocess.run([pipeline.FFMPEG, "-v", "error", "-ss", "%.3f" % t0, "-t", "%.3f" % (t1 - t0), "-i", src, "-vn",
+                        "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "96k", "-f", "mp3", "-"], capture_output=True)
+    if p.returncode != 0 or not p.stdout:
+        raise HTTPException(400, "Ton konnte nicht gelesen werden")
+    return Response(p.stdout, media_type="audio/mpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 
 @app.post("/api/jobs/{jid}/clips/{idx}/duplicate")
@@ -704,7 +830,7 @@ async def duplicate_clip(jid: str, idx: int, request: Request):
             raise HTTPException(400, "Zu viele Clips in diesem Projekt")
         src = job["clips"][idx]
         copy = {k: v for k, v in src.items() if k not in ("file", "thumb", "srt", "cover", "formats", "version", "postiz",
-                                                          "translations", "uid", "checks", "spelling")}
+                                                          "translations", "uid", "checks", "spelling", "prev")}
         copy["hook_text"] = str(body.get("hook_text") or src.get("hook_text", ""))[:300]
         copy["variant_of"] = idx
         copy["status"] = "entwurf" if job["status"] == "prüfen" else "wartet"
@@ -794,6 +920,7 @@ async def fix_spelling(jid: str, idx: int, request: Request):
                                                     pipeline.realign(old, text.replace(wrong, good, 1))))
         clip["spelling"] = [x for x in clip.get("spelling", []) if x.get("wrong") != wrong]
         if job["status"] != "prüfen":
+            keep_previous(clip)
             clip["status"], job["status"], job["message"] = "wartet", "wartet", "Clip %d wird korrigiert" % (idx + 1)
             work.put(("render", jid, idx))
         save_job(job)
@@ -1344,8 +1471,10 @@ def render_one(jid, idx, info):
     ensure_aligned(jid, idx)
     p = prepare(jid, idx, info)
     clip, s = p["clip"], p["s"]
-    version = clip.get("version", 0) + 1
     uid = clip.get("uid") or uuid.uuid4().hex[:6]
+    # never reuse a file name that an older version in the trash still holds
+    version = max([clip.get("version", 0)] + [t["clip"].get("version", 0) for t in load_job(jid).get("trash", [])
+                                              if t["clip"].get("uid") == uid]) + 1
     name = "c" + uid + ("_v%d" % version if version > 1 else "")
     hook = clip.get("hook_text", clip.get("title", ""))
     keywords = clip.get("keywords", [])
@@ -1379,14 +1508,18 @@ def render_one(jid, idx, info):
             log(jid, "KI-Endkontrolle fehlgeschlagen: " + str(e)[:200])
 
     keep = {name + ".mp4", name + ".jpg", name + ".srt", cover} | set(outputs.values())
-    for old in clip_files(clip):
-        if old not in keep:
-            try:
-                os.remove(os.path.join(d, old))
-            except OSError:
-                pass
+    if not clip.get("prev"):  # with a kept previous version, its files go to the trash instead
+        for old in clip_files(clip):
+            if old not in keep:
+                try:
+                    os.remove(os.path.join(d, old))
+                except OSError:
+                    pass
     with lock:
         job = load_job(jid)
+        prev = job["clips"][idx].pop("prev", None)
+        if prev and prev.get("file"):
+            trash_add(job, "version", prev, idx)
         job["clips"][idx].update({
             "file": outputs["9x16"], "thumb": name + ".jpg", "srt": name + ".srt", "cover": cover,
             "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "version": version, "status": "fertig",
@@ -1794,6 +1927,11 @@ def cleanup():
             try:
                 if load_job(jid)["created"] < cutoff:
                     shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
+                    continue
+                with lock:
+                    job = load_job(jid)
+                    if trash_purge(job, lambda t: t["deleted"] < time.time() - TRASH_DAYS * 86400):
+                        save_job(job)
             except Exception:
                 pass
         for name in os.listdir(UPLOADS):  # abandoned uploads

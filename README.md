@@ -40,6 +40,9 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 - Wörter überpiepen: im Editor auf „🔇 Überpiepen“ schalten und Wörter anklicken – Ton wird stummgeschaltet und mit 1-kHz-Piep überlagert, im Untertitel steht „a***“.
 - Titelbild: automatisch das beste Standbild (scharf, gut belichtet, großes Gesicht mit offenen Augen, mittig).
 - Texte zum Video: YouTube-Titel und fertige Beschreibung mit Kapiteln (Kapitel beginnen am Satzanfang, mind. 10 s, mind. 3). Mit dem Link zum veröffentlichten Video bekommt jeder Clip-Text „▶ Ganzes Video ab 12:34 – Kapitel …“ mit Sprungmarke.
+- Schnitt-Ansicht im Clip-Editor: Tonwelle des Originals (Clip ±15 s), Anfang/Ende per Griff ziehen (rastet an Wortgrenzen ein, Alt = frei), Klick setzt die Abspielposition; Tasten: Leertaste abspielen, I/O Anfang/Ende, ←/→ 1 s (Umschalt 0,1 s), P Auswahl abspielen.
+- Papierkorb: gelöschte Clips und durch Neu-Rendern ersetzte Fassungen bleiben 14 Tage erhalten und lassen sich wiederherstellen (eine ältere Fassung tauscht mit der aktuellen).
+- Mehrere Videos auf einmal hochladen: alle bekommen dieselben Einstellungen und werden nacheinander verarbeitet.
 - App installieren (PWA): Android/Chrome „Zum Startbildschirm hinzufügen“, danach Videos per „Teilen → ShortCut“ direkt hochladen. iPhone: nur „Zum Home-Bildschirm“, ohne Teilen-Ziel.
 
 ## Deployment
