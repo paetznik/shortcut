@@ -540,6 +540,11 @@ async def edit_clip(jid: str, idx: int, request: Request):
             except (TypeError, ValueError):
                 raise HTTPException(400, "Ungültiger Bildausschnitt")
             clip["crop_keys"] = sorted(keys)[:50]
+        if "beeped" in body:
+            try:
+                clip["beeped"] = sorted({round(float(x), 2) for x in body["beeped"]})[:500]
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Ungültige Wortauswahl")
         if "removed" in body:
             try:
                 clip["removed"] = sorted({round(float(x), 2) for x in body["removed"]})[:2000]
@@ -556,6 +561,136 @@ async def edit_clip(jid: str, idx: int, request: Request):
     return public_job(job, with_text=True)
 
 
+@app.get("/api/jobs/{jid}/transcript")
+def transcript(jid: str, request: Request):
+    """All words of the video for marking clips by hand: [[word, start, end], ...]."""
+    require_auth(request)
+    segments = load_transcript(jid) or []
+    return {"words": [[w["w"], round(w["s"], 2), round(w["e"], 2)] for w in pipeline.all_words(segments)]}
+
+
+def series_parts(words, start, end, part_len):
+    """Split [start, end] at sentence ends into parts of roughly part_len seconds (never shorter than 8 s)."""
+    sel = [w for w in words if w["s"] >= start - 0.01 and w["e"] <= end + 0.01]
+    parts, cur = [], []
+    for w in sel:
+        cur.append(w)
+        if cur[-1]["e"] - cur[0]["s"] >= part_len and w["w"][-1:] in ".!?":
+            parts.append(cur)
+            cur = []
+        elif cur[-1]["e"] - cur[0]["s"] >= part_len * 1.5:  # no sentence end in sight: cut at the next word
+            parts.append(cur)
+            cur = []
+    if cur:
+        if parts and cur[-1]["e"] - cur[0]["s"] < 8:
+            parts[-1] += cur
+        else:
+            parts.append(cur)
+    return [(round(max(0, p_[0]["s"] - 0.15), 2), round(p_[-1]["e"] + 0.35, 2)) for p_ in parts]
+
+
+def new_clip(words, start, end, extra=None):
+    text = " ".join(w["w"] for w in words if w["s"] >= start - 0.01 and w["e"] <= end + 0.01)
+    first = re.split(r"(?<=[.!?])\s", text)[0] if text else ""
+    title = (first[:70] + "…") if len(first) > 70 else first
+    c = {"start": start, "end": end, "title": title, "hook": "Von Hand markiert", "caption": "", "score": 0,
+         "hooks": [title], "keywords": pipeline.guess_keywords(text), "hook_text": title, "cover_text": title,
+         "manual": True, "uid": uuid.uuid4().hex[:6]}
+    c.update(extra or {})
+    return c
+
+
+def add_clips(jid, clips):
+    """Append clips to a finished (or reviewed) project and render them unless the project is in review."""
+    with lock:
+        job = load_job(jid)
+        if job["status"] not in ("fertig", "fehler", "prüfen", "abgebrochen"):
+            raise HTTPException(400, "Bitte warten, bis das Projekt fertig ist.")
+        require_source(job)
+        if len(job["clips"]) + len(clips) > 40:
+            raise HTTPException(400, "Zu viele Clips in diesem Projekt (max. 40)")
+        first = len(job["clips"])
+        for c in clips:
+            c["status"] = "entwurf" if job["status"] == "prüfen" else "wartet"
+            job["clips"].append(c)
+        if job["status"] != "prüfen":
+            job["status"], job["message"] = "wartet", "%d neue Clips werden gerendert" % len(clips)
+            for i in range(first, first + len(clips)):
+                work.put(("render", jid, i))
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.post("/api/jobs/{jid}/clips")
+async def create_clip(jid: str, request: Request):
+    """Clip from a stretch marked in the transcript, or a series of parts when `series` is set."""
+    require_auth(request)
+    body = await request.json()
+    try:
+        start, end = float(body["start"]), float(body["end"])
+        part_len = max(20.0, min(180.0, float(body.get("part_len", 60))))
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "Bitte Anfang und Ende markieren")
+    if end - start < 3:
+        raise HTTPException(400, "Die Markierung ist zu kurz (mind. 3 Sekunden)")
+    if body.get("series"):
+        return add_series(jid, start, end, part_len)
+    words = pipeline.all_words(load_transcript(jid) or [])
+    if end - start > 180:
+        raise HTTPException(400, "Ein Clip darf höchstens 3 Minuten lang sein – für Längeres „Als Serie“ wählen.")
+    return add_clips(jid, [new_clip(words, start, end)])
+
+
+@app.post("/api/jobs/{jid}/clips/{idx}/split")
+async def split_clip(jid: str, idx: int, request: Request):
+    """Turn one clip into a series of parts (the original clip stays)."""
+    require_auth(request)
+    body = await request.json()
+    job = load_job(jid)
+    if idx >= len(job["clips"]):
+        raise HTTPException(404, "Unbekannt")
+    c = job["clips"][idx]
+    return add_series(jid, c["start"], c["end"], body.get("part_len", 30))
+
+
+def add_series(jid, start, end, part_len):
+    try:
+        part_len = max(15.0, min(180.0, float(part_len)))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Ungültige Teillänge")
+    words = pipeline.all_words(load_transcript(jid) or [])
+    parts = series_parts(words, start, end, part_len)
+    if len(parts) < 2:
+        raise HTTPException(400, "Der Clip ist zu kurz für mehrere Teile – wähle eine kürzere Teillänge.")
+    sid = uuid.uuid4().hex[:6]
+    clips = [new_clip(words, a, b, {"series": {"id": sid, "part": i + 1, "total": len(parts)}}) for i, (a, b) in enumerate(parts)]
+    for c in clips:
+        c["hook_text"] = "Teil %d/%d: %s" % (c["series"]["part"], c["series"]["total"], c["title"])
+    return add_clips(jid, clips)
+
+
+@app.delete("/api/jobs/{jid}/clips/{idx}")
+def delete_clip(jid: str, idx: int, request: Request):
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if job["status"] in ("wartet", "läuft"):
+            raise HTTPException(400, "Bitte warten, bis das Projekt fertig ist.")
+        if idx >= len(job["clips"]):
+            raise HTTPException(404, "Unbekannt")
+        clip = job["clips"].pop(idx)
+        for f in clip_files(clip):
+            try:
+                os.remove(os.path.join(JOBS, jid, f))
+            except OSError:
+                pass
+        for c in job["clips"]:  # variants point at positions
+            if c.get("variant_of") is not None:
+                c["variant_of"] = None if c["variant_of"] == idx else c["variant_of"] - (c["variant_of"] > idx)
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
 @app.post("/api/jobs/{jid}/clips/{idx}/duplicate")
 async def duplicate_clip(jid: str, idx: int, request: Request):
     """Second version of a clip with another hook text, e.g. to compare two hooks (A/B)."""
@@ -568,7 +703,8 @@ async def duplicate_clip(jid: str, idx: int, request: Request):
         if len(job["clips"]) >= 30:
             raise HTTPException(400, "Zu viele Clips in diesem Projekt")
         src = job["clips"][idx]
-        copy = {k: v for k, v in src.items() if k not in ("file", "thumb", "srt", "cover", "formats", "version", "postiz", "translations")}
+        copy = {k: v for k, v in src.items() if k not in ("file", "thumb", "srt", "cover", "formats", "version", "postiz",
+                                                          "translations", "uid", "checks", "spelling")}
         copy["hook_text"] = str(body.get("hook_text") or src.get("hook_text", ""))[:300]
         copy["variant_of"] = idx
         copy["status"] = "entwurf" if job["status"] == "prüfen" else "wartet"
@@ -1007,7 +1143,7 @@ def get_music(name: str, request: Request):
 @app.get("/files/{jid}/{name}")
 def get_file(jid: str, name: str, request: Request, dl: int = 0):
     require_auth(request)
-    if not re.fullmatch(r"(clip\d{1,2}(_v\d+)?(_4x5|_1x1|_cover|_[a-z]{2})?\.(mp4|jpg|srt)|bestof_\d+\.(mp4|jpg))", name):
+    if not re.fullmatch(r"((clip\d{1,2}|c[0-9a-f]{6})(_v\d+)?(_4x5|_1x1|_cover|_[a-z]{2})?\.(mp4|jpg|srt)|bestof_\d+\.(mp4|jpg))", name):
         raise HTTPException(404, "Unbekannt")
     path = os.path.join(job_dir(jid), name)
     if not os.path.exists(path):
@@ -1115,11 +1251,21 @@ def prepare(jid, idx, info):
     duration = clip["end"] - clip["start"]
     words = pipeline.clip_words(load_transcript(jid), clip["start"], clip["end"])
     removed = [r - clip["start"] for r in clip.get("removed", [])]
+    beeped = {round(b, 2) for b in clip.get("beeped", [])}
+    for w in words:  # clip_words gives clip-relative times; the marks are absolute word starts
+        if round(w["s"] + clip["start"], 2) in beeped:
+            w["beep"] = True
     intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True), removed)
     intervals = pipeline.add_spans(intervals, reaction_spans(jid, clip["start"], clip["end"]), duration)
     intervals = pipeline.quantize(intervals, pipeline.out_fps(info))
     out_words = pipeline.remap_words(words, intervals)
+    beeps = [(w["s"], w["e"]) for w in out_words if w.get("beep")]
+    for w in out_words:  # blacked out in the subtitles too
+        if w.get("beep"):
+            w["w"] = w["w"][:1] + "***" + ("".join(ch for ch in w["w"][-1:] if ch in ".,!?;:"))
     out_len = sum(b - a for a, b in intervals)
+    series = clip.get("series")
+    end_text = ("Teil %d folgt →" % (series["part"] + 1)) if series and series["part"] < series["total"] else ""
     crop_segs, split = manual, None
     if manual:
         s["mode"] = "auto"  # hand-set framing always crops, whatever the project mode
@@ -1132,7 +1278,8 @@ def prepare(jid, idx, info):
     music = os.path.join(MUSIC, s["music"]) if s.get("music") and os.path.exists(os.path.join(MUSIC, s["music"])) else None
     return {"job": job, "clip": clip, "s": s, "src": src, "duration": duration, "intervals": intervals,
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
-            "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail),
+            "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail), "beeps": beeps,
+            "end_text": end_text,
             "zooms": pipeline.zoom_spans(out_words, intervals, out_len) if s.get("zoom", True) else None}
 
 
@@ -1141,9 +1288,9 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
     clip = p["clip"]
     ass = base + ".ass"
     burn = pipeline.write_subtitles(words, os.path.join(d, ass), os.path.join(d, base + ".srt") if srt else None,
-                                    p["s"], hook, p["out_len"], keywords, size)
+                                    p["s"], hook, p["out_len"], keywords, size, p["end_text"])
     out_len = pipeline.render_clip(p["src"], p["job"]["info"], clip["start"], clip["end"], d, base, p["s"], ass, burn,
-                                   p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"])
+                                   p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"], p["beeps"])
     os.remove(os.path.join(d, ass))
     return out_len
 
@@ -1183,7 +1330,8 @@ def render_one(jid, idx, info):
     p = prepare(jid, idx, info)
     clip, s = p["clip"], p["s"]
     version = clip.get("version", 0) + 1
-    name = "clip%02d" % (idx + 1) + ("_v%d" % version if version > 1 else "")
+    uid = clip.get("uid") or uuid.uuid4().hex[:6]
+    name = "c" + uid + ("_v%d" % version if version > 1 else "")
     hook = clip.get("hook_text", clip.get("title", ""))
     keywords = clip.get("keywords", [])
 
@@ -1196,8 +1344,12 @@ def render_one(jid, idx, info):
     pipeline.render_thumb(d, name + ".mp4", name, min(1.0, out_len / 2))
     cover = None
     if s.get("cover", True):
-        pipeline.render_cover(p["src"], info, clip["start"], min(p["duration"] / 2, 1.5), d, name + "_cover", s,
-                              p["crop_segs"], clip.get("cover_text") or clip.get("title", ""))
+        try:
+            at = pipeline.best_cover_time(p["src"], info, clip["start"], clip["end"])
+        except Exception:
+            at = None
+        pipeline.render_cover(p["src"], info, clip["start"], at if at is not None else min(p["duration"] / 2, 1.5), d,
+                              name + "_cover", s, p["crop_segs"], clip.get("cover_text") or clip.get("title", ""))
         cover = name + "_cover.jpg"
 
     checks = pipeline.quality_checks(d, outputs["9x16"], info, load_transcript(jid), clip["start"], clip["end"],
@@ -1224,7 +1376,7 @@ def render_one(jid, idx, info):
             "file": outputs["9x16"], "thumb": name + ".jpg", "srt": name + ".srt", "cover": cover,
             "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "version": version, "status": "fertig",
             "duration_out": round(out_len, 1), "speakers": len({seg[2] for seg in p["crop_segs"] or []}),
-            "translations": {}, "checks": checks, "split": bool(p["split"]),
+            "translations": {}, "checks": checks, "split": bool(p["split"]), "uid": uid,
         })
         save_job(job)
     export_files(jid, clip_files(load_job(jid)["clips"][idx]), "Clip %d" % (idx + 1))
@@ -1502,6 +1654,7 @@ def process(jid):
     for c in clips:
         c["status"] = "entwurf" if s.get("review") else "wartet"
         c["hook_text"] = c.get("title", "")
+        c["uid"] = uuid.uuid4().hex[:6]
         c["cover_text"] = c.get("title", "")
     update(jid, clips=clips, selector=source)
     log(jid, "%d Highlights gefunden (%s)" % (len(clips), "Claude KI" if source == "claude" else "Automatik"))
@@ -1657,3 +1810,83 @@ def start():
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=cleanup, daemon=True).start()
     threading.Thread(target=watcher, daemon=True).start()
+
+
+# ---------------------------------------------------------------- installable web app (PWA) with share target
+
+MANIFEST = {
+    "name": "ShortCut", "short_name": "ShortCut", "start_url": "/", "scope": "/", "display": "standalone",
+    "background_color": "#0f1115", "theme_color": "#0f1115", "lang": "de",
+    "description": "Aus langen Videos werden Shorts und Reels",
+    "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+              {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}],
+    "share_target": {"action": "/share-target", "method": "POST", "enctype": "multipart/form-data",
+                     "params": {"title": "title", "files": [{"name": "video", "accept": ["video/*"]}]}},
+}
+
+SERVICE_WORKER = """
+// ShortCut service worker: makes the app installable and receives videos shared from other apps.
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  const url = new URL(e.request.url);
+  if (e.request.method === 'POST' && url.pathname === '/share-target') {
+    e.respondWith((async () => {
+      const form = await e.request.formData();
+      const file = form.get('video');
+      if (file) {
+        const cache = await caches.open('shortcut-share');
+        await cache.put('/shared-video', new Response(file, {headers: {
+          'content-type': file.type || 'video/mp4', 'x-name': encodeURIComponent(file.name || 'video.mp4')}}));
+      }
+      return Response.redirect('/?shared=1', 303);
+    })());
+  }
+});
+"""
+
+_ICONS = {}
+
+
+def app_icon(size):
+    """App icon in the ShortCut colours (drawn once with OpenCV, no image files needed)."""
+    if size not in _ICONS:
+        import cv2
+        import numpy as np
+
+        img = np.zeros((size, size, 3), np.uint8)
+        t = np.linspace(0, 1, size)[None, :, None] * 0.5 + np.linspace(0, 1, size)[:, None, None] * 0.5
+        a, b = np.array([110, 61, 255], np.float32), np.array([46, 176, 255], np.float32)  # BGR of #ff3d6e, #ffb02e
+        img[:] = (a * (1 - t) + b * t).astype(np.uint8)
+        w, h = int(size * 0.3), int(size * 0.56)
+        x0, y0 = (size - w) // 2, (size - h) // 2
+        r = max(2, size // 24)
+        cv2.rectangle(img, (x0 + r, y0), (x0 + w - r, y0 + h), (255, 255, 255), -1)
+        cv2.rectangle(img, (x0, y0 + r), (x0 + w, y0 + h - r), (255, 255, 255), -1)
+        for cx, cy in ((x0 + r, y0 + r), (x0 + w - r, y0 + r), (x0 + r, y0 + h - r), (x0 + w - r, y0 + h - r)):
+            cv2.circle(img, (cx, cy), r, (255, 255, 255), -1)
+        _ICONS[size] = cv2.imencode(".png", img)[1].tobytes()
+    return _ICONS[size]
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return JSONResponse(MANIFEST, media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+def service_worker():
+    return Response(SERVICE_WORKER, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/icon-{size}.png")
+def icon(size: int):
+    if size not in (180, 192, 512):
+        raise HTTPException(404, "Unbekannt")
+    return Response(app_icon(size), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.post("/share-target")
+def share_target_fallback():
+    """Normally answered by the service worker; without it, just open the app."""
+    return Response(status_code=303, headers={"Location": "/"})

@@ -519,7 +519,10 @@ def remap_words(words, intervals):
         mid = (w["s"] + w["e"]) / 2
         if is_filler(w["w"]) or not any(a <= mid <= b for a, b in intervals):
             continue
-        out.append({"w": w["w"], "s": remap(w["s"], intervals), "e": remap(w["e"], intervals)})
+        nw = {"w": w["w"], "s": remap(w["s"], intervals), "e": remap(w["e"], intervals)}
+        if w.get("beep"):
+            nw["beep"] = True
+        out.append(nw)
     return out
 
 
@@ -817,7 +820,8 @@ def norm_word(w):
     return re.sub(r"[^\wäöüß%€$]", "", w.lower())
 
 
-def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, keywords=(), size=(1080, 1920)):
+def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, keywords=(), size=(1080, 1920),
+                    end_text=""):
     """Subtitles in one of several looks; keywords get their own colour, the active word the highlight colour."""
     pw, ph = size
     k = ph / 1920
@@ -858,6 +862,9 @@ def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, k
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     ) % (pw, ph, main, 72 * max(0.75, k), hl, side, side, int(0.13 * ph))
     events, srt = [], []
+    if end_text and total > 4:  # e.g. "Teil 2 folgt" over the last two seconds
+        events.append("Dialogue: 1,%s,%s,Hook,,0,0,0,,{\\an5\\fad(200,0)}%s"
+                      % (ass_time(total - 2.2), ass_time(total), ass_escape(end_text)))
     hook_secs = float(style.get("hook_seconds", 3))
     if style.get("hook", True) and hook_text.strip():
         end = min(hook_secs, total) if total else hook_secs
@@ -997,7 +1004,7 @@ def filter_path(path):
     return "'" + path.replace("\\", "/").replace(":", "\\:") + "'"
 
 
-def audio_chain(intervals, cut, enhance, music, music_volume):
+def audio_chain(intervals, cut, enhance, music, music_volume, beeps=()):
     """Voice clean-up (rumble, AI noise reduction, sibilance, levelling), soft 12 ms fades at every cut so the
     pause cutter never clicks, and optional background music that ducks under speech."""
     head = "[0:a]aformat=sample_rates=48000:channel_layouts=stereo"
@@ -1017,6 +1024,13 @@ def audio_chain(intervals, cut, enhance, music, music_volume):
     if enhance:
         denoise = ("arnndn=m=%s:mix=0.85" % filter_path(RNNOISE)) if os.path.exists(RNNOISE) else "afftdn=nf=-25"
         a += ",highpass=f=80," + denoise + ",deesser=i=0.4,acompressor=threshold=-20dB:ratio=3:attack=5:release=150"
+    if beeps:
+        on = "+".join("between(t,%.3f,%.3f)" % (b0, b1) for b0, b1 in beeps)
+        total = max(b1 for _, b1 in beeps) + 1
+        a += (",volume=enable='%s':volume=0[vb];"
+              "sine=frequency=1000:sample_rate=48000:duration=%.2f,aformat=sample_rates=48000:channel_layouts=stereo,"
+              "volume=0.18,volume=enable='not(%s)':volume=0[bp];"
+              "[vb][bp]amix=inputs=2:duration=first:normalize=0" % (on, total, on))
     if music:
         a += (",asplit=2[vs][vm];"
               "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=%.2f[m];"
@@ -1026,7 +1040,7 @@ def audio_chain(intervals, cut, enhance, music, music_volume):
 
 
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
-                size=(1080, 1920), zoom_spans_out=None, music=None, split=None):
+                size=(1080, 1920), zoom_spans_out=None, music=None, split=None, beeps=()):
     ow, oh = size
     fps = out_fps(info)
     duration = end - start
@@ -1042,7 +1056,7 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
         if music:
             cmd += ["-stream_loop", "-1", "-i", music]
         graph += ";" + audio_chain(intervals, cut, style.get("enhance_audio", True), music,
-                                   int(style.get("music_volume", 15)))
+                                   int(style.get("music_volume", 15)), beeps)
     out = name + ".mp4"
     cmd += ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if has_audio else [])
     cmd += ["-c:v", "libx264", "-preset", "faster", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
@@ -1713,3 +1727,51 @@ def visual_check(api_key, video_path, out_len, hook, title, text):
     ) % (hook[:200], title[:200], text[:1500])
     res = claude_json(api_key, prompt, max_tokens=800, feature="Endkontrolle", images=frames)
     return [str(i)[:200] for i in (res.get("issues") or []) if str(i).strip()][:5]
+
+
+
+# ---------------------------------------------------------------- cover still
+
+def best_cover_time(video, info, start, end):
+    """Seconds into the clip of the best still for the cover: a large, sharp, well-lit face with open eyes.
+
+    Looks at two frames per second over the first 30 seconds; without a face anywhere, the sharpest frame wins."""
+    import cv2
+    import numpy as np
+
+    W, H = info["width"], info["height"]
+    span = min(end - start, 30.0)
+    aw = 480
+    ah = int(round(H * aw / W / 2)) * 2
+    p = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.2f" % (start + 0.3), "-t", "%.2f" % span, "-i", video,
+                        "-vf", "fps=2,scale=%d:%d" % (aw, ah), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], capture_output=True)
+    if p.returncode != 0 or not p.stdout:
+        return None
+    frames = np.frombuffer(p.stdout, np.uint8)
+    frames = frames[: len(frames) // (aw * ah * 3) * aw * ah * 3].reshape(-1, ah, aw, 3)
+    yunet = None
+    if os.path.exists(YUNET):
+        try:
+            yunet = cv2.FaceDetectorYN.create(YUNET, "", (aw, ah), 0.6, 0.3, 20)
+        except cv2.error:
+            yunet = None
+    eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+    best, best_t = -1e9, None
+    for i, img in enumerate(frames):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        light = float(gray.mean())
+        score = min(sharp, 400) / 40 - abs(light - 120) / 20  # sharp and neither too dark nor too bright
+        if yunet is not None:
+            found = yunet.detect(img)[1]
+            if found is not None and len(found):
+                f = max(found, key=lambda r: r[2] * r[3])
+                x, y, w, h, conf = int(f[0]), int(f[1]), int(f[2]), int(f[3]), float(f[14])
+                score += 20 * conf + 30 * (w * h) / (aw * ah) * 10
+                face = gray[max(0, y):y + h // 2 + 1, max(0, x):x + w]
+                if face.size:
+                    score += 6 * min(2, len(eyes.detectMultiScale(face, 1.1, 4)))  # open eyes are found, closed ones not
+                score -= abs((x + w / 2) / aw - 0.5) * 6  # prefer a face near the middle
+        if score > best:
+            best, best_t = score, 0.3 + i / 2
+    return best_t

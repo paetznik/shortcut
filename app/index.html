@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ShortCut</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff3d6e'/%3E%3Crect x='11' y='6' width='10' height='20' rx='2' fill='white'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#0f1115;--panel:#171a21;--panel2:#1f232c;--line:#2a2f3a;--text:#eef0f4;--muted:#9aa1ad;--accent:#ff3d6e;--accent2:#ffb02e;--ok:#2ecc8f;--err:#ff5d5d;--r:14px}
@@ -93,6 +98,13 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
 .wd{cursor:pointer;border-radius:4px;padding:1px 2px}
 .wd:hover{background:var(--panel2)}
 .wd.cut{text-decoration:line-through;color:var(--err);opacity:.7}
+.wd.beep{background:#111;color:#111;border-radius:3px;outline:1px solid #555}
+.chip.on{border-color:var(--accent);background:#2a1a22}
+.ft{max-height:320px;overflow:auto;line-height:1.9;font-size:14px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;user-select:none}
+.fw{cursor:pointer;border-radius:3px;padding:1px 1px}
+.fw:hover{background:var(--panel2)}
+.fw.inc{background:rgba(255,176,46,.14)}
+.fw.sel{background:rgba(255,61,110,.45);color:#fff}
 .warn{font-size:12px;color:var(--accent2)}
 .vwrap{position:relative}
 .sz{position:absolute;display:none;pointer-events:none;background:rgba(255,61,110,.28);outline:1px dashed rgba(255,255,255,.6)}
@@ -269,7 +281,7 @@ window.onhashchange=function(){route()};
 function route(){
   clearInterval(S.timer);
   var m=location.hash.match(/^#job\/([0-9a-f]{12})/);
-  if(m){S.view="job";S.job=null;S.editing={};S.crop={};S.removed={};loadJob(m[1])}else{S.view="home";renderHome();loadJobs()}
+  if(m){S.view="job";S.job=null;S.editing={};S.crop={};S.removed={};S.beeped={};S.chipMode={};S.tw=null;S.tsel=null;S.trOpen=false;loadJob(m[1])}else{S.view="home";renderHome();loadJobs();handleShared()}
   S.timer=setInterval(function(){
     if(S.view==="home"){loadJobs();loadQueue();if(!S.stTick||Date.now()-S.stTick>30000) loadStorage()}
     else if(S.job && isRunning(S.job)) loadJob(S.job.id, true);
@@ -401,22 +413,109 @@ function removedSet(i){
   if(!S.removed[i]) S.removed[i]=(S.job.clips[i].removed||[]).map(function(x){return x.toFixed(2)});
   return S.removed[i];
 }
+function beepSet(i){
+  if(!S.beeped) S.beeped={};
+  if(!S.beeped[i]) S.beeped[i]=(S.job.clips[i].beeped||[]).map(function(x){return x.toFixed(2)});
+  return S.beeped[i];
+}
+function chipMode(i){return (S.chipMode&&S.chipMode[i])||"cut"}
+function setChipMode(i,m){if(!S.chipMode) S.chipMode={};S.chipMode[i]=m;renderChips(i)}
 function wordChips(c,i){
-  var cut=removedSet(i);
-  return (c.words||[]).map(function(w,k){var on=cut.indexOf(w[1].toFixed(2))>=0;return '<span class="wd'+(on?" cut":"")+'" onclick="toggleWord('+i+','+k+',event)">'+esc(w[0])+'</span>'}).join(" ");
+  var cut=removedSet(i),bp=beepSet(i);
+  return (c.words||[]).map(function(w,k){var key=w[1].toFixed(2),cls=cut.indexOf(key)>=0?" cut":bp.indexOf(key)>=0?" beep":"";
+    return '<span class="wd'+cls+'" onclick="toggleWord('+i+','+k+',event)">'+esc(w[0])+'</span>'}).join(" ");
+}
+function chipNote(i){
+  var n=removedSet(i).length,b=beepSet(i).length;
+  return [n?n+" Wörter werden geschnitten":"",b?b+" Wörter werden überpiept":""].filter(Boolean).join(" · ");
+}
+function renderChips(i){
+  var c=S.job.clips[i];$("wc"+i).innerHTML=wordChips(c,i);$("wn"+i).textContent=chipNote(i);
+  ["cut","beep"].forEach(function(m){var b=$("cm"+m+i);if(b) b.classList.toggle("on",chipMode(i)===m)});
 }
 function toggleWord(i,k,ev){
-  var c=S.job.clips[i],cut=removedSet(i),from=k;
+  var c=S.job.clips[i],set=chipMode(i)==="beep"?beepSet(i):removedSet(i),other=chipMode(i)==="beep"?removedSet(i):beepSet(i),from=k;
   if(ev.shiftKey&&S.lastWord&&S.lastWord[0]===i) from=S.lastWord[1];
-  var a=Math.min(from,k),b=Math.max(from,k),target=cut.indexOf(c.words[k][1].toFixed(2))<0;
+  var a=Math.min(from,k),b=Math.max(from,k),target=set.indexOf(c.words[k][1].toFixed(2))<0;
   for(var x=a;x<=b;x++){
-    var key=c.words[x][1].toFixed(2),pos=cut.indexOf(key);
-    if(target&&pos<0) cut.push(key); else if(!target&&pos>=0) cut.splice(pos,1);
+    var key=c.words[x][1].toFixed(2),pos=set.indexOf(key);
+    if(target&&pos<0){set.push(key);var o=other.indexOf(key);if(o>=0) other.splice(o,1)}
+    else if(!target&&pos>=0) set.splice(pos,1);
   }
   S.lastWord=[i,k];
-  $("wc"+i).innerHTML=wordChips(c,i);
-  $("wn"+i).textContent=cut.length?cut.length+" Wörter werden geschnitten":"";
+  renderChips(i);
 }
+
+// ---------------------------------------------------------------- full transcript: mark your own clip or a series
+function transcriptCard(j){
+  if(!j.info||!["fertig","fehler","prüfen","abgebrochen"].includes(j.status)||j.source_deleted) return '';
+  return '<details class="card" id="trCard" style="margin-top:16px"'+(S.trOpen?" open":"")+' ontoggle="trToggle(this)"><summary style="margin:0;color:var(--text)"><b>Gesamtes Transkript</b> <span class="muted small">– eigenen Clip oder eine Serie markieren</span></summary>'+
+    '<p class="muted small">Klicke auf das erste und dann auf das letzte Wort der gewünschten Passage. Bereits vorhandene Clips sind hinterlegt.</p>'+
+    '<div class="ft" id="ft">'+(S.tw&&S.tw.id===j.id?transcriptHtml():'<span class="muted small">Lade Transkript …</span>')+'</div>'+
+    '<div class="row" id="trBar" style="margin-top:10px;gap:8px">'+trBar()+'</div></details>';
+}
+function trToggle(el){S.trOpen=el.open;if(el.open&&!(S.tw&&S.tw.id===S.job.id)) loadTranscript()}
+function loadTranscript(){
+  api("GET","/api/jobs/"+S.job.id+"/transcript").then(function(r){S.tw={id:S.job.id,words:r.words};S.tsel=null;var f=$("ft");if(f) f.innerHTML=transcriptHtml()}).catch(function(e){toast(e.message)});
+}
+function transcriptHtml(){
+  var ws=S.tw.words,cl=S.job.clips||[],sel=S.tsel||[],a=Math.min(sel[0],sel[1]==null?sel[0]:sel[1]),b=Math.max(sel[0],sel[1]==null?sel[0]:sel[1]);
+  return ws.map(function(w,k){
+    var inc=cl.some(function(c){return w[1]>=c.start-0.01&&w[2]<=c.end+0.01});
+    var s=sel.length&&k>=a&&k<=b;
+    return '<span class="fw'+(inc?" inc":"")+(s?" sel":"")+'" onclick="trClick('+k+')">'+esc(w[0])+'</span>';
+  }).join(" ");
+}
+function trClick(k){
+  if(!S.tsel||S.tsel.length===2) S.tsel=[k]; else S.tsel=[S.tsel[0],k];
+  $("ft").innerHTML=transcriptHtml();$("trBar").innerHTML=trBar();
+}
+function trRange(){
+  if(!S.tsel||!S.tw) return null;
+  var a=Math.min.apply(null,S.tsel),b=Math.max.apply(null,S.tsel);
+  return [S.tw.words[a][1],S.tw.words[b][2]];
+}
+function trBar(){
+  var r=trRange();
+  if(!r) return '<span class="muted small">Noch nichts markiert.</span>';
+  var len=r[1]-r[0],one=S.tsel.length===1;
+  return '<span class="small">'+(one?'Anfang bei '+fmt(r[0])+' – jetzt das letzte Wort anklicken':'Markiert: '+fmt(r[0])+'–'+fmt(r[1])+' ('+Math.round(len)+' s)')+'</span>'+
+    (one?'':'<button class="btn sm primary" onclick="trCreate(false)"'+(len>180?' disabled title="Länger als 3 Minuten – als Serie anlegen"':'')+'>Als Clip anlegen</button>'+
+      '<button class="btn sm" onclick="trCreate(true)">Als Serie</button><span class="small muted">Teile à</span><input id="e_partlen" type="number" min="20" max="180" value="'+(S.partLen||60)+'" style="width:70px"><span class="small muted">s</span>')+
+    '<button class="btn sm ghost" onclick="S.tsel=null;$(\'ft\').innerHTML=transcriptHtml();$(\'trBar\').innerHTML=trBar()">Markierung aufheben</button>';
+}
+function trCreate(series){
+  var r=trRange();if(!r) return;
+  var pl=parseFloat(($("e_partlen")||{}).value)||60;S.partLen=pl;
+  api("POST","/api/jobs/"+S.job.id+"/clips",{start:r[0],end:r[1],series:series,part_len:pl}).then(function(j){
+    S.job=j;S.tsel=null;renderJob();toast(series?"Serie wird angelegt":"Clip wird angelegt");
+  }).catch(function(e){toast(e.message)});
+}
+function splitClip(i){
+  var v=prompt("In Teile zerlegen – Länge je Teil in Sekunden:","30");if(!v) return;
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+i+"/split",{part_len:parseFloat(v)}).then(function(j){S.job=j;renderJob();toast("Serie wird angelegt")}).catch(function(e){toast(e.message)});
+}
+function deleteClip(i){
+  if(!confirm("Diesen Clip löschen?")) return;
+  api("DELETE","/api/jobs/"+S.job.id+"/clips/"+i).then(function(j){S.job=j;S.removed={};S.beeped={};S.crop={};S.editing={};renderJob();toast("Clip gelöscht")}).catch(function(e){toast(e.message)});
+}
+
+// ---------------------------------------------------------------- app install and shared videos
+if("serviceWorker" in navigator){window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){})})}
+function handleShared(){
+  if(location.search.indexOf("shared=1")<0||!("caches" in window)) return;
+  history.replaceState(null,"","/");
+  caches.open("shortcut-share").then(function(c){return c.match("/shared-video").then(function(r){
+    if(!r) return;
+    var name=decodeURIComponent(r.headers.get("x-name")||"video.mp4"),type=r.headers.get("content-type")||"video/mp4";
+    return r.blob().then(function(b){
+      c.delete("/shared-video");
+      S.srcTab="file";renderHome();toast("Geteiltes Video wird hochgeladen …");
+      upload(new File([b],name,{type:type}));
+    });
+  })}).catch(function(){});
+}
+
 function editor(c,i,review){
   var hooks=(c.hooks||[]).filter(function(h){return h});
   return '<div class="edit'+(review||S.editing[i]?" on":"")+'" id="ed'+i+'">'+
@@ -428,11 +527,12 @@ function editor(c,i,review){
     '<div><label>Text auf dem Titelbild</label><input id="e_cv'+i+'" value="'+esc(c.cover_text==null?c.title:c.cover_text)+'"></div>'+
     cropUI(c,i)+
     '<div><label>Schlüsselwörter (farbig, mit Komma getrennt)</label><input id="e_k'+i+'" value="'+esc((c.keywords||[]).join(", "))+'"></div>'+
-    '<div><label>Schneiden: Wörter anklicken, die raus sollen (Umschalt-Klick markiert einen Bereich)</label><div class="words-cut" id="wc'+i+'">'+wordChips(c,i)+'</div><div class="muted small" id="wn'+i+'">'+(removedSet(i).length?removedSet(i).length+" Wörter werden geschnitten":"")+'</div></div>'+
+    '<div><label>Wörter anklicken (Umschalt-Klick markiert einen Bereich)</label><div class="row" style="gap:6px;margin-bottom:6px"><button class="chip'+(chipMode(i)==="cut"?" on":"")+'" id="cmcut'+i+'" onclick="setChipMode('+i+',\'cut\')">✂ Schneiden</button><button class="chip'+(chipMode(i)==="beep"?" on":"")+'" id="cmbeep'+i+'" onclick="setChipMode('+i+',\'beep\')">🔇 Überpiepen</button></div><div class="words-cut" id="wc'+i+'">'+wordChips(c,i)+'</div><div class="muted small" id="wn'+i+'">'+chipNote(i)+'</div></div>'+
     '<div><label>Untertitel – Tippfehler hier korrigieren</label><textarea class="words" id="e_w'+i+'">'+esc(c.text||"")+'</textarea></div>'+
     '<div><label>Beschreibung für Social Media</label><textarea id="e_c'+i+'">'+esc(c.caption||"")+'</textarea></div>'+
     '<div class="muted small">Zeiten als Minuten:Sekunden, z. B. 3:12.5. Bei geänderten Zeiten passen sich die Untertitel an.</div>'+
-    '<button class="btn sm primary" onclick="saveClip('+i+')">'+(review?"Speichern":"Speichern und neu rendern")+'</button></div>';
+    '<div class="row" style="gap:8px"><button class="btn sm primary" onclick="saveClip('+i+')">'+(review?"Speichern":"Speichern und neu rendern")+'</button>'+
+    (!review?'<button class="btn sm" onclick="splitClip('+i+')">In Teile zerlegen</button>':'')+'<button class="btn sm danger" onclick="deleteClip('+i+')">Clip löschen</button></div></div>';
 }
 function lengthNote(sec){
   if(sec>180) return '<span class="warn">zu lang für Shorts/Reels (max. 3 min)</span>';
@@ -461,6 +561,7 @@ function renderJob(){
   if(j.status==="fehler") html+='<div class="hint" style="margin-top:14px;background:#2a1616;border-color:#5a2525;color:#ffb3b3">'+esc(j.message)+'</div>';
   if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Hook, Titelbild-Text und Untertitel jedes Clips. Wörter anklicken schneidet sie heraus, Tippfehler korrigierst du im Textfeld. Dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
   html+=energyTimeline(j);
+  html+=transcriptCard(j);
   html+=textsCard(j);
   html+=bestofCard(j);
   html+='<div class="clips">'+(j.clips||[]).map(function(c,i){
@@ -472,6 +573,7 @@ function renderJob(){
     var pz=c.postiz?'<div class="tag">✓ An Postiz gesendet'+(c.postiz.now?' (sofort)':' – geplant für '+new Date(c.postiz.date*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"}))+(c.postiz.channels&&c.postiz.channels.length?': '+esc(c.postiz.channels.join(", ")):'')+'</div>':'';
     var f=c.formats||{},dl=function(file,label,cls){return '<a class="btn sm'+(cls||"")+'" href="/files/'+j.id+'/'+file+'?dl=1">'+label+'</a>'};
     return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+(c.variant_of!=null?' · Variante von Clip '+(c.variant_of+1):'')+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
+      (c.series?'<div><span class="pill rev">Teil '+c.series.part+'/'+c.series.total+'</span></div>':'')+(c.manual&&!c.series?'<div><span class="pill">Von Hand markiert</span></div>':'')+
       lengthNote(outLen)+audioBadge(c)+criteriaUI(c)+checksUI(c,i)+
       '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
       (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+pz+
@@ -485,14 +587,16 @@ function renderJob(){
   if(playing&&!running) return;
   var a=document.activeElement;
   if(a&&a.id&&/^e_/.test(a.id)) return;
+  var ft=$("ft"),scroll=ft?ft.scrollTop:0;
   app.innerHTML=shell(html);
+  if(scroll&&$("ft")) $("ft").scrollTop=scroll;
 }
 function toggleEdit(i){S.editing[i]=!S.editing[i];$("ed"+i).classList.toggle("on")}
 function copyCap(i){var c=S.job.clips[i];navigator.clipboard.writeText(c.title+"\n\n"+c.caption).then(function(){toast("Kopiert")})}
 function clipBody(i){
   return {start:parseT($("e_s"+i).value),end:parseT($("e_e"+i).value),title:$("e_t"+i).value,hook_text:$("e_h"+i).value,
     cover_text:$("e_cv"+i).value,keywords:$("e_k"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value,
-    removed:removedSet(i).map(parseFloat),crop_keys:S.crop&&S.crop[i]?S.crop[i].keys:undefined};
+    removed:removedSet(i).map(parseFloat),beeped:beepSet(i).map(parseFloat),crop_keys:S.crop&&S.crop[i]?S.crop[i].keys:undefined};
 }
 function saveClip(i){
   var body=clipBody(i);
