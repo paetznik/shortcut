@@ -25,6 +25,14 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 12. Betrieb: Warteschlange mit Restzeit (lernt die Geschwindigkeit des Servers), Umsortieren und Abbrechen; Transkript und Tonanalyse werden übernommen, wenn dasselbe Video erneut hochgeladen wird; Speicheranzeige mit Löschen der Originalvideos; Claude-Kosten pro Projekt und pro Monat.
 13. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
 
+## Qualität
+
+- Bild: Bildrate des Originals (24–60 fps), Lanczos-Skalierung mit leichtem Nachschärfen, CRF 19; Warnung, wenn das Material für Hochformat zu wenig Auflösung hat.
+- Bildausschnitt: YuNet-Gesichtserkennung (OpenCV) mit Mundbewegung als Sprechersignal, weiche Kamerafahrt mit Totzone, harte Schnitte nur bei Sprecherwechsel; Szenenwechsel werden erkannt, Clip-Grenzen auf Kameraschnitte gelegt.
+- Ton: Schnitte bildgenau, 12-ms-Blenden an jeder Schnittstelle, RNNoise-Rauschunterdrückung.
+- Text: Spracherkennung wahlweise mit large-v3-turbo, wortgenaue Zeitstempel per Forced Alignment (torchaudio MMS) für die Clip-Bereiche, Untertitel-Umbruch nach Sinngrenzen.
+- Kontrolle: optionale KI-Endkontrolle anhand von Standbildern des fertigen Clips.
+
 ## Deployment
 
 `docker-compose.yaml` baut das Image direkt aus diesem Repository und hängt es an Traefik (Let's-Encrypt-Zertifikat).

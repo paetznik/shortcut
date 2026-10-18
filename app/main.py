@@ -36,7 +36,8 @@ DEFAULTS = {
     "highlight": "#FFE600", "uppercase": True, "font_size": 78, "position": "unten", "words_per_line": 3,
     "remove_pauses": True, "hook": True, "hook_seconds": 3, "review": False,
     "sub_style": "pop", "keyword_color": "#4ADE80", "zoom": True, "enhance_audio": True, "music": "", "music_volume": 15,
-    "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True,
+    "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True, "precise_timing": True,
+    "ai_check": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -1059,34 +1060,67 @@ def manual_crop(clip, info):
     return segs or None
 
 
+def snap_to_cuts(det, duration, limit=0.9):
+    """A camera cut just after the start or just before the end would flash a frame of the other shot:
+    move the clip boundary onto the cut. Returns (cut off at the start, cut off at the end) in seconds."""
+    head = tail = 0.0
+    for c in (det or {}).get("cuts", []):
+        if 0.05 < c < limit:
+            head = max(head, c + 0.05)
+        if duration - limit < c < duration - 0.05:
+            tail = max(tail, duration - c + 0.05)
+    if duration - head - tail < 3:
+        return 0.0, 0.0
+    return round(head, 2), round(tail, 2)
+
+
+def shift_segs(segs, offset, duration):
+    """Framing computed for the original range, moved to a clip that now starts `offset` seconds later."""
+    if not segs:
+        return segs
+    out = []
+    for seg in segs:
+        t0, t1 = max(0.0, seg[0] - offset), min(duration, seg[1] - offset)
+        if t1 <= t0:
+            continue
+        pts = [(min(max(t - offset, t0), t1), x) for t, x in (seg[3] if len(seg) > 3 and seg[3] else [])]
+        out.append((t0, t1, seg[2], pts))
+    return out or None
+
+
 def prepare(jid, idx, info):
     """Everything a render of this clip needs: cut intervals, words on the output timeline, zooms, framing, music."""
     job = load_job(jid)
-    clip = job["clips"][idx]
+    clip = dict(job["clips"][idx])
     s = dict(job["settings"])
     src = os.path.join(JOBS, jid, job["source"])
+    manual = manual_crop(clip, info)
+    split_wanted = s.get("mode") == "split"
+    # faces are only needed for automatic framing; scene cuts are always looked for
+    det = pipeline.detect_faces(src, info, clip["start"], clip["end"], faces=not manual and s.get("mode") in ("auto", "split"))
+    head, tail = snap_to_cuts(det, clip["end"] - clip["start"]) if not manual else (0.0, 0.0)
+    clip["start"], clip["end"] = round(clip["start"] + head, 2), round(clip["end"] - tail, 2)
     duration = clip["end"] - clip["start"]
     words = pipeline.clip_words(load_transcript(jid), clip["start"], clip["end"])
     removed = [r - clip["start"] for r in clip.get("removed", [])]
     intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True), removed)
     intervals = pipeline.add_spans(intervals, reaction_spans(jid, clip["start"], clip["end"]), duration)
+    intervals = pipeline.quantize(intervals, pipeline.out_fps(info))
     out_words = pipeline.remap_words(words, intervals)
     out_len = sum(b - a for a, b in intervals)
-    crop_segs = manual_crop(clip, info)
-    det, split, split_wanted = None, None, s.get("mode") == "split"
-    if crop_segs:
+    crop_segs, split = manual, None
+    if manual:
         s["mode"] = "auto"  # hand-set framing always crops, whatever the project mode
     elif s.get("mode") in ("auto", "split"):
-        det = pipeline.detect_faces(src, info, clip["start"], clip["end"])
         if split_wanted:
             split = pipeline.split_pair(det)
-        crop_segs = None if split else pipeline.speaker_segments(det, duration)
+        crop_segs = None if split else shift_segs(pipeline.speaker_segments(det, duration + head + tail), head, duration)
         s["mode"] = "auto"
         s["split_layout"] = bool(split)
     music = os.path.join(MUSIC, s["music"]) if s.get("music") and os.path.exists(os.path.join(MUSIC, s["music"])) else None
     return {"job": job, "clip": clip, "s": s, "src": src, "duration": duration, "intervals": intervals,
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
-            "det": det, "split": split, "split_wanted": split_wanted,
+            "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail),
             "zooms": pipeline.zoom_spans(out_words, intervals, out_len) if s.get("zoom", True) else None}
 
 
@@ -1102,10 +1136,38 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
     return out_len
 
 
+def job_settings(jid):
+    return load_job(jid).get("settings", {})
+
+
+def ensure_aligned(jid, idx):
+    """Word-exact timing for the stretch of one clip (once per stretch; the rest of the transcript stays as is)."""
+    job = load_job(jid)
+    if not job["settings"].get("precise_timing", True) or job.get("source_deleted"):
+        return
+    clip = job["clips"][idx]
+    lo, hi = max(0.0, clip["start"] - 1), clip["end"] + 1
+    done = job.get("aligned", [])
+    if any(a <= lo and hi <= b for a, b in done):
+        return
+    segments = load_transcript(jid)
+    words = [w for w in pipeline.all_words(segments) if w["e"] > lo and w["s"] < hi]
+    try:
+        new = pipeline.align_words(os.path.join(JOBS, jid, job["source"]), words, lo, hi)
+    except Exception as e:
+        log(jid, "Wortgenaue Zeitstempel nicht möglich: " + str(e)[:200])
+        return
+    moved = sum(1 for a, b in zip(words, new) if abs(a["s"] - b["s"]) > 0.04)
+    save_transcript(jid, pipeline.replace_words(segments, lo, hi, new))
+    update(jid, aligned=done + [[round(lo, 2), round(hi, 2)]])
+    log(jid, "Clip %d: %d von %d Wörtern zeitlich nachjustiert" % (idx + 1, moved, len(words)))
+
+
 def render_one(jid, idx, info):
     """Render one clip: speaker framing, cuts (pauses, fillers, struck-out words), zooms, subtitles, hook, audio,
     extra formats and the cover image. Translations of an older version are dropped."""
     d = os.path.join(JOBS, jid)
+    ensure_aligned(jid, idx)
     p = prepare(jid, idx, info)
     clip, s = p["clip"], p["s"]
     version = clip.get("version", 0) + 1
@@ -1128,6 +1190,14 @@ def render_one(jid, idx, info):
 
     checks = pipeline.quality_checks(d, outputs["9x16"], info, load_transcript(jid), clip["start"], clip["end"],
                                      p["det"], p["crop_segs"], s.get("mode"), p["split_wanted"], p["split"], out_len)
+    key = load_config().get("anthropic_key", "")
+    if key and job_settings(jid).get("ai_check", True):
+        try:
+            issues = pipeline.visual_check(key, os.path.join(d, outputs["9x16"]), out_len, hook, clip.get("title", ""),
+                                           " ".join(w["w"] for w in p["out_words"]))
+            checks += [{"level": "warn", "msg": "KI-Kontrolle: " + i} for i in issues] or                 [{"level": "info", "msg": "KI-Endkontrolle ohne Befund."}]
+        except Exception as e:
+            log(jid, "KI-Endkontrolle fehlgeschlagen: " + str(e)[:200])
 
     keep = {name + ".mp4", name + ".jpg", name + ".srt", cover} | set(outputs.values())
     for old in clip_files(clip):
@@ -1141,7 +1211,7 @@ def render_one(jid, idx, info):
         job["clips"][idx].update({
             "file": outputs["9x16"], "thumb": name + ".jpg", "srt": name + ".srt", "cover": cover,
             "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "version": version, "status": "fertig",
-            "duration_out": round(out_len, 1), "speakers": len({x for _, _, x in p["crop_segs"] or []}),
+            "duration_out": round(out_len, 1), "speakers": len({seg[2] for seg in p["crop_segs"] or []}),
             "translations": {}, "checks": checks, "split": bool(p["split"]),
         })
         save_job(job)
@@ -1188,6 +1258,7 @@ def render_bestof(jid, target):
         words = pipeline.clip_words(segments, a, b)
         intervals = pipeline.keep_intervals(words, b - a, s.get("remove_pauses", True))
         intervals = pipeline.add_spans(intervals, reaction_spans(jid, a, b), b - a)
+        intervals = pipeline.quantize(intervals, pipeline.out_fps(info))
         out_words = pipeline.remap_words(words, intervals)
         out_len = sum(y - x for x, y in intervals)
         crop = manual_crop(clip, info) or (pipeline.track_speaker(os.path.join(d, job["source"]), info, a, b)
@@ -1462,6 +1533,7 @@ def render_clips(jid, info):
         formats = 1 + len(c.get("formats") or {})
         learn_speed("render", (time.time() - t0) / formats, c.get("duration_out") or 0)
     update(jid, message="Prüfe Rechtschreibung …")
+    pipeline.release_aligner()
     spelling(jid, range(n))
     update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % n, finished=time.time())
 
@@ -1469,6 +1541,7 @@ def render_clips(jid, info):
 def rerender(jid, idx):
     job = update(jid, status="läuft", message="Rendere Clip %d neu …" % (idx + 1))
     render_one(jid, idx, job["info"])
+    pipeline.release_aligner()
     spelling(jid, [idx])
     update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % len(job["clips"]))
 

@@ -15,7 +15,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 WHISPER_PRESETS = {
     "schnell": {"model": "base", "beam_size": 1},
     "ausgewogen": {"model": "small", "beam_size": 3},
-    "genau": {"model": "medium", "beam_size": 5},
+    "genau": {"model": "large-v3-turbo", "beam_size": 3},  # newest large model, distilled decoder; 3-5x video length on 2 cores
 }
 
 
@@ -207,12 +207,18 @@ def cost_usd(model, tokens_in, tokens_out):
     return (tokens_in * pin + tokens_out * pout) / 1e6
 
 
-def claude_json(api_key, prompt, pattern=r"\{.*\}", max_tokens=4000, feature="Sonstiges"):
-    """Ask Claude and parse the first JSON array/object in the answer; usage is reported to USAGE_HOOK."""
+def claude_json(api_key, prompt, pattern=r"\{.*\}", max_tokens=4000, feature="Sonstiges", images=()):
+    """Ask Claude (optionally with JPEG images) and parse the first JSON array/object in the answer;
+    usage is reported to USAGE_HOOK."""
+    import base64
+
+    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                            "data": base64.b64encode(img).decode()}} for img in images]
+    content.append({"type": "text", "text": prompt})
     r = httpx.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
+        json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "messages": [{"role": "user", "content": content}]},
         timeout=300,
     )
     if r.status_code != 200:
@@ -519,50 +525,89 @@ def remap_words(words, intervals):
 
 # ---------------------------------------------------------------- speaker tracking
 
-def detect_faces(video, info, start, end):
-    """Faces on 5 frames per second, grouped into one track per person (by horizontal position).
+YUNET = os.environ.get("YUNET_MODEL", "/opt/models/face_detection_yunet_2023mar.onnx")
 
-    Returns {"tracks": [{"cx", "w", "seen", "motion"}], "frames", "fps"} with positions in source pixels and
-    `motion` = mouth movement per frame, or None for portrait sources and when nothing could be decoded."""
+
+def detect_faces(video, info, start, end, faces=True):
+    """Scene cuts and faces on 5 frames per second.
+
+    Faces come from YuNet (a small modern CNN detector that also finds profiles and small faces; falls back to the
+    older Haar cascades if the model file is missing) and are grouped into one track per person by position.
+    Scene cuts are found from the same frames (large change of the whole picture between two frames).
+    Returns {"tracks": [{"cx", "w", "seen", "motion", "pos"}], "cuts": [s], "frames", "fps"}, positions in source
+    pixels, or None for portrait sources and when nothing could be decoded."""
     import cv2
     import numpy as np
 
     W, H = info["width"], info["height"]
-    if W / H <= 9 / 16 + 0.01:
-        return None
     fps, aw = 5, 480
     ah = int(round(H * aw / W / 2)) * 2
     p = subprocess.run(
         [FFMPEG, "-v", "error", "-ss", "%.2f" % start, "-t", "%.2f" % (end - start), "-i", video,
-         "-vf", "fps=%d,scale=%d:%d" % (fps, aw, ah), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+         "-vf", "fps=%d,scale=%d:%d" % (fps, aw, ah), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
         capture_output=True,
     )
     if p.returncode != 0 or not p.stdout:
         return None
     frames = np.frombuffer(p.stdout, np.uint8)
-    frames = frames[: len(frames) // (aw * ah) * aw * ah].reshape(-1, ah, aw)
-    frontal = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
-    min_size = (max(20, ah // 9),) * 2
+    frames = frames[: len(frames) // (aw * ah * 3) * aw * ah * 3].reshape(-1, ah, aw, 3)
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
 
-    tracks = []  # {"cx": [..], "w": [..], "last": x, "seen": n, "motion": {frame: v}, "patch": (frame, arr)}
-    for i, img in enumerate(frames):
-        faces = list(frontal.detectMultiScale(img, 1.1, 5, minSize=min_size))
-        if not faces:
-            faces = list(profile.detectMultiScale(img, 1.1, 5, minSize=min_size))
+    # scene cuts: the whole picture changes much more than between neighbouring frames usually
+    small = [cv2.resize(g, (48, 27)).astype(np.float32) for g in grays]
+    diffs = [0.0] + [float(np.mean(np.abs(a - b))) for a, b in zip(small[1:], small[:-1])]
+    base = float(np.median(diffs[1:])) if len(diffs) > 2 else 0.0
+    cuts = [round(i / fps - 0.1, 2) for i, d in enumerate(diffs) if i and d > max(22.0, 4 * base)]
+
+    result = {"tracks": [], "cuts": cuts, "frames": len(frames), "fps": fps}
+    if not faces or W / H <= 9 / 16 + 0.01:
+        return result
+
+    yunet = None
+    if os.path.exists(YUNET):
+        try:
+            yunet = cv2.FaceDetectorYN.create(YUNET, "", (aw, ah), 0.6, 0.3, 50)
+        except cv2.error:
+            yunet = None
+    if yunet is None:
+        frontal = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+    min_size = (max(20, ah // 9),) * 2
+    cut_frames = {int(round((c + 0.1) * fps)) for c in cuts}
+
+    tracks = []
+    for i, (img, gray) in enumerate(zip(frames, grays)):
+        if i in cut_frames:  # positions after a camera cut are not continuations of the old ones
+            for t in tracks:
+                t["last"] = -9999
+        if yunet is not None:
+            found = yunet.detect(img)[1]
+            faces_ = [] if found is None else [(f[0], f[1], f[2], f[3], f[10:14]) for f in found]
+        else:
+            boxes = list(frontal.detectMultiScale(gray, 1.1, 5, minSize=min_size)) or \
+                list(profile.detectMultiScale(gray, 1.1, 5, minSize=min_size))
+            faces_ = [(x, y, w, h, None) for x, y, w, h in boxes]
         used = set()
-        for x, y, w, h in faces:
+        for x, y, w, h, mouth_pts in faces_:
             cx = x + w / 2
             best = min((t for t in tracks if id(t) not in used), key=lambda t: abs(t["last"] - cx), default=None)
             if best is None or abs(best["last"] - cx) > 0.12 * aw:
-                best = {"cx": [], "w": [], "last": cx, "seen": 0, "motion": {}, "patch": None}
+                best = {"cx": [], "w": [], "last": cx, "seen": 0, "motion": {}, "patch": None, "pos": {}}
                 tracks.append(best)
             used.add(id(best))
             best["cx"].append(cx)
             best["w"].append(w)
             best["last"] = cx
             best["seen"] += 1
-            mouth = img[y + int(h * 0.62): y + h, x + int(w * 0.2): x + int(w * 0.8)]
+            best["pos"][i] = cx
+            if mouth_pts is not None:  # mouth corners from the landmarks
+                mx0, my0, mx1, my1 = [float(v) for v in mouth_pts]
+                mw = max(8, abs(mx1 - mx0))
+                x0, x1 = int(min(mx0, mx1) - mw * 0.2), int(max(mx0, mx1) + mw * 0.2)
+                y0, y1 = int((my0 + my1) / 2 - mw * 0.45), int((my0 + my1) / 2 + mw * 0.45)
+            else:
+                x0, x1, y0, y1 = int(x + w * 0.2), int(x + w * 0.8), int(y + h * 0.62), int(y + h)
+            mouth = gray[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
             if mouth.size:
                 patch = cv2.resize(mouth, (24, 12)).astype(np.float32)
                 if best["patch"] is not None and best["patch"][0] == i - 1:
@@ -570,48 +615,74 @@ def detect_faces(video, info, start, end):
                 best["patch"] = (i, patch)
 
     scale = W / aw
-    tracks = [{"cx": int(float(np.median(t["cx"])) * scale), "w": int(float(np.median(t["w"])) * scale * 1.6),
-               "seen": t["seen"] / max(1, len(frames)), "motion": t["motion"]}
-              for t in tracks if t["seen"] >= max(3, len(frames) * 0.15)]
-    return {"tracks": tracks, "frames": len(frames), "fps": fps}
+    result["tracks"] = [{"cx": int(float(np.median(t["cx"])) * scale), "w": int(float(np.median(t["w"])) * scale * 1.6),
+                         "seen": t["seen"] / max(1, len(frames)), "motion": t["motion"],
+                         "pos": {k: v * scale for k, v in t["pos"].items()}}
+                        for t in tracks if t["seen"] >= max(3, len(frames) * 0.08)]
+    return result
 
 
 def speaker_segments(det, duration):
-    """Who talks when: [(t0, t1, centre_x)] in clip time, or None for a centre crop.
+    """Framing over time: [(t0, t1, centre_x, keyframes)] in clip time.
 
-    The face whose mouth moves most within each second is treated as the speaker, and switches shorter than two
-    seconds are smoothed away so the framing does not jump around."""
+    Per second the person whose mouth moves most is the speaker; a change of speaker or a camera cut starts a new
+    shot (hard cut, like a real edit), shots shorter than two seconds are merged away. Within a shot the frame
+    follows the person smoothly: one keyframe per second, small moves ignored (dead zone), the rest eased."""
     import numpy as np
 
     if not det or not det["tracks"]:
         return None
     tracks, fps = det["tracks"], det["fps"]
-    if len(tracks) == 1:
-        return [(0.0, duration, tracks[0]["cx"])]
     windows = max(1, int(np.ceil(det["frames"] / fps)))
+    cut_at = {int(c): c for c in det.get("cuts", [])}  # window -> exact cut time
+    cut_wins = set(cut_at)
+    visible = lambda k, rng: any(f in tracks[k]["pos"] for f in rng)
     choice, prev = [], max(range(len(tracks)), key=lambda k: tracks[k]["seen"])
     for wi in range(windows):
         rng = range(wi * fps, (wi + 1) * fps)
-        scores = [sum(t["motion"].get(f, 0) for f in rng) for t in tracks]
+        scores = [sum(t["motion"].get(f, 0) for f in rng) if visible(k, rng) else -1 for k, t in enumerate(tracks)]
         if max(scores) > 0:
             prev = int(np.argmax(scores))
+        elif not visible(prev, rng):  # nobody talks visibly: keep someone who is in the picture
+            vis = [k for k in range(len(tracks)) if visible(k, rng)]
+            prev = max(vis, key=lambda k: tracks[k]["seen"]) if vis else prev
         choice.append(prev)
     runs = []
-    for k in choice:
-        if runs and runs[-1][0] == k:
-            runs[-1][1] += 1
+    for wi, k in enumerate(choice):
+        if runs and runs[-1][0] == k and wi not in cut_wins:
+            runs[-1][2] = wi + 1
         else:
-            runs.append([k, 1])
+            runs.append([k, wi, wi + 1])
     merged = []
-    for k, n in runs:
-        if merged and (n < 2 or merged[-1][0] == k):
-            merged[-1][1] += n
+    for k, a, b in runs:
+        if merged and (b - a < 2 and a not in cut_wins or merged[-1][0] == k and a not in cut_wins):
+            merged[-1][2] = b
         else:
-            merged.append([k, n])
-    segs, t = [], 0.0
-    for k, n in merged:
-        segs.append((t, min(duration, t + n), tracks[k]["cx"]))
-        t += n
+            merged.append([k, a, b])
+
+    W_guess = max(t["cx"] for t in tracks) * 2 or 1
+    segs = []
+    for k, a, b in merged:
+        t = tracks[k]
+        pts, last = [], None
+        for wi in range(a, b):
+            xs = [t["pos"][f] for f in range(wi * fps, (wi + 1) * fps) if f in t["pos"]]
+            if not xs:
+                continue
+            x = float(np.median(xs))
+            if last is not None and abs(x - last) < 0.035 * W_guess:  # dead zone against jitter
+                x = last
+            elif last is not None:
+                x = last + 0.6 * (x - last)  # ease towards the new position
+            pts.append((wi + 0.5, x))
+            last = x
+        t0 = float(cut_at.get(a, a)) if segs else 0.0
+        t1 = float(min(duration, b))
+        if segs:
+            segs[-1] = (segs[-1][0], t0) + segs[-1][2:]
+        if not pts:
+            pts = [(t0, float(t["cx"]))]
+        segs.append((t0, t1, int(pts[0][1]), [(max(t0, min(t1, pt)), int(x)) for pt, x in pts]))
     return segs
 
 
@@ -637,14 +708,25 @@ def crop_box(W, H, ar):
 
 
 def crop_filter(segs, W, H, ar):
+    """Crop that follows the framing: hard switches between shots, linear glides between keyframes within one."""
     cw, ch = crop_box(W, H, ar)
     y = (H - ch) // 2
     if not segs:
         return "crop=%d:%d:%d:%d" % (cw, ch, (W - cw) // 2, y)
-    xs = [int(min(max(0, cx - cw / 2), W - cw)) for _, _, cx in segs]
-    expr = str(xs[-1])
-    for (t0, t1, _), x in reversed(list(zip(segs[:-1], xs[:-1]))):
-        expr = "if(lt(t,%.2f),%d,%s)" % (t1, x, expr)
+    clampx = lambda cx: int(min(max(0, cx - cw / 2), W - cw))
+
+    def seg_expr(seg):
+        pts = seg[3] if len(seg) > 3 and seg[3] else [(seg[0], seg[2])]
+        pts = [(t, clampx(cx)) for t, cx in pts]
+        expr = str(pts[-1][1])
+        for (ta, xa), (tb, xb) in reversed(list(zip(pts[:-1], pts[1:]))):
+            body = str(xa) if xa == xb else "%d+%d*(t-%.2f)/%.2f" % (xa, xb - xa, ta, max(0.01, tb - ta))
+            expr = "if(lt(t,%.2f),%s,%s)" % (tb, body, expr)
+        return "if(lt(t,%.2f),%d,%s)" % (pts[0][0], pts[0][1], expr) if pts[0][0] > seg[0] + 0.01 else expr
+
+    expr = seg_expr(segs[-1])
+    for seg in reversed(segs[:-1]):
+        expr = "if(lt(t,%.2f),%s,%s)" % (seg[1], seg_expr(seg), expr)
     return "crop=%d:%d:'%s':%d" % (cw, ch, expr, y)
 
 
@@ -671,19 +753,52 @@ def hex_to_ass(color, fallback="FFE600"):
     return "&H00%s%s%s" % (c[4:6], c[2:4], c[0:2])
 
 
+# words that belong to what follows: a subtitle line should not end on them
+GLUE = {
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "einem", "einer", "eines", "und", "oder",
+    "aber", "sondern", "mit", "in", "im", "ins", "zu", "zum", "zur", "von", "vom", "für", "auf", "an", "am", "bei",
+    "beim", "nach", "aus", "über", "unter", "vor", "durch", "gegen", "ohne", "um", "als", "wie", "dass", "weil",
+    "wenn", "ob", "nicht", "kein", "keine", "keinen", "sehr", "so", "noch", "schon", "mein", "meine", "meinen",
+    "dein", "deine", "sein", "seine", "ihr", "ihre", "unser", "unsere", "dieser", "diese", "dieses", "diesen",
+    "jeder", "jede", "jedes", "jeden", "the", "a", "an", "of", "to", "and",
+}
+
+
+def _len(ws):
+    return len(" ".join(x["w"] for x in ws))
+
+
 def chunk_words(words, max_words, max_chars=20):
+    """Subtitle lines that break where the meaning allows it.
+
+    Hard breaks at sentence marks and pauses; otherwise a line is full at `max_words`/`max_chars`, but it never
+    ends on an article, preposition or conjunction, and names (capitalised words in a row) stay together.
+    Lines that would only flash up for a moment are merged with the next one."""
     chunks, cur = [], []
     for w in words:
         if cur:
-            gap = w["s"] - cur[-1]["e"]
-            length = len(" ".join(x["w"] for x in cur + [w]))
-            if len(cur) >= max_words or length > max_chars or gap > 0.6 or cur[-1]["w"][-1:] in ".!?,;:":
+            prev = cur[-1]
+            hard = w["s"] - prev["e"] > 0.6 or prev["w"][-1:] in ".!?,;:"
+            full = len(cur) >= max_words or _len(cur + [w]) > max_chars
+            name = (len(cur) >= 2 or not chunks) and prev["w"][:1].isupper() and w["w"][:1].isupper() \
+                and norm_word(prev["w"]) not in GLUE and _len(cur + [w]) <= max_chars + 10
+            if hard or (full and not name):
+                carry = []
+                if not hard and len(cur) > 1 and norm_word(cur[-1]["w"]) in GLUE:
+                    carry = [cur.pop()]
                 chunks.append(cur)
-                cur = []
+                cur = carry
         cur.append(w)
     if cur:
         chunks.append(cur)
-    return chunks
+    merged = []
+    for ch in chunks:  # a line shown for less than ~0.45 s cannot be read: join it with the previous one
+        if merged and ch[-1]["e"] - ch[0]["s"] < 0.45 and merged[-1][-1]["w"][-1:] not in ".!?" \
+                and ch[0]["s"] - merged[-1][-1]["e"] < 0.3 and _len(merged[-1] + ch) <= max_chars + 8:
+            merged[-1] = merged[-1] + ch
+        else:
+            merged.append(ch)
+    return merged
 
 
 def clip_words(segments, start, end):
@@ -825,42 +940,83 @@ def zoom_filter(spans, ow, oh, amount=0.1):
 
 # ---------------------------------------------------------------- rendering
 
-def select_expr(intervals):
-    return "+".join("between(t,%.3f,%.3f)" % (a, b) for a, b in intervals)
+def out_fps(info):
+    """Keep the source frame rate (24-60 fps) instead of forcing 30."""
+    return int(min(60, max(24, round(info.get("fps") or 30))))
+
+
+def quantize(intervals, fps):
+    """Snap cut points to whole frames so picture and sound are cut at exactly the same place (no drift)."""
+    out = []
+    for a, b in intervals:
+        a, b = round(a * fps) / fps, round(b * fps) / fps
+        if b - a >= 1 / fps:
+            out.append((a, b))
+    return out
+
+
+def select_expr(intervals, fps=30):
+    h = 0.5 / fps  # frame k (at k/fps) belongs to [a, b) -> exactly (b-a)*fps frames per part
+    return "+".join("between(t,%.4f,%.4f)" % (a - h, b - h) for a, b in intervals)
+
+
+SCALE = "flags=lanczos"
+SHARPEN = "unsharp=5:5:0.55:5:5:0.0"  # a touch of luma sharpening after enlarging the crop
 
 
 def video_chain(info, mode, crop_segs, sel, ow, oh, split=None):
     w, h = info["width"], info["height"]
+    fps = out_fps(info)
     if split:  # two people stacked: left person on top, right person below, thin line in between
         hh = oh // 2
         cw, ch = crop_box(w, h, ow / hh)
         y = (h - ch) // 2
         xs = [int(min(max(0, cx - cw / 2), w - cw)) for cx in split]
         return (
-            "[0:v]fps=30,split=2[pa][pb];"
-            "[pa]crop=%d:%d:%d:%d,scale=%d:%d,setsar=1[top];"
-            "[pb]crop=%d:%d:%d:%d,scale=%d:%d,setsar=1[bot];"
-            "[top][bot]vstack=inputs=2,drawbox=x=0:y=%d:w=%d:h=6:color=black@0.7:t=fill%s"
-            % (cw, ch, xs[0], y, ow, hh, cw, ch, xs[1], y, ow, oh - hh, hh - 3, ow, sel)
+            "[0:v]fps=%d,split=2[pa][pb];"
+            "[pa]crop=%d:%d:%d:%d,scale=%d:%d:%s,setsar=1[top];"
+            "[pb]crop=%d:%d:%d:%d,scale=%d:%d:%s,setsar=1[bot];"
+            "[top][bot]vstack=inputs=2,%s,drawbox=x=0:y=%d:w=%d:h=6:color=black@0.7:t=fill%s"
+            % (fps, cw, ch, xs[0], y, ow, hh, SCALE, cw, ch, xs[1], y, ow, oh - hh, SCALE, SHARPEN, hh - 3, ow, sel)
         )
     if mode == "blur" and w / h > ow / oh + 0.01:
         return (
-            "[0:v]fps=30" + sel + ",split=2[a][b];"
+            "[0:v]fps=%d" % fps + sel + ",split=2[a][b];"
             "[a]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,boxblur=24:3,eq=brightness=-0.08[bg];"
-            "[b]scale=%d:%d:force_original_aspect_ratio=decrease[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1" % (ow, oh, ow, oh, ow, oh)
+            "[b]scale=%d:%d:force_original_aspect_ratio=decrease:%s[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1" % (ow, oh, ow, oh, ow, oh, SCALE)
         )
     crop = crop_filter(crop_segs if mode == "auto" else None, w, h, ow / oh)
-    return "[0:v]fps=30," + crop + sel + ",scale=%d:%d,setsar=1" % (ow, oh)
+    return "[0:v]fps=%d," % fps + crop + sel + ",scale=%d:%d:%s,%s,setsar=1" % (ow, oh, SCALE, SHARPEN)
+
+
+RNNOISE = os.environ.get("RNNOISE_MODEL", "/opt/models/sh.rnnn")
+
+
+def filter_path(path):
+    return "'" + path.replace("\\", "/").replace(":", "\\:") + "'"
 
 
 def audio_chain(intervals, cut, enhance, music, music_volume):
-    """Voice clean-up (rumble, noise, sibilance, levelling) and optional background music that ducks under speech."""
-    a = "[0:a]aformat=sample_rates=48000:channel_layouts=stereo"
-    if cut:
-        a += ",aselect='%s',asetpts=N/SR/TB" % select_expr(intervals)
+    """Voice clean-up (rumble, AI noise reduction, sibilance, levelling), soft 12 ms fades at every cut so the
+    pause cutter never clicks, and optional background music that ducks under speech."""
+    head = "[0:a]aformat=sample_rates=48000:channel_layouts=stereo"
+    if cut and len(intervals) > 1:
+        n = len(intervals)
+        parts = [head + ",asplit=%d%s" % (n, "".join("[s%d]" % i for i in range(n)))]
+        for i, (a, b) in enumerate(intervals):
+            ln = b - a
+            fade = ",afade=t=in:st=0:d=0.012,afade=t=out:st=%.4f:d=0.012" % (ln - 0.012) if ln > 0.05 else ""
+            parts.append("[s%d]atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS%s[p%d]" % (i, a, b, fade, i))
+        parts.append("%sconcat=n=%d:v=0:a=1" % ("".join("[p%d]" % i for i in range(n)), n))
+        a = ";".join(parts)
+    elif cut:
+        a = head + ",atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS" % intervals[0]
+    else:
+        a = head
     if enhance:
-        a += ",highpass=f=80,afftdn=nf=-25,deesser=i=0.4,acompressor=threshold=-20dB:ratio=3:attack=5:release=150"
+        denoise = ("arnndn=m=%s:mix=0.85" % filter_path(RNNOISE)) if os.path.exists(RNNOISE) else "afftdn=nf=-25"
+        a += ",highpass=f=80," + denoise + ",deesser=i=0.4,acompressor=threshold=-20dB:ratio=3:attack=5:release=150"
     if music:
         a += (",asplit=2[vs][vm];"
               "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=%.2f[m];"
@@ -872,14 +1028,15 @@ def audio_chain(intervals, cut, enhance, music, music_volume):
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
                 size=(1080, 1920), zoom_spans_out=None, music=None, split=None):
     ow, oh = size
+    fps = out_fps(info)
     duration = end - start
     cut = bool(intervals) and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
-    sel = (",select='%s',setpts=N/30/TB" % select_expr(intervals)) if cut else ""
+    sel = (",select='%s',setpts=N/%d/TB" % (select_expr(intervals, fps), fps)) if cut else ""
     graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh, split)
     if style.get("zoom", True) and zoom_spans_out and not split:
         graph += zoom_filter(zoom_spans_out, ow, oh)
     graph += ((",ass=" + ass_name) if burn else "") + "[v]"
-    cmd = [FFMPEG, "-y", "-ss", "%.2f" % start, "-t", "%.2f" % duration, "-i", video]
+    cmd = [FFMPEG, "-y", "-ss", "%.3f" % start, "-t", "%.3f" % duration, "-i", video]
     has_audio = info.get("has_audio", True)
     if has_audio:
         if music:
@@ -887,9 +1044,9 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
         graph += ";" + audio_chain(intervals, cut, style.get("enhance_audio", True), music,
                                    int(style.get("music_volume", 15)))
     out = name + ".mp4"
-    cmd += ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]", "-c:a", "aac", "-b:a", "160k", "-ar", "48000"] if has_audio else [])
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", "30",
-            "-shortest", "-movflags", "+faststart", "-threads", str(THREADS), out]
+    cmd += ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if has_audio else [])
+    cmd += ["-c:v", "libx264", "-preset", "faster", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-r", str(fps), "-shortest", "-movflags", "+faststart", "-threads", str(THREADS), out]
     run(cmd, cwd=workdir)
     return sum(b - a for a, b in intervals) if cut else duration
 
@@ -1307,12 +1464,17 @@ def quality_checks(workdir, name, info, segments, start, end, det, crop_segs, mo
         if w["s"] + 0.08 < end < w["e"] - 0.08:
             out.append({"level": "warn", "msg": "Endet mitten im Wort „%s“." % w["w"]})
     landscape = info["width"] / info["height"] > 9 / 16 + 0.01
+    crop_w = crop_box(info["width"], info["height"], 9 / 16)[0]
+    if landscape and mode in ("auto", "crop") and not split and crop_w < 700:
+        out.append({"level": "warn", "msg": "Für Hochformat stehen nur %d Pixel Breite zur Verfügung (wird auf 1080 hochgerechnet). "
+                                            "Schärfer wird es mit 4K-Aufnahmen oder direkt im Hochformat." % crop_w})
     if landscape and mode == "auto" and not split:
         if not det or not det["tracks"]:
             out.append({"level": "info", "msg": "Kein Gesicht erkannt – Bildmitte verwendet. Bei Bedarf Ausschnitt von Hand setzen."})
         elif crop_segs:
             cw, _ = crop_box(info["width"], info["height"], 9 / 16)
-            for t0, _, cx in crop_segs:
+            for seg in crop_segs:
+                t0, cx = seg[0], seg[2]
                 x = min(max(0, cx - cw / 2), info["width"] - cw)
                 for t in det["tracks"]:
                     if t["seen"] < 0.25:
@@ -1469,3 +1631,85 @@ def fcpxml(project_name, source_name, info, clips):
         parts.append("      </spine></sequence></project>")
     parts += ["    </event>", "  </library>", "</fcpxml>"]
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------- word-exact timing (forced alignment)
+
+_ALIGNER = {}
+
+
+def _aligner():
+    """Meta MMS forced aligner from torchaudio (multilingual wav2vec2), loaded once and kept until released."""
+    if not _ALIGNER:
+        import torch
+        import torchaudio
+
+        torch.set_num_threads(THREADS)
+        bundle = torchaudio.pipelines.MMS_FA
+        _ALIGNER.update(model=bundle.get_model(with_star=False).eval(), dictionary=bundle.get_dict(star=None),
+                        align=bundle.get_aligner(), tokenizer=bundle.get_tokenizer(), rate=bundle.sample_rate)
+    return _ALIGNER
+
+
+def release_aligner():
+    _ALIGNER.clear()
+    gc.collect()
+
+
+def _roman(word):
+    w = word.lower().replace("ä", "a").replace("ö", "o").replace("ü", "u").replace("ß", "ss")
+    return re.sub(r"[^a-z']", "", w)
+
+
+def align_words(video, words, start, end):
+    """Re-time words (absolute seconds) between start and end against the audio itself.
+
+    Whisper's word times are often off by one or two tenths of a second; the aligner finds where each word's sounds
+    actually are. Words without letters (numbers) or implausible results keep their original times."""
+    import numpy as np
+    import torch
+
+    al = _aligner()
+    lo, hi = max(0.0, start - 0.4), end + 0.4
+    p = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.3f" % lo, "-t", "%.3f" % (hi - lo), "-i", video, "-vn", "-ac", "1",
+                        "-ar", str(al["rate"]), "-f", "s16le", "-"], capture_output=True)
+    if p.returncode != 0 or not p.stdout:
+        return words
+    wave_ = torch.from_numpy(np.frombuffer(p.stdout, np.int16).astype(np.float32) / 32768.0).unsqueeze(0)
+    idx = [i for i, w in enumerate(words) if _roman(w["w"])]
+    if not idx:
+        return words
+    with torch.inference_mode():
+        emission, _ = al["model"](wave_)
+        spans = al["align"](emission[0], al["tokenizer"]([_roman(words[i]["w"]) for i in idx]))
+    sec = wave_.size(1) / emission.size(1) / al["rate"]
+    out = [dict(w) for w in words]
+    for i, sp in zip(idx, spans):
+        if not sp:
+            continue
+        s_, e_ = lo + sp[0].start * sec, lo + sp[-1].end * sec
+        if abs(s_ - words[i]["s"]) < 0.7 and abs(e_ - words[i]["e"]) < 0.7 and e_ > s_:
+            out[i]["s"], out[i]["e"] = round(s_, 3), round(e_, 3)
+    for a, b in zip(out, out[1:]):  # keep the order strict after re-timing
+        if b["s"] < a["s"]:
+            b["s"] = a["s"]
+        b["e"] = max(b["e"], b["s"] + 0.03)
+    return out
+
+
+# ---------------------------------------------------------------- AI final check
+
+def visual_check(api_key, video_path, out_len, hook, title, text):
+    """Claude looks at three stills of the finished clip and reports visible problems."""
+    frames = [frame_jpeg(video_path, out_len * f, 540) for f in (0.12, 0.5, 0.85)]
+    prompt = (
+        "Du prüfst ein fertig geschnittenes Kurzvideo im Hochformat 9:16 anhand von drei Standbildern (Anfang, Mitte, "
+        "Ende). Oben steht in den ersten Sekunden der Hook-Text „%s“, unten bzw. mittig laufen Untertitel.\n"
+        "Titel: %s\nGesprochener Text: %s\n\n"
+        "Melde nur echte, sichtbare Probleme, zum Beispiel: Person oder Kopf angeschnitten oder außerhalb des Bildes, "
+        "Untertitel oder Hook-Text abgeschnitten, verdeckt oder schlecht lesbar, Bild deutlich unscharf, zu dunkel oder "
+        "überbelichtet, Hook-Text passt nicht zum Inhalt. Wenn alles in Ordnung ist, gib eine leere Liste zurück.\n"
+        "Antworte NUR mit JSON: {\"issues\": [\"kurzer Hinweis auf Deutsch\"]}"
+    ) % (hook[:200], title[:200], text[:1500])
+    res = claude_json(api_key, prompt, max_tokens=800, feature="Endkontrolle", images=frames)
+    return [str(i)[:200] for i in (res.get("issues") or []) if str(i).strip()][:5]

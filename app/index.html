@@ -299,7 +299,7 @@ function renderHome(){
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
       '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("split",d.mode,"Geteilt bei 2 Personen")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
     '</div>'+
-    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_two_stage",d.two_stage,"Gründliche KI-Auswahl (2 Durchgänge)")+chk("o_reuse_transcript",d.reuse_transcript,"Transkript wiederverwenden, wenn das Video schon verarbeitet wurde")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
+    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_two_stage",d.two_stage,"Gründliche KI-Auswahl (2 Durchgänge)")+chk("o_reuse_transcript",d.reuse_transcript,"Transkript wiederverwenden, wenn das Video schon verarbeitet wurde")+chk("o_precise_timing",d.precise_timing,"Wortgenaue Zeitstempel")+chk("o_ai_check",d.ai_check,"KI-Endkontrolle mit Standbildern")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
     '<details><summary>Untertitel, Hook und Qualität</summary><div class="grid">'+
       '<div><label>Untertitel-Stil</label><select id="o_sub_style">'+opt("pop",d.sub_style,"Pop – Wort für Wort")+opt("box",d.sub_style,"Box – mit Hintergrund")+opt("minimal",d.sub_style,"Minimal")+opt("satz",d.sub_style,"Ganze Sätze")+'</select></div>'+
       '<div><label>Hervorhebung (aktives Wort)</label><input id="o_highlight" type="color" value="'+d.highlight+'"></div>'+
@@ -308,7 +308,7 @@ function renderHome(){
       '<div><label>Wörter pro Zeile</label><input id="o_words_per_line" type="number" min="1" max="6" value="'+d.words_per_line+'"></div>'+
       '<div><label>Position</label><select id="o_position">'+opt("unten",d.position,"Unteres Drittel")+opt("mitte",d.position,"Mitte")+opt("oben",d.position,"Oben")+'</select></div>'+
       '<div><label>Hook-Dauer (Sek.)</label><input id="o_hook_seconds" type="number" min="1" max="10" value="'+d.hook_seconds+'"></div>'+
-      '<div><label>Spracherkennung</label><select id="o_quality">'+opt("schnell",d.quality,"Schnell")+opt("ausgewogen",d.quality,"Ausgewogen")+opt("genau",d.quality,"Genau (langsam)")+'</select></div>'+
+      '<div><label>Spracherkennung</label><select id="o_quality">'+opt("schnell",d.quality,"Schnell")+opt("ausgewogen",d.quality,"Ausgewogen")+opt("genau",d.quality,"Genau – large-v3-turbo (ca. doppelte Zeit)")+'</select></div>'+
       '<div><label>&nbsp;</label>'+chk("o_uppercase",d.uppercase,"GROSSBUCHSTABEN")+'</div>'+
     '</div></details>'+
     '<details><summary>Musik und Formate</summary><div class="grid">'+
@@ -332,7 +332,7 @@ function renderHome(){
 
 function readOpts(){
   var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript"].forEach(function(k){o[k]=$("o_"+k).checked});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
