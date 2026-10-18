@@ -496,11 +496,11 @@ def remap_words(words, intervals):
 
 # ---------------------------------------------------------------- speaker tracking
 
-def track_speaker(video, info, start, end):
-    """Find who is talking and return [(t0, t1, centre_x)] in clip time (source pixels), or None for a centre crop.
+def detect_faces(video, info, start, end):
+    """Faces on 5 frames per second, grouped into one track per person (by horizontal position).
 
-    Faces are detected on a few frames per second; the face whose mouth area moves most within each second
-    is treated as the speaker, and short switches are smoothed away so the framing does not jump around."""
+    Returns {"tracks": [{"cx", "w", "seen", "motion"}], "frames", "fps"} with positions in source pixels and
+    `motion` = mouth movement per frame, or None for portrait sources and when nothing could be decoded."""
     import cv2
     import numpy as np
 
@@ -522,7 +522,7 @@ def track_speaker(video, info, start, end):
     profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
     min_size = (max(20, ah // 9),) * 2
 
-    tracks = []  # {"cx": [..], "last": x, "seen": n, "motion": {frame: v}, "patch": (frame, arr)}
+    tracks = []  # {"cx": [..], "w": [..], "last": x, "seen": n, "motion": {frame: v}, "patch": (frame, arr)}
     for i, img in enumerate(frames):
         faces = list(frontal.detectMultiScale(img, 1.1, 5, minSize=min_size))
         if not faces:
@@ -532,10 +532,11 @@ def track_speaker(video, info, start, end):
             cx = x + w / 2
             best = min((t for t in tracks if id(t) not in used), key=lambda t: abs(t["last"] - cx), default=None)
             if best is None or abs(best["last"] - cx) > 0.12 * aw:
-                best = {"cx": [], "last": cx, "seen": 0, "motion": {}, "patch": None}
+                best = {"cx": [], "w": [], "last": cx, "seen": 0, "motion": {}, "patch": None}
                 tracks.append(best)
             used.add(id(best))
             best["cx"].append(cx)
+            best["w"].append(w)
             best["last"] = cx
             best["seen"] += 1
             mouth = img[y + int(h * 0.62): y + h, x + int(w * 0.2): x + int(w * 0.8)]
@@ -545,18 +546,26 @@ def track_speaker(video, info, start, end):
                     best["motion"][i] = float(np.mean(np.abs(patch - best["patch"][1])))
                 best["patch"] = (i, patch)
 
-    tracks = [t for t in tracks if t["seen"] >= max(3, len(frames) * 0.15)]
-    if not tracks:
+    scale = W / aw
+    tracks = [{"cx": int(float(np.median(t["cx"])) * scale), "w": int(float(np.median(t["w"])) * scale * 1.6),
+               "seen": t["seen"] / max(1, len(frames)), "motion": t["motion"]}
+              for t in tracks if t["seen"] >= max(3, len(frames) * 0.15)]
+    return {"tracks": tracks, "frames": len(frames), "fps": fps}
+
+
+def speaker_segments(det, duration):
+    """Who talks when: [(t0, t1, centre_x)] in clip time, or None for a centre crop.
+
+    The face whose mouth moves most within each second is treated as the speaker, and switches shorter than two
+    seconds are smoothed away so the framing does not jump around."""
+    import numpy as np
+
+    if not det or not det["tracks"]:
         return None
-
-    def centre(track):
-        return int(float(np.median(track["cx"])) * W / aw)
-
-    duration = end - start
+    tracks, fps = det["tracks"], det["fps"]
     if len(tracks) == 1:
-        return [(0.0, duration, centre(tracks[0]))]
-
-    windows = max(1, int(np.ceil(len(frames) / fps)))
+        return [(0.0, duration, tracks[0]["cx"])]
+    windows = max(1, int(np.ceil(det["frames"] / fps)))
     choice, prev = [], max(range(len(tracks)), key=lambda k: tracks[k]["seen"])
     for wi in range(windows):
         rng = range(wi * fps, (wi + 1) * fps)
@@ -564,7 +573,6 @@ def track_speaker(video, info, start, end):
         if max(scores) > 0:
             prev = int(np.argmax(scores))
         choice.append(prev)
-    # merge runs shorter than two seconds into the previous shot
     runs = []
     for k in choice:
         if runs and runs[-1][0] == k:
@@ -579,9 +587,23 @@ def track_speaker(video, info, start, end):
             merged.append([k, n])
     segs, t = [], 0.0
     for k, n in merged:
-        segs.append((t, min(duration, t + n), centre(tracks[k])))
+        segs.append((t, min(duration, t + n), tracks[k]["cx"]))
         t += n
     return segs
+
+
+def split_pair(det):
+    """The two most visible people, left one first – for the split-screen layout; None if fewer than two."""
+    if not det or len(det["tracks"]) < 2:
+        return None
+    a, b = sorted(sorted(det["tracks"], key=lambda t: -t["seen"])[:2], key=lambda t: t["cx"])
+    if b["seen"] < 0.25 or a["seen"] < 0.25:  # the second person is hardly ever in the picture
+        return None
+    return a["cx"], b["cx"]
+
+
+def track_speaker(video, info, start, end):
+    return speaker_segments(detect_faces(video, info, start, end), end - start)
 
 
 def crop_box(W, H, ar):
@@ -667,6 +689,8 @@ def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, k
     kw_col = hex_to_ass(style.get("keyword_color", "#4ADE80"), "4ADE80")
     fs = int(style.get("font_size", 78)) * max(0.72, k)
     margin_v = int({"unten": 0.22, "mitte": 0.45, "oben": 0.70}.get(style.get("position", "unten"), 0.22) * ph)
+    if style.get("split_layout"):  # split screen: subtitles sit on the seam between the two people
+        margin_v = int(0.455 * ph)
     max_words = int(style.get("words_per_line", 3))
     keys = {norm_word(x) for kw in keywords for x in str(kw).split() if norm_word(x)}
 
@@ -782,8 +806,20 @@ def select_expr(intervals):
     return "+".join("between(t,%.3f,%.3f)" % (a, b) for a, b in intervals)
 
 
-def video_chain(info, mode, crop_segs, sel, ow, oh):
+def video_chain(info, mode, crop_segs, sel, ow, oh, split=None):
     w, h = info["width"], info["height"]
+    if split:  # two people stacked: left person on top, right person below, thin line in between
+        hh = oh // 2
+        cw, ch = crop_box(w, h, ow / hh)
+        y = (h - ch) // 2
+        xs = [int(min(max(0, cx - cw / 2), w - cw)) for cx in split]
+        return (
+            "[0:v]fps=30,split=2[pa][pb];"
+            "[pa]crop=%d:%d:%d:%d,scale=%d:%d,setsar=1[top];"
+            "[pb]crop=%d:%d:%d:%d,scale=%d:%d,setsar=1[bot];"
+            "[top][bot]vstack=inputs=2,drawbox=x=0:y=%d:w=%d:h=6:color=black@0.7:t=fill%s"
+            % (cw, ch, xs[0], y, ow, hh, cw, ch, xs[1], y, ow, oh - hh, hh - 3, ow, sel)
+        )
     if mode == "blur" and w / h > ow / oh + 0.01:
         return (
             "[0:v]fps=30" + sel + ",split=2[a][b];"
@@ -811,13 +847,13 @@ def audio_chain(intervals, cut, enhance, music, music_volume):
 
 
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
-                size=(1080, 1920), zoom_spans_out=None, music=None):
+                size=(1080, 1920), zoom_spans_out=None, music=None, split=None):
     ow, oh = size
     duration = end - start
     cut = bool(intervals) and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
     sel = (",select='%s',setpts=N/30/TB" % select_expr(intervals)) if cut else ""
-    graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh)
-    if style.get("zoom", True) and zoom_spans_out:
+    graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh, split)
+    if style.get("zoom", True) and zoom_spans_out and not split:
         graph += zoom_filter(zoom_spans_out, ow, oh)
     graph += ((",ass=" + ass_name) if burn else "") + "[v]"
     cmd = [FFMPEG, "-y", "-ss", "%.2f" % start, "-t", "%.2f" % duration, "-i", video]
@@ -1216,3 +1252,128 @@ def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context,
     if refined:
         log("KI-Feinschnitt: %d Clips verfeinert%s" % (len(out) - dropped, (", %d verworfen" % dropped) if dropped else ""))
     return out
+
+
+# ---------------------------------------------------------------- quality check
+
+def volume_stats(workdir, name):
+    p = subprocess.run([FFMPEG, "-hide_banner", "-i", name, "-vn", "-af", "volumedetect", "-f", "null", "-"], cwd=workdir,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    mean = re.search(r"mean_volume: (-?[\d.]+) dB", p.stderr)
+    peak = re.search(r"max_volume: (-?[\d.]+) dB", p.stderr)
+    return (float(mean.group(1)) if mean else None), (float(peak.group(1)) if peak else None)
+
+
+def quality_checks(workdir, name, info, segments, start, end, det, crop_segs, mode, split_wanted, split, out_len):
+    """Automatic checks of a rendered clip; returns a list of {"level": "warn"|"info", "msg": ...}."""
+    out = []
+    if not info.get("has_audio", True):
+        out.append({"level": "warn", "msg": "Das Video hat keine Tonspur."})
+    else:
+        mean, peak = volume_stats(workdir, name)
+        if mean is not None and mean < -28:
+            out.append({"level": "warn", "msg": "Ton sehr leise (%.0f dB im Mittel)." % mean})
+        if peak is not None and peak >= -0.1:
+            out.append({"level": "warn", "msg": "Ton übersteuert – Spitzen erreichen 0 dB."})
+    if out_len < 5:
+        out.append({"level": "warn", "msg": "Clip ist nach dem Schnitt nur %.0f s lang." % out_len})
+    for w in all_words(segments):  # cut points inside a word
+        if w["s"] + 0.08 < start < w["e"] - 0.08:
+            out.append({"level": "warn", "msg": "Beginnt mitten im Wort „%s“." % w["w"]})
+        if w["s"] + 0.08 < end < w["e"] - 0.08:
+            out.append({"level": "warn", "msg": "Endet mitten im Wort „%s“." % w["w"]})
+    landscape = info["width"] / info["height"] > 9 / 16 + 0.01
+    if landscape and mode == "auto" and not split:
+        if not det or not det["tracks"]:
+            out.append({"level": "info", "msg": "Kein Gesicht erkannt – Bildmitte verwendet. Bei Bedarf Ausschnitt von Hand setzen."})
+        elif crop_segs:
+            cw, _ = crop_box(info["width"], info["height"], 9 / 16)
+            for t0, _, cx in crop_segs:
+                x = min(max(0, cx - cw / 2), info["width"] - cw)
+                for t in det["tracks"]:
+                    if t["seen"] < 0.25:
+                        continue
+                    left, right = t["cx"] - t["w"] / 2, t["cx"] + t["w"] / 2
+                    if left < x < right or left < x + cw < right:
+                        out.append({"level": "warn", "msg": "Person am Bildrand angeschnitten (ab %s)." % fmt_time(t0)})
+                        break
+                else:
+                    continue
+                break
+    if split_wanted and not split and landscape:
+        out.append({"level": "info", "msg": "Geteilter Bildschirm nicht möglich – keine zwei Personen erkannt, normaler Zuschnitt verwendet."})
+    return out
+
+
+def spelling_check(api_key, texts, vocabulary=""):
+    """Likely recognition or spelling errors in subtitle texts: {clip_index: [{"wrong", "suggestion"}]}."""
+    if not texts:
+        return {}
+    vocab = ("\nRichtig geschriebene Fachbegriffe und Namen: " + vocabulary.strip()) if vocabulary.strip() else ""
+    prompt = (
+        "Die folgenden Untertitel stammen aus automatischer Spracherkennung eines deutschsprachigen Videos.%s\n"
+        "Finde nur echte Fehler: falsch erkannte Wörter, Rechtschreibfehler, falsch geschriebene Namen oder Marken. "
+        "Ignoriere Umgangssprache, fehlende Kommas und Stil. \"wrong\" muss wörtlich im Text vorkommen (1-3 Wörter).\n"
+        "Antworte NUR mit JSON: {\"0\": [{\"wrong\": \"...\", \"suggestion\": \"...\"}], \"1\": []}\n\n%s"
+    ) % (vocab, "\n\n".join("### %s\n%s" % (k, t) for k, t in texts.items()))
+    res = claude_json(api_key, prompt, max_tokens=3000)
+    out = {}
+    for k, items in (res or {}).items():
+        try:
+            idx = int(k)
+        except ValueError:
+            continue
+        good = [{"wrong": str(i["wrong"]), "suggestion": str(i["suggestion"])} for i in items or []
+                if isinstance(i, dict) and i.get("wrong") and i.get("suggestion") and str(i["wrong"]) in texts.get(idx, "")
+                and str(i["wrong"]) != str(i["suggestion"])]
+        out[idx] = good[:10]
+    return out
+
+
+# ---------------------------------------------------------------- text content
+
+def generate_texts(api_key, segments, context="", titles=()):
+    """YouTube chapters, a LinkedIn post, a blog/newsletter text and carousel slides from the whole transcript."""
+    lines = "\n".join("[%s] %s" % (fmt_time(s["s"]), s["text"]) for s in segments)
+    extra = ("\nKontext vom Ersteller: " + context.strip()) if context and context.strip() else ""
+    prompt = (
+        "Hier ist das Transkript eines deutschsprachigen Videos mit Zeitstempeln (Minuten:Sekunden).%s\n"
+        "Erstelle daraus Inhalte für die Verwertung auf anderen Kanälen, auf Deutsch, im Stil und mit den Aussagen des "
+        "Sprechers (nichts erfinden):\n"
+        "1. chapters: YouTube-Kapitel, das erste bei 0:00, mindestens 3, sinnvolle Abschnitte mit mind. 30 s Abstand, "
+        "kurze Titel (max. 6 Wörter).\n"
+        "2. linkedin: LinkedIn-Beitrag (120-200 Wörter): starke erste Zeile, kurze Absätze, eine Frage am Ende, 3 Hashtags.\n"
+        "3. blog: Blog- bzw. Newsletter-Artikel mit title und text (300-500 Wörter, Zwischenüberschriften mit ##).\n"
+        "4. carousel: 6-8 Folien für ein Instagram-Karussell, je title (max. 6 Wörter) und text (max. 25 Wörter); "
+        "Folie 1 ist der Aufhänger, die letzte eine Aufforderung.\n"
+        "Antworte NUR mit JSON: {\"chapters\": [{\"time\": \"0:00\", \"title\": \"...\"}], \"linkedin\": \"...\", "
+        "\"blog\": {\"title\": \"...\", \"text\": \"...\"}, \"carousel\": [{\"title\": \"...\", \"text\": \"...\"}]}\n\n"
+        "TRANSKRIPT:\n%s"
+    ) % (extra, lines)
+    res = claude_json(api_key, prompt, max_tokens=6000)
+
+    def secs(t):
+        parts = [float(x) for x in str(t).split(":")]
+        return sum(v * 60 ** k for k, v in enumerate(reversed(parts)))
+
+    chapters, last = [], -999
+    for c in sorted(res.get("chapters") or [], key=lambda c: secs(c.get("time", 0))):
+        try:
+            t = secs(c.get("time", 0))
+        except ValueError:
+            continue
+        if not chapters:
+            t = 0
+        if t - last >= 10 and c.get("title"):
+            chapters.append({"time": fmt_time(t), "title": str(c["title"])[:80]})
+            last = t
+    if len(chapters) < 3:
+        chapters = []
+    blog = res.get("blog") or {}
+    return {
+        "chapters": chapters,
+        "linkedin": str(res.get("linkedin") or ""),
+        "blog": {"title": str(blog.get("title") or ""), "text": str(blog.get("text") or "")},
+        "carousel": [{"title": str(s.get("title", "")), "text": str(s.get("text", ""))}
+                     for s in (res.get("carousel") or []) if isinstance(s, dict)][:10],
+    }

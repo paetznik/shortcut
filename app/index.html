@@ -108,6 +108,13 @@ body.safe .sz{display:block}
 .tr{display:flex;flex-direction:column;gap:6px;border-top:1px solid var(--line);padding-top:8px}
 .tl{width:100%;height:90px;display:block;margin-top:8px}
 .crit{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-size:12px}
+.qc{display:flex;flex-direction:column;gap:4px;font-size:13px;background:var(--panel2);border-radius:8px;padding:8px 10px}
+.qw{color:var(--accent2)}.qi{color:var(--muted)}
+.qs{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.qs s{color:var(--err)}
+details.txt{border-top:1px solid var(--line);padding:8px 0}
+details.txt summary{display:flex;justify-content:space-between;align-items:center;margin:0;color:var(--text)}
+details.txt pre{white-space:pre-wrap;font:14px/1.55 inherit;font-family:inherit;margin:8px 0 0;color:var(--text);background:var(--bg);border-radius:8px;padding:10px 12px}
 .crit div{display:flex;align-items:center;gap:6px}
 .crit span{width:76px;color:var(--muted)}
 .crit i{flex:1;height:5px;background:var(--panel2);border-radius:9px;overflow:hidden}
@@ -277,7 +284,7 @@ function renderHome(){
       '<div><label>Anzahl Clips</label><input id="o_clips" type="number" min="1" max="15" value="'+d.clips+'"></div>'+
       '<div><label>Länge min. (Sek.)</label><input id="o_min_len" type="number" min="5" max="170" value="'+d.min_len+'"></div>'+
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
-      '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
+      '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("split",d.mode,"Geteilt bei 2 Personen")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
     '</div>'+
     '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_two_stage",d.two_stage,"Gründliche KI-Auswahl (2 Durchgänge)")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
     '<details><summary>Untertitel, Hook und Qualität</summary><div class="grid">'+
@@ -432,6 +439,7 @@ function renderJob(){
   if(j.status==="fehler") html+='<div class="hint" style="margin-top:14px;background:#2a1616;border-color:#5a2525;color:#ffb3b3">'+esc(j.message)+'</div>';
   if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Hook, Titelbild-Text und Untertitel jedes Clips. Wörter anklicken schneidet sie heraus, Tippfehler korrigierst du im Textfeld. Dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
   html+=energyTimeline(j);
+  html+=textsCard(j);
   html+=bestofCard(j);
   html+='<div class="clips">'+(j.clips||[]).map(function(c,i){
     var done=c.file&&c.status==="fertig";
@@ -442,7 +450,7 @@ function renderJob(){
     var pz=c.postiz?'<div class="tag">✓ An Postiz gesendet'+(c.postiz.now?' (sofort)':' – geplant für '+new Date(c.postiz.date*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"}))+(c.postiz.channels&&c.postiz.channels.length?': '+esc(c.postiz.channels.join(", ")):'')+'</div>':'';
     var f=c.formats||{},dl=function(file,label,cls){return '<a class="btn sm'+(cls||"")+'" href="/files/'+j.id+'/'+file+'?dl=1">'+label+'</a>'};
     return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+(c.variant_of!=null?' · Variante von Clip '+(c.variant_of+1):'')+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
-      lengthNote(outLen)+audioBadge(c)+criteriaUI(c)+
+      lengthNote(outLen)+audioBadge(c)+criteriaUI(c)+checksUI(c,i)+
       '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
       (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+pz+
       (done&&!review?'<div class="row" style="margin-top:auto;gap:8px">'+dl(c.file,"MP4 9:16"," primary")+(f["4x5"]?dl(f["4x5"],"4:5"):'')+(f["1x1"]?dl(f["1x1"],"1:1"):'')+(c.cover?dl(c.cover,"Titelbild"):'')+dl(c.srt,"SRT")+
@@ -529,6 +537,43 @@ function cropTime(i){
 }
 function delCropKey(i,n){cropState(i).keys.splice(n,1);$("ck"+i).innerHTML=cropList(i)}
 function clearCrop(i){cropState(i).keys=[];$("ck"+i).innerHTML=cropList(i);toast("Bildausschnitt wieder automatisch – Speichern nicht vergessen")}
+
+// ---------------------------------------------------------------- quality check
+function checksUI(c,i){
+  var ch=c.checks||[],sp=c.spelling||[];
+  if(!ch.length&&!sp.length) return c.checks?'<div class="small" style="color:var(--ok)">✓ Qualitäts-Check ohne Auffälligkeiten</div>':'';
+  return '<div class="qc">'+ch.map(function(x){return '<div class="'+(x.level==="warn"?"qw":"qi")+'">'+(x.level==="warn"?"⚠ ":"ℹ ")+esc(x.msg)+'</div>'}).join("")+
+    (sp.length?'<div class="qw">⚠ Mögliche Tippfehler:</div>'+sp.map(function(x,k){return '<div class="qs"><span><s>'+esc(x.wrong)+'</s> → <b>'+esc(x.suggestion)+'</b></span><button class="btn sm" onclick="fixSpelling('+i+','+k+')">Übernehmen</button></div>'}).join(""):'')+'</div>';
+}
+function fixSpelling(i,k){
+  var x=S.job.clips[i].spelling[k];
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+i+"/fix",{wrong:x.wrong,suggestion:x.suggestion}).then(function(j){S.job=j;renderJob();toast(j.status==="prüfen"?"Korrigiert":"Korrigiert – Clip wird neu gerendert")}).catch(function(e){toast(e.message)});
+}
+
+// ---------------------------------------------------------------- texts
+function textsCard(j){
+  if(j.status!=="fertig"&&!j.texts) return '';
+  var t=j.texts;
+  var head='<div class="row" style="justify-content:space-between"><div><b>Texte zum Video</b><div class="muted small">YouTube-Kapitel, LinkedIn-Beitrag, Blog-/Newsletter-Text und Karussell-Folien aus dem Transkript.</div></div>'+
+    '<div class="row" style="gap:8px">'+(t?'<button class="btn sm" onclick="downloadTexts()">Als Textdatei laden</button>':'')+'<button class="btn sm primary" onclick="makeTexts()">'+(t?"Neu erstellen":"Texte erstellen")+'</button></div></div>';
+  if(!t) return '<div class="card" style="margin-top:16px">'+head+'</div>';
+  var chap=(t.chapters||[]).map(function(c){return c.time+" "+c.title}).join("\n");
+  var blog=t.blog&&t.blog.title?"# "+t.blog.title+"\n\n"+t.blog.text:"";
+  var car=(t.carousel||[]).map(function(c,k){return "Folie "+(k+1)+": "+c.title+"\n"+c.text}).join("\n\n");
+  S.textParts={chapters:chap,linkedin:t.linkedin||"",blog:blog,carousel:car};
+  function sec(key,label){return S.textParts[key]?'<details class="txt"><summary>'+label+'<button class="btn sm ghost" onclick="event.preventDefault();copyText(\''+key+'\')">Kopieren</button></summary><pre>'+esc(S.textParts[key])+'</pre></details>':''}
+  return '<div class="card" style="margin-top:16px">'+head+'<div style="margin-top:10px">'+sec("chapters","YouTube-Kapitel")+sec("linkedin","LinkedIn-Beitrag")+sec("blog","Blog / Newsletter")+sec("carousel","Karussell-Folien")+'</div></div>';
+}
+function makeTexts(){
+  if(!S.settings.has_anthropic_key) return toast("Für die Texte bitte zuerst einen Claude-API-Schlüssel in den Einstellungen hinterlegen");
+  api("POST","/api/jobs/"+S.job.id+"/texts").then(function(j){S.job=j;renderJob();toast("Texte werden erstellt")}).catch(function(e){toast(e.message)});
+}
+function copyText(k){navigator.clipboard.writeText(S.textParts[k]).then(function(){toast("Kopiert")})}
+function downloadTexts(){
+  var p=S.textParts,all="YOUTUBE-KAPITEL\n\n"+p.chapters+"\n\n\nLINKEDIN\n\n"+p.linkedin+"\n\n\nBLOG / NEWSLETTER\n\n"+p.blog+"\n\n\nKARUSSELL\n\n"+p.carousel+"\n";
+  var a=document.createElement("a");a.href=URL.createObjectURL(new Blob([all],{type:"text/plain;charset=utf-8"}));
+  a.download=(S.job.name.replace(/\.[^.]+$/,"")||"video")+"_texte.txt";a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},2000);
+}
 
 // ---------------------------------------------------------------- AI ratings
 var CRIT=[["hook","Hook"],["standalone","Verständlich"],["value","Mehrwert"],["payoff","Pointe"]];

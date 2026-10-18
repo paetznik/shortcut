@@ -209,7 +209,7 @@ def clean_settings(s):
     out["font_size"] = max(40, min(140, out["font_size"]))
     out["words_per_line"] = max(1, min(6, out["words_per_line"]))
     out["hook_seconds"] = max(1, min(10, out["hook_seconds"]))
-    if out["mode"] not in ("auto", "crop", "blur"):
+    if out["mode"] not in ("auto", "split", "crop", "blur"):
         out["mode"] = "auto"
     if out["quality"] not in pipeline.WHISPER_PRESETS:
         out["quality"] = "ausgewogen"
@@ -529,6 +529,40 @@ async def bestof(jid: str, request: Request):
     return queue_extra(jid, "bestof", target, "Erstelle Best-of-Trailer")
 
 
+@app.post("/api/jobs/{jid}/clips/{idx}/fix")
+async def fix_spelling(jid: str, idx: int, request: Request):
+    """Take over a spelling suggestion: correct the transcript and render the clip again."""
+    require_auth(request)
+    body = await request.json()
+    wrong, good = str(body.get("wrong") or ""), str(body.get("suggestion") or "")
+    with lock:
+        job = load_job(jid)
+        if job["status"] not in ("fertig", "fehler", "prüfen") or idx >= len(job["clips"]) or not wrong:
+            raise HTTPException(400, "Clip kann gerade nicht bearbeitet werden")
+        clip = job["clips"][idx]
+        segments = load_transcript(jid)
+        old = [w for w in pipeline.all_words(segments) if w["e"] > clip["start"] and w["s"] < clip["end"]]
+        text = " ".join(w["w"] for w in old)
+        if wrong not in text:
+            raise HTTPException(400, "Text wurde inzwischen geändert")
+        save_transcript(jid, pipeline.replace_words(segments, clip["start"], clip["end"],
+                                                    pipeline.realign(old, text.replace(wrong, good, 1))))
+        clip["spelling"] = [x for x in clip.get("spelling", []) if x.get("wrong") != wrong]
+        if job["status"] != "prüfen":
+            clip["status"], job["status"], job["message"] = "wartet", "wartet", "Clip %d wird korrigiert" % (idx + 1)
+            work.put(("render", jid, idx))
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.post("/api/jobs/{jid}/texts")
+def create_texts(jid: str, request: Request):
+    require_auth(request)
+    if not load_config().get("anthropic_key"):
+        raise HTTPException(400, "Für die Texte wird ein Claude-API-Schlüssel benötigt (Einstellungen).")
+    return queue_extra(jid, "texts", None, "Erstelle Texte zum Video")
+
+
 @app.post("/api/jobs/{jid}/render")
 def render_all(jid: str, request: Request):
     """Leave review mode and render every clip."""
@@ -717,13 +751,20 @@ def prepare(jid, idx, info):
     out_words = pipeline.remap_words(words, intervals)
     out_len = sum(b - a for a, b in intervals)
     crop_segs = manual_crop(clip, info)
+    det, split, split_wanted = None, None, s.get("mode") == "split"
     if crop_segs:
         s["mode"] = "auto"  # hand-set framing always crops, whatever the project mode
-    elif s.get("mode") == "auto":
-        crop_segs = pipeline.track_speaker(src, info, clip["start"], clip["end"])
+    elif s.get("mode") in ("auto", "split"):
+        det = pipeline.detect_faces(src, info, clip["start"], clip["end"])
+        if split_wanted:
+            split = pipeline.split_pair(det)
+        crop_segs = None if split else pipeline.speaker_segments(det, duration)
+        s["mode"] = "auto"
+        s["split_layout"] = bool(split)
     music = os.path.join(MUSIC, s["music"]) if s.get("music") and os.path.exists(os.path.join(MUSIC, s["music"])) else None
     return {"job": job, "clip": clip, "s": s, "src": src, "duration": duration, "intervals": intervals,
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
+            "det": det, "split": split, "split_wanted": split_wanted,
             "zooms": pipeline.zoom_spans(out_words, intervals, out_len) if s.get("zoom", True) else None}
 
 
@@ -734,7 +775,7 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
     burn = pipeline.write_subtitles(words, os.path.join(d, ass), os.path.join(d, base + ".srt") if srt else None,
                                     p["s"], hook, p["out_len"], keywords, size)
     out_len = pipeline.render_clip(p["src"], p["job"]["info"], clip["start"], clip["end"], d, base, p["s"], ass, burn,
-                                   p["intervals"], p["crop_segs"], size, p["zooms"], p["music"])
+                                   p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"])
     os.remove(os.path.join(d, ass))
     return out_len
 
@@ -763,6 +804,9 @@ def render_one(jid, idx, info):
                               p["crop_segs"], clip.get("cover_text") or clip.get("title", ""))
         cover = name + "_cover.jpg"
 
+    checks = pipeline.quality_checks(d, outputs["9x16"], info, load_transcript(jid), clip["start"], clip["end"],
+                                     p["det"], p["crop_segs"], s.get("mode"), p["split_wanted"], p["split"], out_len)
+
     keep = {name + ".mp4", name + ".jpg", name + ".srt", cover} | set(outputs.values())
     for old in clip_files(clip):
         if old not in keep:
@@ -776,7 +820,7 @@ def render_one(jid, idx, info):
             "file": outputs["9x16"], "thumb": name + ".jpg", "srt": name + ".srt", "cover": cover,
             "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "version": version, "status": "fertig",
             "duration_out": round(out_len, 1), "speakers": len({x for _, _, x in p["crop_segs"] or []}),
-            "translations": {},
+            "translations": {}, "checks": checks, "split": bool(p["split"]),
         })
         save_job(job)
     export_files(jid, clip_files(load_job(jid)["clips"][idx]), "Clip %d" % (idx + 1))
@@ -825,8 +869,9 @@ def render_bestof(jid, target):
         out_words = pipeline.remap_words(words, intervals)
         out_len = sum(y - x for x, y in intervals)
         crop = manual_crop(clip, info) or (pipeline.track_speaker(os.path.join(d, job["source"]), info, a, b)
-                                           if s.get("mode") == "auto" else None)
-        ps = dict(s, hook=bool(n == 0 and s.get("hook", True)), mode="auto" if crop else s.get("mode"))
+                                           if s.get("mode") in ("auto", "split") else None)
+        ps = dict(s, hook=bool(n == 0 and s.get("hook", True)),
+                  mode="auto" if crop else ("crop" if s.get("mode") == "split" else s.get("mode")))
         base = "bestof_part%02d" % n
         ass = base + ".ass"
         burn = pipeline.write_subtitles(out_words, os.path.join(d, ass), None, ps,
@@ -1017,18 +1062,44 @@ def process(jid):
     render_clips(jid, info)
 
 
+def spelling(jid, indices):
+    cfg = load_config()
+    key = cfg.get("anthropic_key", "")
+    if not key:
+        return
+    job = load_job(jid)
+    words = pipeline.all_words(load_transcript(jid))
+    texts = {i: " ".join(w["w"] for w in words if w["e"] > job["clips"][i]["start"] and w["s"] < job["clips"][i]["end"])
+             for i in indices if i < len(job["clips"])}
+    try:
+        found = pipeline.spelling_check(key, texts, cfg.get("vocabulary", ""))
+    except Exception as e:
+        log(jid, "Rechtschreibprüfung fehlgeschlagen: " + str(e)[:200])
+        return
+    with lock:
+        job = load_job(jid)
+        for i in texts:
+            job["clips"][i]["spelling"] = found.get(i, [])
+        save_job(job)
+    n = sum(len(v) for v in found.values())
+    log(jid, "Rechtschreibprüfung: %s" % ("%d mögliche Fehler gefunden" % n if n else "keine Auffälligkeiten"))
+
+
 def render_clips(jid, info):
     job = load_job(jid)
     n = len(job["clips"])
     for i in range(n):
         update(jid, status="läuft", progress=round(75 + i / n * 24, 1), message="Rendere Clip %d von %d …" % (i + 1, n))
         render_one(jid, i, info)
+    update(jid, message="Prüfe Rechtschreibung …")
+    spelling(jid, range(n))
     update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % n, finished=time.time())
 
 
 def rerender(jid, idx):
     job = update(jid, status="läuft", message="Rendere Clip %d neu …" % (idx + 1))
     render_one(jid, idx, job["info"])
+    spelling(jid, [idx])
     update(jid, status="fertig", progress=100, message="Fertig – %d Clips" % len(job["clips"]))
 
 
@@ -1036,8 +1107,14 @@ def extra_task(jid, kind, arg):
     """Translation or best-of on a finished project; a failure is reported but leaves the clips usable."""
     update(jid, status="läuft", progress=50)
     n = len(load_job(jid)["clips"])
+    label = {"translate": "Übersetzung", "bestof": "Best-of", "texts": "Texterstellung"}[kind]
     try:
-        if kind == "translate":
+        if kind == "texts":
+            job = load_job(jid)
+            texts = pipeline.generate_texts(load_config().get("anthropic_key", ""), load_transcript(jid), job.get("context", ""))
+            update(jid, texts=texts)
+            msg = "Fertig – Texte zum Video erstellt"
+        elif kind == "translate":
             render_translation(jid, arg[0], arg[1])
             msg = "Fertig – Übersetzung von Clip %d erstellt" % (arg[0] + 1)
         else:
@@ -1047,8 +1124,8 @@ def extra_task(jid, kind, arg):
         raise
     except Exception as e:
         traceback.print_exc()
-        log(jid, ("Übersetzung" if kind == "translate" else "Best-of") + " fehlgeschlagen: " + str(e)[:300])
-        msg = "Fertig – %d Clips (%s fehlgeschlagen: %s)" % (n, "Übersetzung" if kind == "translate" else "Best-of", str(e)[:150])
+        log(jid, label + " fehlgeschlagen: " + str(e)[:300])
+        msg = "Fertig – %d Clips (%s fehlgeschlagen: %s)" % (n, label, str(e)[:150])
     update(jid, status="fertig", progress=100, message=msg)
 
 
@@ -1062,7 +1139,7 @@ def worker():
                 process(jid)
             elif kind == "render_all":
                 render_clips(jid, load_job(jid)["info"])
-            elif kind in ("translate", "bestof"):
+            elif kind in ("translate", "bestof", "texts"):
                 extra_task(jid, kind, idx)
             else:
                 rerender(jid, idx)

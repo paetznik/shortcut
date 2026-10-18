@@ -12,14 +12,16 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
    - ohne Schlüssel: automatische Auswahl nach Sprechtempo, Fragen und Schlüsselwörtern.
 5. Optional Prüfmodus: Titel, Hook-Text (mit KI-Varianten), Titelbild-Text und Untertitel jedes Clips vor dem Rendern korrigieren; Wörter im Transkript anklicken schneidet sie heraus.
 6. Schnitt mit ffmpeg:
-   - 9:16-Zuschnitt, der dem Sprecher folgt (Gesichtserkennung mit OpenCV, Mundbewegung entscheidet bei mehreren Personen), alternativ Mitte oder ganzes Bild mit unscharfem Hintergrund; optional zusätzlich 4:5 und 1:1,
+   - 9:16-Zuschnitt, der dem Sprecher folgt, oder geteilter Bildschirm bei zwei Personen (links oben, rechts unten) (Gesichtserkennung mit OpenCV, Mundbewegung entscheidet bei mehreren Personen), alternativ Mitte oder ganzes Bild mit unscharfem Hintergrund; optional zusätzlich 4:5 und 1:1,
    - Pausen, Füllwörter und angeklickte Wörter werden herausgeschnitten, dynamische Zooms an Schnitten und Satzanfängen,
    - Hook-Text in den ersten Sekunden, Untertitel in vier Stilen (Pop, Box, Minimal, ganze Sätze) mit farbigen Schlüsselwörtern, innerhalb der Sicherheitszonen der Plattformen,
    - Tonaufbereitung (Rumpelfilter, Rauschunterdrückung, De-Esser, Kompressor, Lautheit −14 LUFS) und optionale Hintergrundmusik, die unter Sprache leiser wird,
    - Titelbild mit großem Text für das Profilraster.
 7. Bildausschnitt von Hand: im Editor auf einem Standbild den 9:16-Rahmen ziehen, auch mit Wechseln ab bestimmten Sekunden.
 8. Best-of-Trailer (30–60 s) aus den stärksten Sätzen mehrerer Clips; übersetzte Versionen jedes Clips (Untertitel, Hook, Titel, Beschreibung) per Claude in Englisch, Spanisch, Französisch, Italienisch, Türkisch oder Polnisch.
-9. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
+9. Qualitäts-Check nach dem Rendern: Lautstärke, Schnitt mitten im Wort, angeschnittene Personen, fehlende Gesichter; mit Claude-Schlüssel zusätzlich Rechtschreibprüfung der Untertitel mit Ein-Klick-Korrektur.
+10. Texte zum Video per Claude: YouTube-Kapitel, LinkedIn-Beitrag, Blog-/Newsletter-Text und Karussell-Folien.
+11. Download (MP4 je Format, Titelbild, SRT), automatischer Export nach Nextcloud und Versand an Postiz (planen oder sofort veröffentlichen). Clips lassen sich nachträglich ändern und neu rendern oder als Variante B mit anderem Hook duplizieren.
 
 ## Deployment
 
