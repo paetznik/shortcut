@@ -309,33 +309,40 @@ def highlights_heuristic(segments, n, min_len, max_len, audio=None, cands=None):
     return clips
 
 
-def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=None, two_stage=True):
+def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=None, two_stage=True, exclude=()):
+    """The n best clips; `exclude` holds existing clips (start/end) – new ones must not repeat them."""
     words = all_words(segments)
     clips, source = None, "heuristik"
+    exclude = [{"start": e["start"], "end": e["end"]} for e in exclude]
+    free = lambda c: all(overlap(c, e) <= 1.5 for e in exclude)
+    if exclude:
+        context = (context + "\n" if context else "") + "Diese Stellen gibt es schon als Clip – schlage sie NICHT noch " \
+            "einmal vor, sondern andere: " + ", ".join("%s–%s" % (fmt_time(e["start"]), fmt_time(e["end"])) for e in exclude)
+    ask = n + min(len(exclude), 5)
     if api_key:
         try:
             if two_stage:
-                clips = highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context, audio, log)
+                clips = highlights_claude_two_stage(segments, api_key, ask, min_len, max_len, context, audio, log)
             else:
-                clips = highlights_claude(segments, api_key, n, min_len, max_len, context, audio)
+                clips = highlights_claude(segments, api_key, ask, min_len, max_len, context, audio)
             source = "claude"
         except Exception as e:  # fall back to heuristic
             log("KI-Auswahl fehlgeschlagen, nutze automatische Auswahl: " + str(e)[:200])
     cands = score_windows(segments, min_len, max_len, audio)
     if not clips:
-        clips = highlights_heuristic(segments, n, min_len, max_len, audio, cands)
+        clips = highlights_heuristic(segments, ask, min_len, max_len, audio, cands)
     for rank, c in enumerate(clips):  # Claude lists the best first; keep that order if it gives no score
         c.setdefault("score", 100 - rank)
 
     def select(primary, pool, max_l):
-        chosen = [c for c in (snap(c, words, min_len, max_l) for c in primary) if c]
+        chosen = [c for c in (snap(c, words, min_len, max_l) for c in primary) if c and free(c)]
         chosen = remove_overlaps(chosen, 1.5)[:n]
         top = max([x["score"] for x in pool] or [1]) or 1
         for c in sorted(pool, key=lambda c: -c["score"]):  # fill free stretches with the best remaining windows
             if len(chosen) >= n:
                 break
             sc = snap(dict(c), words, min_len, max_l)
-            if sc and all(overlap(sc, o) <= 1.5 for o in chosen):
+            if sc and free(sc) and all(overlap(sc, o) <= 1.5 for o in chosen):
                 sc = decorate(sc)
                 sc["score"] = max(1, round(c["score"] / top * 100))
                 sc["filled"] = True
@@ -352,7 +359,7 @@ def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=
         mx = min_len + (max_len - min_len) * frac + 5
         short = [c for c in cands if c["end"] - c["start"] <= mx]
         alt = select([dict(c) for c in clips if c["end"] - c["start"] <= mx + 1] if source == "claude"
-                      else highlights_heuristic(segments, n, min_len, mx, audio, short), short, mx)
+                      else highlights_heuristic(segments, ask, min_len, mx, audio, short), short, mx)
         if len(alt) > len(snapped):
             snapped = alt
     for c in snapped:
@@ -469,8 +476,8 @@ def pause_pads(words, natural, pad=0.1, max_pause=0.35):
     if not natural or not words:
         return [pad] * len(words), [pad] * len(words), max_pause
     rate = len(words) / max(1.0, words[-1]["e"] - words[0]["s"])
-    base = 0.08 if rate > 3.2 else 0.12 if rate < 2.2 else 0.1
-    bridge = 0.15 if rate > 3.2 else 0.25 if rate < 2.2 else 0.2
+    base = 0.1 if rate > 3.2 else 0.14 if rate < 2.2 else 0.12
+    bridge = 0.3 if rate > 3.2 else 0.45 if rate < 2.2 else 0.38
     before, after = [], []
     for i, w in enumerate(words):
         t = w["w"]
@@ -529,7 +536,33 @@ def keep_intervals(words, duration, remove_pauses, removed=(), max_pause=0.35, p
         return [(0.0, duration)] if not any(gone) else [(0.0, 0.5)]
     tail_cut = next((x["s"] for x, g in zip(words, gone) if g and x["s"] >= out[-1][1]), duration)
     out[-1][1] = min(duration, tail_cut, out[-1][1] + 0.25)
+    out = merge_short(out, words, gone)
     return [(round(a, 3), round(b, 3)) for a, b in out if b - a > 0.05]
+
+
+def merge_short(out, words, gone, min_piece=1.0, max_fill=0.8):
+    """A piece shorter than `min_piece` between two cuts makes the picture stutter: keep the pause next to it
+    instead (the shorter one, at most `max_fill` s) – unless a struck-out word or a filler sits in that pause."""
+    forced = [(w["s"], w["e"]) for w, g in zip(words, gone) if g or is_filler(w["w"])]
+    fillable = lambda a, b: b - a <= max_fill and not any(s < b and e > a for s, e in forced)
+    changed = True
+    while changed and len(out) > 1:
+        changed = False
+        for k, (a, b) in enumerate(out):
+            if b - a >= min_piece:
+                continue
+            gaps = []
+            if k and fillable(out[k - 1][1], a):
+                gaps.append((a - out[k - 1][1], k - 1))
+            if k + 1 < len(out) and fillable(b, out[k + 1][0]):
+                gaps.append((out[k + 1][0] - b, k))
+            if gaps:
+                _, j = min(gaps)
+                out[j] = [out[j][0], out[j + 1][1]]
+                del out[j + 1]
+                changed = True
+                break
+    return out
 
 
 def remap(t, intervals):
@@ -1182,7 +1215,9 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
     fps = out_fps(info)
     duration = end - start
     cut = bool(intervals) and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
-    sel = (",select='%s',setpts=N/%d/TB" % (select_expr(intervals, fps), fps)) if cut else ""
+    # soft cuts: the picture is built on the full clip timeline and the parts are blended into each other
+    soft = cut and len(intervals) > 1 and style.get("cut_style", "weich") == "weich"
+    sel = (",select='%s',setpts=N/%d/TB" % (select_expr(intervals, fps), fps)) if cut and not soft else ""
     graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh, split)
     if style.get("stabilize"):
         graph = graph.replace("[0:v]", "[0:v]" + stabilize_filter(video, start, duration, workdir) + ",", 1)
@@ -1195,9 +1230,11 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
         for j, cam in enumerate(cams, 1):
             cmd += ["-ss", "%.3f" % cam["start"], "-t", "%.3f" % duration, "-i", cam["path"]]
             graph += ";" + camera_chain(j, cam["info"], cam.get("crop_segs"), sel, ow, oh, "c%d" % j, fps)
-            on = "+".join("between(t,%.3f,%.3f)" % s for s in cam["on"])
+            on = "+".join("between(t,%.3f,%.3f)" % s for s in (cam.get("on_src") or cam["on"] if soft else cam["on"]))
             graph += ";[m%d][c%d]overlay=0:0:enable='%s'[m%d]" % (j - 1, j, on, j)
         graph += ";[m%d]null" % len(cams)
+    if soft:
+        graph += "[full];" + dissolve_chain("full", intervals, fps)
     if zoom_spans_out and not split:
         graph += zoom_filter(zoom_spans_out, ow, oh, eye=eye)
     graph += ((",ass=" + ass_name) if burn else "") + "[v]"
@@ -1220,6 +1257,40 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
             "-r", str(fps), "-shortest", "-movflags", "+faststart", "-threads", str(THREADS), out]
     run(cmd, cwd=workdir)
     return sum(b - a for a, b in intervals) if cut else duration
+
+
+DISSOLVE = 0.2  # seconds of picture blend at a jump cut (about 5 frames)
+
+
+def dissolve_chain(label, intervals, fps, length=DISSOLVE):
+    """The kept parts of [label] (full clip timeline) one after the other, each cut a short cross-dissolve.
+
+    Both sides reach half the blend into the cut-away picture – like the 40 ms sound cross-fades – so the
+    total length and the lip sync stay exactly as with hard cuts. Very short parts get a shorter blend."""
+    n = len(intervals)
+    step = 1.0 / fps
+    d = []
+    for (a0, b0), (a1, b1) in zip(intervals, intervals[1:]):
+        frames = int(min(length, (b0 - a0) / 2, (b1 - a1) / 2) * fps / 2) * 2  # an even number of frames
+        d.append(max(0, frames) * step)
+    parts = ["[%s]split=%d%s" % (label, n, "".join("[f%d]" % i for i in range(n)))]
+    lens = []
+    for i, (a, b) in enumerate(intervals):
+        a2 = a - (d[i - 1] / 2 if i else 0.0)
+        b2 = b + (d[i] / 2 if i < n - 1 else 0.0)
+        lens.append(b2 - a2)
+        parts.append("[f%d]trim=start=%.4f:end=%.4f,setpts=PTS-STARTPTS,fps=%d[g%d]" % (i, max(0.0, a2), b2, fps, i))
+    prev, acc = "g0", lens[0]
+    for i in range(1, n):
+        out = "x%d" % i
+        if d[i - 1] >= 2 * step:
+            parts.append("[%s][g%d]xfade=transition=fade:duration=%.4f:offset=%.4f[%s]" % (prev, i, d[i - 1], acc - d[i - 1], out))
+            acc += lens[i] - d[i - 1]
+        else:  # too short for a blend: plain cut
+            parts.append("[%s][g%d]concat=n=2:v=1:a=0,fps=%d[%s]" % (prev, i, fps, out))
+            acc += lens[i]
+        prev = out
+    return ";".join(parts) + ";[%s]null" % prev
 
 
 def render_thumb(workdir, video_name, name, at):

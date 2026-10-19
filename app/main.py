@@ -40,7 +40,7 @@ DEFAULTS = {
     "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True, "precise_timing": True,
     "ai_check": True, "jumpcut_zoom": True, "blink_safe": True, "natural_pauses": True, "roomtone": True,
     "stabilize": False, "loop_end": True, "fmt_lengths": False, "speaker_colors": False, "blur_faces": False,
-    "blur_plates": False, "multicam": True,
+    "blur_plates": False, "multicam": True, "cut_style": "weich",
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -276,6 +276,8 @@ def clean_settings(s):
     for k in ("highlight", "keyword_color"):
         if not re.fullmatch(r"#[0-9A-Fa-f]{6}", out[k]):
             out[k] = DEFAULTS[k]
+    if out["cut_style"] not in ("weich", "zoom", "hart"):
+        out["cut_style"] = "weich"
     if out["sub_style"] not in pipeline.SUB_STYLES:
         out["sub_style"] = "pop"
     out["music_volume"] = max(2, min(60, out["music_volume"]))
@@ -827,6 +829,55 @@ def listen(jid: str, request: Request, start: float, end: float):
     if p.returncode != 0 or not p.stdout:
         raise HTTPException(400, "Ton konnte nicht gelesen werden")
     return Response(p.stdout, media_type="audio/mpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+# ---------------------------------------------------------------- more highlights later, without uploading again
+
+@app.post("/api/jobs/{jid}/more")
+async def more_highlights(jid: str, request: Request):
+    """Find further highlights in a finished project (new ones never repeat existing clips) and render them."""
+    require_auth(request)
+    body = await request.json()
+    job = load_job(jid)
+    s = job["settings"]
+    try:
+        count = max(1, min(10, int(body.get("count", 3))))
+        mn = max(5, min(170, int(float(body.get("min_len", s["min_len"])))))
+        mx = max(mn + 5, min(180, int(float(body.get("max_len", s["max_len"])))))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Ungültige Angaben")
+    if load_transcript(jid) is None:
+        raise HTTPException(400, "Für dieses Projekt gibt es kein Transkript.")
+    if len(job["clips"]) + count > 40:
+        raise HTTPException(400, "Zu viele Clips in diesem Projekt (max. 40)")
+    return queue_extra(jid, "more", [count, mn, mx], "Suche %d weitere Highlight%s …" % (count, "s" if count > 1 else ""))
+
+
+def more_highlights_task(jid, arg):
+    count, mn, mx = arg
+    job = load_job(jid)
+    s = job["settings"]
+    update(jid, progress=10, message="Suche %d weitere Highlights …" % count)
+    audio = load_audio(jid) if s.get("audio_analysis", True) else None
+    clips, source = pipeline.find_highlights(load_transcript(jid), load_config().get("anthropic_key", ""), count, mn, mx,
+                                             job.get("context", ""), lambda m: log(jid, m), audio,
+                                             s.get("two_stage", True), exclude=job["clips"])
+    if not clips:
+        return "Fertig – keine weiteren passenden Highlights gefunden (kürzere Mindestlänge probieren)"
+    for c in clips:
+        c.update(status="wartet", hook_text=c.get("title", ""), uid=uuid.uuid4().hex[:6], cover_text=c.get("title", ""))
+    with lock:
+        job = load_job(jid)
+        first = len(job["clips"])
+        job["clips"] += clips
+        save_job(job)
+    log(jid, "%d weitere Highlights gefunden (%s)" % (len(clips), "Claude KI" if source == "claude" else "Automatik"))
+    for k, i in enumerate(range(first, first + len(clips))):
+        update(jid, progress=round(20 + k / len(clips) * 75, 1), message="Rendere neuen Clip %d von %d …" % (k + 1, len(clips)))
+        render_one(jid, i, job["info"])
+    pipeline.release_aligner()
+    spelling(jid, range(first, first + len(clips)))
+    return "Fertig – %d weitere Clip%s" % (len(clips), "s" if len(clips) > 1 else "")
 
 
 # ---------------------------------------------------------------- several cameras
@@ -1635,7 +1686,8 @@ def prepare(jid, idx, info):
     # picture rhythm: speaker and camera switches count as a change; zooms at jump cuts and to keep long takes alive
     switches = [pipeline.remap(seg[0], intervals) for seg in (crop_segs or [])[1:]] + \
                [t for cam in cams for on in cam["on"] for t in on]
-    zoom_on, jumpcuts = s.get("zoom", True), s.get("jumpcut_zoom", True)
+    # jump cuts: soft blend (default), a punch-in zoom, or a plain hard cut
+    zoom_on, jumpcuts = s.get("zoom", True), s.get("cut_style", "weich") == "zoom"
     zooms = pipeline.zoom_spans(out_words, intervals, out_len, jumpcuts=jumpcuts, rhythm=zoom_on, switches=switches,
                                 loop=s.get("loop_end", True), beats=beats) if (zoom_on or jumpcuts) and not split else None
     changes = sorted(set([0.0, out_len] + switches + pipeline.cut_points(intervals) +
@@ -1699,7 +1751,8 @@ def camera_inputs(jid, job, clip, duration, det, head, intervals):
         on = [x for x in on if x[1] - x[0] > 0.3]
         if on and dets[j]:
             out.append({"path": os.path.join(JOBS, jid, cam["file"]), "start": starts[j - 1], "info": cam["info"],
-                        "crop_segs": pipeline.speaker_segments(dets[j], duration), "on": on})
+                        "crop_segs": pipeline.speaker_segments(dets[j], duration), "on": on,
+                        "on_src": [(a, b) for a, b, c in plan if c == j and b - a > 0.3]})
     return out
 
 
@@ -2177,9 +2230,12 @@ def extra_task(jid, kind, arg):
     """Translation or best-of on a finished project; a failure is reported but leaves the clips usable."""
     update(jid, status="läuft", progress=50)
     n = len(load_job(jid)["clips"])
-    label = {"translate": "Übersetzung", "bestof": "Best-of", "texts": "Texterstellung", "cam": "Kamera-Synchronisation"}[kind]
+    label = {"translate": "Übersetzung", "bestof": "Best-of", "texts": "Texterstellung", "cam": "Kamera-Synchronisation",
+             "more": "Suche nach weiteren Highlights"}[kind]
     try:
-        if kind == "cam":
+        if kind == "more":
+            msg = more_highlights_task(jid, arg)
+        elif kind == "cam":
             msg = sync_camera(jid, arg)
         elif kind == "texts":
             job = load_job(jid)
@@ -2212,7 +2268,7 @@ def worker():
                 process(jid)
             elif kind == "render_all":
                 render_clips(jid, load_job(jid)["info"])
-            elif kind in ("translate", "bestof", "texts", "cam"):
+            elif kind in ("translate", "bestof", "texts", "cam", "more"):
                 extra_task(jid, kind, idx)
             else:
                 rerender(jid, idx)

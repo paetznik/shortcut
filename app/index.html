@@ -344,13 +344,13 @@ function renderHome(){
       chk("o_blur_plates",d.blur_plates,"Kfz-Kennzeichen unkenntlich machen (experimentell)")+
     '</div><p class="muted small">Die Hauptpersonen bleiben sichtbar. Weitere Bereiche (Bildschirme, Namensschilder) kannst du pro Clip im Editor per Rechteck markieren.</p></details>'+
     '<details><summary>Schnitt-Feinschliff</summary><div class="toggles">'+
-      chk("o_jumpcut_zoom",d.jumpcut_zoom,"Jump-Cuts kaschieren (Bildausschnitt wechselt an jedem Schnitt)")+
+      '<div style="margin-bottom:6px"><label>Übergang an Schnitten</label><select id="o_cut_style">'+cutOpts(d.cut_style)+'</select></div>'+
       chk("o_natural_pauses",d.natural_pauses,"Pausen mit Gefühl kürzen (Spannungspausen bleiben)")+
       chk("o_roomtone",d.roomtone,"Atmer leiser, Raumton statt Stille")+
       chk("o_blink_safe",d.blink_safe,"Nicht bei geschlossenen Augen oder mitten in einer Bewegung schneiden")+
       chk("o_loop_end",d.loop_end,"Loop-Ende: ohne Vor- und Nachlauf, endet im Bildausschnitt des Anfangs")+
       chk("o_stabilize",d.stabilize,"Verwackelte Aufnahmen stabilisieren (verlängert das Rendern)")+
-    '</div><p class="muted small">Immer aktiv: weiche Tonübergänge an jedem Schnitt, Sprecherwechsel im Bild kurz nach dem ersten Wort (J-Cut), Blickraum in Blickrichtung, Zooms auf Augenhöhe, Untertitel 70 ms vor dem Wort. „Dynamische Zooms“ sorgt zusätzlich dafür, dass das Bild nie länger als etwa 4,5 s stillsteht.</p></details>'+
+    '</div><p class="muted small">Immer aktiv: weiche Tonübergänge an jedem Schnitt, weniger Mini-Schnitte (kein Teil kürzer als 1 s), Sprecherwechsel im Bild kurz nach dem ersten Wort (J-Cut), Blickraum in Blickrichtung, Zooms auf Augenhöhe, Untertitel 70 ms vor dem Wort. „Dynamische Zooms“ sorgt zusätzlich dafür, dass das Bild nie länger als etwa 4,5 s stillsteht.</p></details>'+
     '<div style="margin-top:14px"><label>Worum geht es im Video? (optional, hilft der KI)</label><textarea id="o_context" placeholder="z. B. Podcast über Selbstständigkeit, Zielgruppe junge Gründer"></textarea></div>'+
     '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="saveDefaults()">Einstellungen als Standard speichern</button></div>'+
     '</div><div id="storage"></div><div id="queue"></div><div class="jobs" id="jobs"></div>');
@@ -366,8 +366,8 @@ function renderHome(){
 }
 
 function readOpts(){
-  var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check","jumpcut_zoom","natural_pauses","roomtone","blink_safe","loop_end","stabilize","fmt_lengths","speaker_colors","blur_faces","blur_plates"].forEach(function(k){o[k]=$("o_"+k).checked});
+  var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume","cut_style"].forEach(function(k){o[k]=$("o_"+k).value});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check","natural_pauses","roomtone","blink_safe","loop_end","stabilize","fmt_lengths","speaker_colors","blur_faces","blur_plates"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
@@ -728,10 +728,29 @@ function extrasUI(i){
     chk("e_x_speaker_colors"+i,s.speaker_colors,"Sprecherfarben in den Untertiteln")+
     chk("e_x_fmt_lengths"+i,s.fmt_lengths,"Zusätzlich 15-, 30- und 60-s-Fassungen")+
     chk("e_x_blur_faces"+i,s.blur_faces,"Gesichter im Hintergrund unkenntlich")+
-    chk("e_x_blur_plates"+i,s.blur_plates,"Kennzeichen unkenntlich (experimentell)")+'</div></div>';
+    chk("e_x_blur_plates"+i,s.blur_plates,"Kennzeichen unkenntlich (experimentell)")+'</div>'+
+    '<div style="margin-top:6px"><label>Übergang an Schnitten</label><select id="e_x_cut_style'+i+'">'+cutOpts(s.cut_style)+'</select></div></div>';
+}
+function cutOpts(v){
+  return opt("weich",v||"weich","Weich überblenden (empfohlen)")+opt("zoom",v,"Zoom-Sprung (Punch-in)")+opt("hart",v,"Harter Schnitt");
+}
+function moreCard(j){
+  if(!["fertig","fehler"].includes(j.status)||j.source_deleted) return '';
+  var s=j.settings||{};
+  return '<div class="card" style="margin-top:16px"><div class="row" style="justify-content:space-between;gap:10px"><div><b>Weitere Highlights finden</b><div class="muted small">Ohne neues Hochladen – das Transkript ist schon da. Bereits vorhandene Clips werden nicht wiederholt.</div></div></div>'+
+    '<div class="row" style="gap:10px;margin-top:10px;align-items:flex-end">'+
+    '<div><label>Anzahl</label><input id="e_more_n" type="number" min="1" max="10" value="3" style="width:80px"></div>'+
+    '<div><label>Länge min. (s)</label><input id="e_more_min" type="number" min="5" max="170" value="'+(s.min_len||20)+'" style="width:90px"></div>'+
+    '<div><label>Länge max. (s)</label><input id="e_more_max" type="number" min="10" max="180" value="'+(s.max_len||60)+'" style="width:90px"></div>'+
+    '<button class="btn primary" onclick="findMore()">Suchen und rendern</button></div></div>';
+}
+function findMore(){
+  var b={count:+$("e_more_n").value,min_len:+$("e_more_min").value,max_len:+$("e_more_max").value};
+  if(document.activeElement) document.activeElement.blur();
+  api("POST","/api/jobs/"+S.job.id+"/more",b).then(function(j){S.job=j;renderJob();toast("Suche läuft – neue Clips erscheinen unten")}).catch(function(e){toast(e.message)});
 }
 function extrasBody(i){
-  var o={};["speaker_colors","fmt_lengths","blur_faces","blur_plates"].forEach(function(k){var el=$("e_x_"+k+i);if(el) o[k]=el.checked});
+  var o={cut_style:($("e_x_cut_style"+i)||{}).value||undefined};["speaker_colors","fmt_lengths","blur_faces","blur_plates"].forEach(function(k){var el=$("e_x_"+k+i);if(el) o[k]=el.checked});
   return o;
 }
 
@@ -877,6 +896,7 @@ function renderJob(){
   if(j.status==="fehler") html+='<div class="hint" style="margin-top:14px;background:#2a1616;border-color:#5a2525;color:#ffb3b3">'+esc(j.message)+'</div>';
   if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Hook, Titelbild-Text und Untertitel jedes Clips. Wörter anklicken schneidet sie heraus, Tippfehler korrigierst du im Textfeld. Dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
   html+=energyTimeline(j);
+  html+=moreCard(j);
   html+=transcriptCard(j);
   html+=camsCard(j);
   html+=trashCard(j);

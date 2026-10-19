@@ -44,6 +44,8 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 - Schnitt-Ansicht im Clip-Editor: Tonwelle des Originals (Clip ±15 s), Anfang/Ende per Griff ziehen (rastet an Wortgrenzen ein, Alt = frei), Klick setzt die Abspielposition; Tasten: Leertaste abspielen, I/O Anfang/Ende, ←/→ 1 s (Umschalt 0,1 s), P Auswahl abspielen.
 - Papierkorb: gelöschte Clips und durch Neu-Rendern ersetzte Fassungen bleiben 14 Tage erhalten und lassen sich wiederherstellen (eine ältere Fassung tauscht mit der aktuellen).
 - Mehrere Videos auf einmal hochladen: alle bekommen dieselben Einstellungen und werden nacheinander verarbeitet.
+- Übergang an Schnitten wählbar: weiche Überblendung (Standard, 0,2 s, Länge und Lippensynchronität bleiben exakt), Zoom-Sprung oder harter Schnitt; Pausen werden nur noch deutlich gekürzt, kein Stück zwischen zwei Schnitten unter 1 s.
+- Weitere Highlights nachträglich finden: im fertigen Projekt Anzahl und Länge wählen, ohne neues Hochladen; vorhandene Clips werden nicht wiederholt.
 - Schnitt-Assistent im Clip-Editor: Wunsch in eigenen Worten („Nimm den Teil über Preise raus“), Claude setzt Start/Ende, Schnitte, Piepser und Texte um.
 - Musik im Takt: Tempo und Beat der Hintergrundmusik werden erkannt, die Musik startet so, dass möglichst viele Schnitte auf einen Beat fallen, Zooms innerhalb einer Einstellung liegen auf dem Beat.
 - Optional: 15/30/60-s-Fassungen je Highlight (an Satzenden gekürzt), Sprecherfarben in den Untertiteln (zwei Stimmen, Erkennung über Stimmlage und Klang), Gesichter im Hintergrund und Kennzeichen (experimentell) unkenntlich, eigene Bereiche per Rechteck weichzeichnen.
