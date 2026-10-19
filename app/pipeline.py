@@ -1208,7 +1208,7 @@ def stabilize_filter(video, start, duration, workdir):
 
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
                 size=(1080, 1920), zoom_spans_out=None, music=None, split=None, beeps=(), quiet=(), roomtone_at=None,
-                eye=0.4, blur=None, cams=None, music_offset=0.0):
+                eye=0.4, blur=None, cams=None, music_offset=0.0, cut_kinds=None):
     """One clip from the source: cuts, framing, optional stabilisation, blurred areas, extra cameras (each a list
     item {"path", "start", "info", "crop_segs", "on": [(t0, t1) output time]}), zooms, subtitles and sound."""
     ow, oh = size
@@ -1216,7 +1216,7 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
     duration = end - start
     cut = bool(intervals) and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
     # soft cuts: the picture is built on the full clip timeline and the parts are blended into each other
-    soft = cut and len(intervals) > 1 and style.get("cut_style", "weich") == "weich"
+    soft = cut and len(intervals) > 1 and style.get("cut_style", "morph") in ("weich", "morph")
     sel = (",select='%s',setpts=N/%d/TB" % (select_expr(intervals, fps), fps)) if cut and not soft else ""
     graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh, split)
     if style.get("stabilize"):
@@ -1234,7 +1234,7 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
             graph += ";[m%d][c%d]overlay=0:0:enable='%s'[m%d]" % (j - 1, j, on, j)
         graph += ";[m%d]null" % len(cams)
     if soft:
-        graph += "[full];" + dissolve_chain("full", intervals, fps)
+        graph += "[full];" + dissolve_chain("full", intervals, fps, kinds=cut_kinds)
     if zoom_spans_out and not split:
         graph += zoom_filter(zoom_spans_out, ow, oh, eye=eye)
     graph += ((",ass=" + ass_name) if burn else "") + "[v]"
@@ -1253,7 +1253,9 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
                                    int(style.get("music_volume", 15)), beeps, quiet, roomtone, music_idx)
     out = name + ".mp4"
     cmd += ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if has_audio else [])
-    cmd += ["-c:v", "libx264", "-preset", "faster", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
+    quick = style.get("preview")  # fast low-quality preview
+    cmd += ["-c:v", "libx264", "-preset", "ultrafast" if quick else "faster", "-crf", "30" if quick else "19",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
             "-r", str(fps), "-shortest", "-movflags", "+faststart", "-threads", str(THREADS), out]
     run(cmd, cwd=workdir)
     return sum(b - a for a, b in intervals) if cut else duration
@@ -1262,35 +1264,64 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
 DISSOLVE = 0.2  # seconds of picture blend at a jump cut (about 5 frames)
 
 
-def dissolve_chain(label, intervals, fps, length=DISSOLVE):
-    """The kept parts of [label] (full clip timeline) one after the other, each cut a short cross-dissolve.
+def dissolve_chain(label, intervals, fps, length=DISSOLVE, kinds=None):
+    """The kept parts of [label] (full clip timeline) one after the other, each cut softened.
 
-    Both sides reach half the blend into the cut-away picture – like the 40 ms sound cross-fades – so the
-    total length and the lip sync stay exactly as with hard cuts. Very short parts get a shorter blend."""
+    "fade": a short cross-dissolve; both sides reach half the blend into the cut-away picture.
+    "morph": like a morph cut in an editing program – the last half of the blend before the cut and the first
+    half after it are replaced by frames interpolated with motion compensation (minterpolate) from the picture
+    before to the picture after, so head and body glide into the new position instead of showing through twice.
+    Either way the total length and the lip sync stay exactly as with hard cuts; very short parts get a shorter
+    blend or a plain cut."""
     n = len(intervals)
     step = 1.0 / fps
+    kinds = list(kinds or [])
     d = []
     for (a0, b0), (a1, b1) in zip(intervals, intervals[1:]):
         frames = int(min(length, (b0 - a0) / 2, (b1 - a1) / 2) * fps / 2) * 2  # an even number of frames
         d.append(max(0, frames) * step)
-    parts = ["[%s]split=%d%s" % (label, n, "".join("[f%d]" % i for i in range(n)))]
+    kinds = [(kinds[i] if i < len(kinds) else "fade") if d[i] >= 2 * step else "cut" for i in range(n - 1)]
+    morphs = [i for i, k in enumerate(kinds) if k == "morph"]
+    outs = ["[f%d]" % i for i in range(n)] + ["[ma%d][mb%d]" % (i, i) for i in morphs]
+    # the last cut point may sit a frame past the end of the decoded picture: repeat the last frame a little
+    parts = ["[%s]tpad=stop_mode=clone:stop_duration=0.5,split=%d%s" % (label, n + 2 * len(morphs), "".join(outs))]
     lens = []
     for i, (a, b) in enumerate(intervals):
-        a2 = a - (d[i - 1] / 2 if i else 0.0)
-        b2 = b + (d[i] / 2 if i < n - 1 else 0.0)
+        # into the cut-away picture for a dissolve, short of the cut for a morph (the morph frames fill the gap)
+        a2 = a if not i else a - d[i - 1] / 2 if kinds[i - 1] == "fade" else a + d[i - 1] / 2 if kinds[i - 1] == "morph" else a
+        b2 = b if i == n - 1 else b + d[i] / 2 if kinds[i] == "fade" else b - d[i] / 2 if kinds[i] == "morph" else b
         lens.append(b2 - a2)
-        parts.append("[f%d]trim=start=%.4f:end=%.4f,setpts=PTS-STARTPTS,fps=%d[g%d]" % (i, max(0.0, a2), b2, fps, i))
+        # by frame number: [label] starts at frame 0 with a constant rate, and times rounded to 4 digits could
+        # drop a frame that sits exactly on the boundary (the picture would end up a frame short)
+        parts.append("[f%d]trim=start_frame=%d:end_frame=%d,setpts=PTS-STARTPTS,fps=%d[g%d]"
+                     % (i, max(0, round(a2 * fps)), round(b2 * fps), fps, i))
+    for i in morphs:
+        h = d[i] / 2
+        ta = intervals[i][1] - h  # the picture the morph starts from ...
+        tb = intervals[i + 1][0] + h  # ... and the one it lands on
+        parts.append("[ma%d]trim=start_frame=%d:end_frame=%d,setpts=PTS-STARTPTS[pa%d]" % (i, round(ta * fps), round(ta * fps) + 1, i))
+        parts.append("[mb%d]trim=start_frame=%d:end_frame=%d,setpts=PTS-STARTPTS[pb%d]" % (i, round(tb * fps), round(tb * fps) + 1, i))
+        # two frames d apart -> motion-compensated in-betweens; exactly d*fps of them, whatever minterpolate pads
+        parts.append("[pa%d][pb%d]concat=n=2:v=1:a=0,setpts=N*%.4f/TB,fps=%.4f,tpad=stop_mode=clone:stop_duration=%.4f,"
+                     "minterpolate=fps=%d:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+                     "trim=end_frame=%d,setpts=PTS-STARTPTS[mo%d]" % (i, i, d[i], 1 / d[i], 2 * d[i], fps, round(d[i] * fps), i))
     prev, acc = "g0", lens[0]
     for i in range(1, n):
         out = "x%d" % i
-        if d[i - 1] >= 2 * step:
+        k = kinds[i - 1]
+        if k == "fade":
             parts.append("[%s][g%d]xfade=transition=fade:duration=%.4f:offset=%.4f[%s]" % (prev, i, d[i - 1], acc - d[i - 1], out))
             acc += lens[i] - d[i - 1]
+        elif k == "morph":
+            parts.append("[%s][mo%d][g%d]concat=n=3:v=1:a=0,fps=%d[%s]" % (prev, i - 1, i, fps, out))
+            acc += d[i - 1] + lens[i]
         else:  # too short for a blend: plain cut
             parts.append("[%s][g%d]concat=n=2:v=1:a=0,fps=%d[%s]" % (prev, i, fps, out))
             acc += lens[i]
         prev = out
-    return ";".join(parts) + ";[%s]null" % prev
+    # exactly as many frames as the cut plan says (xfade may drop the very last one): picture = sound length
+    total = sum(round(b * fps) - round(a * fps) for a, b in intervals)
+    return ";".join(parts) + ";[%s]tpad=stop_mode=clone:stop_duration=0.2,trim=end_frame=%d" % (prev, total)
 
 
 def render_thumb(workdir, video_name, name, at):
@@ -2488,3 +2519,44 @@ def camera_chain(k, info, crop_segs, sel, ow, oh, label, fps):
         frame = sel.lstrip(",") + ("," if sel else "") + \
             "scale=%d:%d:force_original_aspect_ratio=increase:%s,crop=%d:%d" % (ow, oh, SCALE, ow, oh)
     return "[%d:v]fps=%d,%s,%s,setsar=1[%s]" % (k, fps, frame, SHARPEN, label)
+
+
+def _crop_x(segs, t):
+    """Centre of the framing at clip time t (None without automatic framing)."""
+    for seg in segs or []:
+        if seg[0] <= t < seg[1]:
+            pts = seg[3] if len(seg) > 3 and seg[3] else [(seg[0], seg[2])]
+            before = [p for p in pts if p[0] <= t]
+            return (before[-1] if before else pts[0])[1]
+    return None
+
+
+def cut_kinds(video, info, start, intervals, fps, crop_segs=None, switches=(), length=DISSOLVE, limit=0.07):
+    """Per jump cut: "morph" when both sides show the same shot in nearly the same position (a morph then glides
+    smoothly), otherwise "fade" – a camera cut, a change of framing or speaker, or too much change in the
+    picture would make the interpolation smear. `switches` are clip times where something else changes."""
+    import numpy as np
+
+    W = info["width"]
+
+    def frame(t):
+        p = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.3f" % max(0.0, start + t), "-i", video, "-frames:v", "1",
+                            "-vf", "scale=160:90,format=gray", "-f", "rawvideo", "-"], capture_output=True)
+        return np.frombuffer(p.stdout, np.uint8).astype(np.float32) if len(p.stdout) == 160 * 90 else None
+
+    kinds = []
+    for (a0, b0), (a1, b1) in zip(intervals, intervals[1:]):
+        h = min(length, (b0 - a0) / 2, (b1 - a1) / 2) / 2
+        ta, tb = b0 - h, a1 + h
+        kind = "morph"
+        if any(ta - 0.3 <= s <= tb + 0.3 for s in switches):
+            kind = "fade"
+        xa, xb = _crop_x(crop_segs, ta), _crop_x(crop_segs, tb)
+        if kind == "morph" and xa is not None and xb is not None and abs(xa - xb) > 0.04 * W:
+            kind = "fade"
+        if kind == "morph":
+            fa, fb = frame(ta), frame(tb)
+            if fa is None or fb is None or float(np.mean(np.abs(fa - fb))) / 255 > limit:
+                kind = "fade"
+        kinds.append(kind)
+    return kinds

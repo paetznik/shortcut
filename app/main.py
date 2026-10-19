@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 import integrations
 import pipeline
@@ -40,7 +41,7 @@ DEFAULTS = {
     "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True, "precise_timing": True,
     "ai_check": True, "jumpcut_zoom": True, "blink_safe": True, "natural_pauses": True, "roomtone": True,
     "stabilize": False, "loop_end": True, "fmt_lengths": False, "speaker_colors": False, "blur_faces": False,
-    "blur_plates": False, "multicam": True, "cut_style": "weich",
+    "blur_plates": False, "multicam": True, "cut_style": "morph",
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -276,8 +277,8 @@ def clean_settings(s):
     for k in ("highlight", "keyword_color"):
         if not re.fullmatch(r"#[0-9A-Fa-f]{6}", out[k]):
             out[k] = DEFAULTS[k]
-    if out["cut_style"] not in ("weich", "zoom", "hart"):
-        out["cut_style"] = "weich"
+    if out["cut_style"] not in ("morph", "weich", "zoom", "hart"):
+        out["cut_style"] = "morph"
     if out["sub_style"] not in pipeline.SUB_STYLES:
         out["sub_style"] = "pop"
     out["music_volume"] = max(2, min(60, out["music_volume"]))
@@ -959,6 +960,75 @@ async def set_multicam(jid: str, request: Request):
     return public_job(job, with_text=True)
 
 
+# ---------------------------------------------------------------- quick preview of unsaved editor changes
+
+PREVIEW_LOCK = threading.Lock()
+
+
+def preview_override(body):
+    """Editor values for the preview, checked like a save."""
+    o = {}
+    try:
+        if "start" in body or "end" in body:
+            o["start"], o["end"] = float(body["start"]), float(body["end"])
+            if not 3 <= o["end"] - o["start"] <= 180 or o["start"] < 0:
+                raise HTTPException(400, "Clip muss zwischen 3 und 180 Sekunden lang sein")
+        for k in ("removed", "beeped"):
+            if k in body:
+                o[k] = sorted({round(float(x), 2) for x in body[k] or []})[:2000]
+        if body.get("crop_keys") is not None:
+            o["crop_keys"] = sorted([[max(0.0, float(t)), min(1.0, max(0.0, float(c)))] for t, c in body["crop_keys"]])[:50]
+        if body.get("blur_boxes") is not None:
+            o["blur_boxes"] = [[min(1.0, max(0.0, float(v))) for v in b[:4]] for b in body["blur_boxes"]][:8]
+    except (TypeError, ValueError, KeyError):
+        raise HTTPException(400, "Ungültige Angaben")
+    for k in ("title", "hook_text", "cover_text"):
+        if k in body:
+            o[k] = str(body[k])[:300]
+    if "keywords" in body:
+        kw = body["keywords"].split(",") if isinstance(body["keywords"], str) else body["keywords"] or []
+        o["keywords"] = [str(k).strip() for k in kw if str(k).strip()][:12]
+    if isinstance(body.get("style"), dict):
+        o["style"] = body["style"]
+    return o
+
+
+@app.post("/api/jobs/{jid}/clips/{idx}/preview")
+async def clip_preview(jid: str, idx: int, request: Request):
+    """A small, fast render of the clip with the editor's current (unsaved) settings – to check cuts and framing
+    before the full render. Leaves out the slow extras; text corrections in the subtitles show after saving."""
+    require_auth(request)
+    body = await request.json()
+    job = load_job(jid)
+    require_source(job)
+    if idx >= len(job["clips"]) or not job.get("info"):
+        raise HTTPException(404, "Unbekannt")
+    override = preview_override(body)
+    if not PREVIEW_LOCK.acquire(blocking=False):
+        raise HTTPException(429, "Es wird gerade schon eine Vorschau erstellt – einen Moment bitte.")
+    try:
+        return await run_in_threadpool(make_preview, jid, idx, override)
+    finally:
+        PREVIEW_LOCK.release()
+
+
+def make_preview(jid, idx, override):
+    t0 = time.time()
+    job = load_job(jid)
+    clip = job["clips"][idx]
+    p = prepare(jid, idx, job["info"], override, fast=True)
+    p["s"]["preview"] = True
+    name = "pv_" + (clip.get("uid") or str(idx))
+    c = p["clip"]
+    try:
+        render_variant(jid, p, name, p["out_words"], c.get("hook_text", c.get("title", "")), c.get("keywords", []), (540, 960),
+                       srt=False)
+    except Exception as e:
+        raise HTTPException(500, "Vorschau fehlgeschlagen: " + str(e)[:300])
+    return {"file": name + ".mp4", "duration": round(p["out_len"], 1), "seconds": round(time.time() - t0, 1),
+            "cuts": len(p["intervals"]) - 1, "morphs": (p.get("cut_kinds") or []).count("morph")}
+
+
 # ---------------------------------------------------------------- editing assistant (chat)
 
 @app.post("/api/jobs/{jid}/clips/{idx}/assist")
@@ -1511,7 +1581,7 @@ def get_music(name: str, request: Request):
 @app.get("/files/{jid}/{name}")
 def get_file(jid: str, name: str, request: Request, dl: int = 0):
     require_auth(request)
-    if not re.fullmatch(r"((clip\d{1,2}|c[0-9a-f]{6})(_v\d+)?(_4x5|_1x1|_cover|_[a-z]{2}|_\d{2}s)?\.(mp4|jpg|srt)|bestof_\d+\.(mp4|jpg))", name):
+    if not re.fullmatch(r"((pv_[0-9a-z]{1,8}|clip\d{1,2}|c[0-9a-f]{6})(_v\d+)?(_4x5|_1x1|_cover|_[a-z]{2}|_\d{2}s)?\.(mp4|jpg|srt)|bestof_\d+\.(mp4|jpg))", name):
         raise HTTPException(404, "Unbekannt")
     path = os.path.join(job_dir(jid), name)
     if not os.path.exists(path):
@@ -1604,11 +1674,21 @@ def shift_segs(segs, offset, duration):
     return out or None
 
 
-def prepare(jid, idx, info):
-    """Everything a render of this clip needs: cut intervals, words on the output timeline, zooms, framing, music."""
+def prepare(jid, idx, info, override=None, fast=False):
+    """Everything a render of this clip needs: cut intervals, words on the output timeline, zooms, framing, music.
+
+    `override` holds unsaved editor values (for the quick preview); `fast` leaves out the slow extras
+    (frame-exact cut polish, automatic blurring, extra cameras, stabilisation)."""
     job = load_job(jid)
     clip = dict(job["clips"][idx])
     s = dict(job["settings"])
+    if override:
+        style = override.pop("style", None)
+        clip.update(override)
+        if style:
+            s = clean_settings({**s, **style})
+    if fast:
+        s["stabilize"] = False
     src = os.path.join(JOBS, jid, job["source"])
     manual = manual_crop(clip, info)
     split_wanted = s.get("mode") == "split"
@@ -1635,7 +1715,7 @@ def prepare(jid, idx, info):
     if s.get("loop_end", True):
         intervals = pipeline.tighten_ends(intervals, [w for w in words if round(w["s"], 2) not in {round(r, 2) for r in removed}])
     fps = pipeline.out_fps(info)
-    if s.get("blink_safe", True):
+    if s.get("blink_safe", True) and not fast:
         try:
             intervals = pipeline.refine_cuts(src, info, clip["start"], intervals, words, fps)
         except Exception as e:
@@ -1662,13 +1742,13 @@ def prepare(jid, idx, info):
     music = os.path.join(MUSIC, s["music"]) if s.get("music") and os.path.exists(os.path.join(MUSIC, s["music"])) else None
 
     cams = []
-    if s.get("multicam", True) and job.get("cams") and not split and s.get("mode") == "auto" and not manual:
+    if s.get("multicam", True) and job.get("cams") and not split and s.get("mode") == "auto" and not manual and not fast:
         try:
             cams = camera_inputs(jid, job, clip, duration, det, head, intervals)
         except Exception as e:
             log(jid, "Weitere Kameras übersprungen: " + str(e)[:200])
     blur = []
-    if s.get("blur_faces") or s.get("blur_plates"):
+    if (s.get("blur_faces") or s.get("blur_plates")) and not fast:
         try:
             blur = pipeline.privacy_regions(src, info, clip["start"], clip["end"], bool(s.get("blur_faces")),
                                             bool(s.get("blur_plates")))
@@ -1677,6 +1757,14 @@ def prepare(jid, idx, info):
     W, H = info["width"], info["height"]
     blur += [{"x": b[0] * W, "y": b[1] * H, "w": max(8, int(b[2] * W)), "h": max(8, int(b[3] * H))}
              for b in clip.get("blur_boxes", [])]
+    kinds = None
+    if s.get("cut_style", "morph") == "morph" and len(intervals) > 1 and not split:
+        # morph only where both sides show the same shot; camera cuts, framing or camera switches get a dissolve
+        changes = [seg[0] for seg in (crop_segs or [])[1:]] + [c - head for c in (det or {}).get("cuts", [])] +                   [t for cam in cams for on in cam.get("on_src", []) for t in on]
+        try:
+            kinds = pipeline.cut_kinds(src, info, clip["start"], intervals, pipeline.out_fps(info), crop_segs, changes)
+        except Exception as e:
+            log(jid, "Morph-Prüfung übersprungen: " + str(e)[:200])
     music_offset, beats = 0.0, ()
     if music:
         beat = music_beat(music)
@@ -1711,7 +1799,7 @@ def prepare(jid, idx, info):
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
             "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail), "beeps": beeps,
             "end_text": end_text, "zooms": zooms, "static_max": static_max, "eye": eye, "quiet": quiet,
-            "roomtone_at": roomtone_at, "blur": blur, "cams": cams, "music_offset": music_offset}
+            "roomtone_at": roomtone_at, "blur": blur, "cams": cams, "music_offset": music_offset, "cut_kinds": kinds}
 
 
 BEATS = {}
@@ -1776,7 +1864,8 @@ def shorten(p, length, fps):
     clipped = lambda spans: [(a, min(b, T)) + tuple(x[2:]) for x in spans for a, b in [x[:2]] if a < T - 0.2]
     return dict(p, intervals=iv, out_len=T, out_words=[w for w in ws if w["s"] < T], end_text="",
                 zooms=clipped(p["zooms"] or []) or None, quiet=clipped(p["quiet"]), beeps=clipped(p["beeps"]),
-                cams=[dict(c, on=clipped(c["on"])) for c in p["cams"]])
+                cams=[dict(c, on=clipped(c["on"])) for c in p["cams"]],
+                cut_kinds=(p.get("cut_kinds") or [])[:max(0, len(iv) - 1)] or None)
 
 
 def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
@@ -1787,7 +1876,8 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
                                     p["s"], hook, p["out_len"], keywords, size, p["end_text"])
     out_len = pipeline.render_clip(p["src"], p["job"]["info"], clip["start"], clip["end"], d, base, p["s"], ass, burn,
                                    p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"], p["beeps"],
-                                   p["quiet"], p["roomtone_at"], p["eye"], p["blur"], p["cams"], p["music_offset"])
+                                   p["quiet"], p["roomtone_at"], p["eye"], p["blur"], p["cams"], p["music_offset"],
+                                   p.get("cut_kinds"))
     os.remove(os.path.join(d, ass))
     return out_len
 

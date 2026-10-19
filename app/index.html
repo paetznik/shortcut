@@ -105,6 +105,8 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
 .blurrect.drawing{border-color:var(--accent)}
 .blurrect button{position:absolute;top:-2px;right:-2px;border:0;background:var(--err);color:#fff;border-radius:0 4px 0 6px;font-size:13px;line-height:1;padding:3px 6px;cursor:pointer}
 .assist{background:var(--panel2);border-radius:9px;padding:8px 10px}
+.pvbox{display:flex;gap:12px;align-items:flex-start;background:var(--panel2);border-radius:9px;padding:8px}
+.pvbox video{width:180px;aspect-ratio:9/16;background:#000;border-radius:6px;flex:none}
 .cutl canvas{width:100%;height:86px;display:block;background:var(--bg);border:1px solid var(--line);border-radius:8px;touch-action:none}
 .cutl:focus{outline:none}
 .cutl:focus canvas{border-color:var(--accent)}
@@ -731,8 +733,26 @@ function extrasUI(i){
     chk("e_x_blur_plates"+i,s.blur_plates,"Kennzeichen unkenntlich (experimentell)")+'</div>'+
     '<div style="margin-top:6px"><label>Übergang an Schnitten</label><select id="e_x_cut_style'+i+'">'+cutOpts(s.cut_style)+'</select></div></div>';
 }
+function previewUI(i){
+  var pv=(S.preview||{})[tlKey(i)];
+  return '<div id="pv'+i+'">'+(pv?'<div class="pvbox"><video src="'+pv.url+'" controls playsinline autoplay></video><div class="muted small">'+esc(pv.note)+'</div></div>':'')+'</div>';
+}
+function makePreview(i){
+  var body=clipBody(i);
+  if(isNaN(body.start)||isNaN(body.end)) return toast("Ungültige Zeit");
+  delete body.text;delete body.caption;
+  var b=$("pvb"+i),key=tlKey(i),t0=Date.now();b.disabled=true;b.textContent="Erstelle Vorschau …";
+  var tick=setInterval(function(){var el=$("pvb"+i);if(el) el.textContent="Erstelle Vorschau … "+Math.round((Date.now()-t0)/1000)+" s"},1000);
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+i+"/preview",body).then(function(r){
+    clearInterval(tick);if(!S.preview) S.preview={};
+    S.preview[key]={url:"/files/"+S.job.id+"/"+r.file+"?v="+Date.now(),
+      note:"Vorschau in geringer Auflösung ("+r.duration+" s, "+r.cuts+" Schnitte"+(r.morphs?", davon "+r.morphs+" als Morph-Cut":"")+", erstellt in "+r.seconds+" s). Noch nicht gespeichert – wenn es passt: „Speichern und neu rendern“."};
+    var el=$("pv"+i);if(el) el.outerHTML=previewUI(i);
+    var bb=$("pvb"+i);if(bb){bb.disabled=false;bb.textContent="▶ Schnelle Vorschau"}
+  }).catch(function(e){clearInterval(tick);var bb=$("pvb"+i);if(bb){bb.disabled=false;bb.textContent="▶ Schnelle Vorschau"}toast(e.message)});
+}
 function cutOpts(v){
-  return opt("weich",v||"weich","Weich überblenden (empfohlen)")+opt("zoom",v,"Zoom-Sprung (Punch-in)")+opt("hart",v,"Harter Schnitt");
+  return opt("morph",v||"morph","Morph-Cut – fließend (empfohlen)")+opt("weich",v,"Weich überblenden")+opt("zoom",v,"Zoom-Sprung (Punch-in)")+opt("hart",v,"Harter Schnitt");
 }
 function moreCard(j){
   if(!["fertig","fehler"].includes(j.status)||j.source_deleted) return '';
@@ -866,7 +886,8 @@ function editor(c,i,review){
     '<div><label>Beschreibung für Social Media</label><textarea id="e_c'+i+'">'+esc(c.caption||"")+'</textarea></div>'+
     '<div class="muted small">Zeiten als Minuten:Sekunden, z. B. 3:12.5. Bei geänderten Zeiten passen sich die Untertitel an.</div>'+
     extrasUI(i)+
-    '<div class="row" style="gap:8px"><button class="btn sm primary" onclick="saveClip('+i+')">'+(review?"Speichern":"Speichern und neu rendern")+'</button>'+
+    previewUI(i)+
+    '<div class="row" style="gap:8px"><button class="btn sm" id="pvb'+i+'" onclick="makePreview('+i+')">▶ Schnelle Vorschau</button><button class="btn sm primary" onclick="saveClip('+i+')">'+(review?"Speichern":"Speichern und neu rendern")+'</button>'+
     (!review?'<button class="btn sm" onclick="splitClip('+i+')">In Teile zerlegen</button>':'')+'<button class="btn sm danger" onclick="deleteClip('+i+')">Clip löschen</button></div></div>';
 }
 function lengthNote(sec){
