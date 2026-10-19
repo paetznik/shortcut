@@ -39,7 +39,8 @@ DEFAULTS = {
     "sub_style": "pop", "keyword_color": "#4ADE80", "zoom": True, "enhance_audio": True, "music": "", "music_volume": 15,
     "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True, "precise_timing": True,
     "ai_check": True, "jumpcut_zoom": True, "blink_safe": True, "natural_pauses": True, "roomtone": True,
-    "stabilize": False, "loop_end": True,
+    "stabilize": False, "loop_end": True, "fmt_lengths": False, "speaker_colors": False, "blur_faces": False,
+    "blur_plates": False, "multicam": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -509,6 +510,10 @@ async def edit_clip(jid: str, idx: int, request: Request):
     """Change timing, titles or transcript of a clip; renders it again unless the job is still in review."""
     require_auth(request)
     body = await request.json()
+    return public_job(apply_edit(jid, idx, body), with_text=True)
+
+
+def apply_edit(jid, idx, body):
     with lock:
         job = load_job(jid)
         if job["status"] not in ("fertig", "fehler", "prüfen") or idx >= len(job["clips"]):
@@ -554,6 +559,12 @@ async def edit_clip(jid: str, idx: int, request: Request):
                 clip["removed"] = sorted({round(float(x), 2) for x in body["removed"]})[:2000]
             except (TypeError, ValueError):
                 raise HTTPException(400, "Ungültige Wortauswahl")
+        if "blur_boxes" in body:  # areas made unrecognisable by hand: [x, y, w, h] as parts of the source picture
+            try:
+                boxes = [[round(min(1.0, max(0.0, float(v))), 4) for v in b[:4]] for b in body["blur_boxes"] or []]
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Ungültiger Bereich")
+            clip["blur_boxes"] = [b for b in boxes if len(b) == 4 and b[2] > 0.01 and b[3] > 0.01][:8]
         if "style" in body:
             job["settings"] = clean_settings({**job["settings"], **body["style"]})
         if job["status"] != "prüfen":
@@ -562,7 +573,7 @@ async def edit_clip(jid: str, idx: int, request: Request):
             job["message"] = "Clip %d wird neu gerendert" % (idx + 1)
             work.put(("render", jid, idx))
         save_job(job)
-    return public_job(job, with_text=True)
+    return job
 
 
 @app.get("/api/jobs/{jid}/transcript")
@@ -816,6 +827,165 @@ def listen(jid: str, request: Request, start: float, end: float):
     if p.returncode != 0 or not p.stdout:
         raise HTTPException(400, "Ton konnte nicht gelesen werden")
     return Response(p.stdout, media_type="audio/mpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+# ---------------------------------------------------------------- several cameras
+
+@app.post("/api/jobs/{jid}/cams")
+async def add_camera(jid: str, request: Request):
+    """Another recording of the same scene (second camera); it is synchronised by its sound in the queue."""
+    require_auth(request)
+    body = await request.json()
+    part = upload_path(str(body.get("upload_id", "")))
+    if not os.path.exists(part) or os.path.getsize(part) < 1000:
+        raise HTTPException(400, "Upload fehlt oder ist leer")
+    with lock:
+        job = load_job(jid)
+        require_source(job)
+        if job["status"] not in ("fertig", "fehler"):
+            raise HTTPException(400, "Bitte warten, bis das Projekt fertig ist.")
+        cams = job.setdefault("cams", [])
+        if len(cams) >= 3:
+            raise HTTPException(400, "Höchstens drei weitere Kameras")
+        name = os.path.basename(str(body.get("filename") or "kamera.mp4"))[:120]
+        ext = os.path.splitext(name)[1].lower()
+        ext = ext if ext in (".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi") else ".mp4"
+        fname = "cam%s%s" % (uuid.uuid4().hex[:6], ext)
+        os.replace(part, os.path.join(JOBS, jid, fname))
+        try:
+            info = pipeline.probe(os.path.join(JOBS, jid, fname))
+        except Exception:
+            os.remove(os.path.join(JOBS, jid, fname))
+            raise HTTPException(400, "Die Datei ist kein lesbares Video")
+        if not info.get("has_audio", True):
+            os.remove(os.path.join(JOBS, jid, fname))
+            raise HTTPException(400, "Die Kamera-Aufnahme braucht eine Tonspur, damit sie synchronisiert werden kann")
+        cams.append({"file": fname, "name": name, "info": info, "offset": None})
+        save_job(job)
+    return queue_extra(jid, "cam", len(cams) - 1, "Synchronisiere Kamera %d …" % (len(cams) + 1))
+
+
+def sync_camera(jid, n):
+    job = load_job(jid)
+    cam = job["cams"][n]
+    d, conf = pipeline.sync_offset(os.path.join(JOBS, jid, job["source"]), os.path.join(JOBS, jid, cam["file"]))
+    with lock:
+        job = load_job(jid)
+        if n < len(job.get("cams", [])) and job["cams"][n]["file"] == cam["file"]:
+            job["cams"][n].update(offset=d, confidence=conf)
+            save_job(job)
+    if conf < 5:
+        return "Fertig – Kamera %d: Ton passt kaum zusammen (Sicherheit %.0f) – bitte prüfen" % (n + 2, conf)
+    return "Fertig – Kamera %d synchronisiert (Versatz %+.2f s). Clips neu rendern, um sie zu nutzen." % (n + 2, d)
+
+
+@app.delete("/api/jobs/{jid}/cams/{n}")
+def delete_camera(jid: str, n: int, request: Request):
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if job["status"] in ("wartet", "läuft"):
+            raise HTTPException(400, "Bitte warten, bis das Projekt fertig ist.")
+        if n >= len(job.get("cams", [])):
+            raise HTTPException(404, "Unbekannt")
+        cam = job["cams"].pop(n)
+        try:
+            os.remove(os.path.join(JOBS, jid, cam["file"]))
+        except OSError:
+            pass
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.post("/api/jobs/{jid}/multicam")
+async def set_multicam(jid: str, request: Request):
+    require_auth(request)
+    on = bool((await request.json()).get("on"))
+    with lock:
+        job = load_job(jid)
+        job["settings"] = clean_settings({**job["settings"], "multicam": on})
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+# ---------------------------------------------------------------- editing assistant (chat)
+
+@app.post("/api/jobs/{jid}/clips/{idx}/assist")
+async def assist(jid: str, idx: int, request: Request):
+    """A wish in plain words ("take out the part about prices", "under 30 seconds") becomes an edit of the clip."""
+    require_auth(request)
+    wish = str((await request.json()).get("text") or "").strip()[:600]
+    if not wish:
+        raise HTTPException(400, "Bitte schreib, was geändert werden soll.")
+    key = load_config().get("anthropic_key", "")
+    if not key:
+        raise HTTPException(400, "Für den Schnitt-Assistenten wird ein Claude-API-Schlüssel benötigt (Einstellungen).")
+    job = load_job(jid)
+    if idx >= len(job["clips"]):
+        raise HTTPException(404, "Unbekannt")
+    clip = job["clips"][idx]
+    words = [w for w in pipeline.all_words(load_transcript(jid)) if w["e"] > clip["start"] - 30 and w["s"] < clip["end"] + 30]
+    removed = {round(x, 2) for x in clip.get("removed", [])}
+    beeped = {round(x, 2) for x in clip.get("beeped", [])}
+
+    def mark(w):
+        m = "-" if round(w["s"], 2) in removed else "*" if round(w["s"], 2) in beeped else ""
+        inside = clip["start"] - 0.05 <= w["s"] < clip["end"]
+        return "%s%s" % ("" if inside else "~", m)
+
+    lines = " ".join("[%d|%.1f%s]%s" % (k, w["s"], mark(w), w["w"]) for k, w in enumerate(words))
+    prompt = (
+        "Du bist Cutter für deutschsprachige Shorts/Reels. Ein Clip soll nach dem Wunsch des Nutzers geändert werden.\n"
+        "Wörter im Format [Nummer|Startzeit Markierung]Wort. Markierungen: ~ = liegt außerhalb des Clips (Kontext davor/"
+        "danach), - = ist herausgeschnitten, * = ist überpiept.\n"
+        "Aktuell: Start %.2f s, Ende %.2f s (Länge %.1f s), Titel: %s, Hook-Text: %s, Beschreibung: %s, Schlüsselwörter: %s\n\n"
+        "WÖRTER:\n%s\n\nWUNSCH: %s\n\n"
+        "Regeln: Start immer auf ein Wort (start_word = Nummer des ersten Wortes), Ende nach einem Wort (end_word = Nummer "
+        "des letzten Wortes), möglichst an Satzgrenzen. Clip 3-180 s. Teile entfernen mit cut (Wortnummern), wieder "
+        "hereinnehmen mit uncut; beep/unbeep zum Überpiepen. Titel/Hook/Beschreibung/Schlüsselwörter nur ändern, wenn "
+        "der Wunsch es verlangt. Erfinde nichts dazu.\n"
+        "Antworte NUR mit JSON: {\"start_word\": Zahl oder null, \"end_word\": Zahl oder null, \"cut\": [], \"uncut\": [], "
+        "\"beep\": [], \"unbeep\": [], \"title\": null, \"hook_text\": null, \"caption\": null, \"keywords\": null, "
+        "\"explanation\": \"ein Satz auf Deutsch, was du geändert hast\", \"question\": null oder eine Rückfrage, falls "
+        "der Wunsch unklar ist}"
+    ) % (clip["start"], clip["end"], clip["end"] - clip["start"], clip.get("title", ""), clip.get("hook_text", ""),
+         clip.get("caption", "")[:400], ", ".join(clip.get("keywords", [])), lines, wish)
+    try:
+        res = pipeline.claude_json(key, prompt, max_tokens=1500, feature="Schnitt-Assistent")
+    except Exception as e:
+        raise HTTPException(502, "Assistent nicht erreichbar: " + str(e)[:200])
+
+    def word(k):
+        try:
+            return words[int(k)]
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    body = {}
+    if word(res.get("start_word")):
+        body["start"] = round(max(0.0, word(res["start_word"])["s"] - 0.05), 2)
+    if word(res.get("end_word")):
+        body["end"] = round(word(res["end_word"])["e"] + 0.15, 2)
+    for field, current, add, drop in (("removed", removed, "cut", "uncut"), ("beeped", beeped, "beep", "unbeep")):
+        new = set(current)
+        new |= {round(word(k)["s"], 2) for k in res.get(add) or [] if word(k)}
+        new -= {round(word(k)["s"], 2) for k in res.get(drop) or [] if word(k)}
+        if new != current:
+            body[field] = sorted(new)
+    for k in ("title", "hook_text", "caption"):
+        if isinstance(res.get(k), str) and res[k].strip():
+            body[k] = res[k].strip()
+    if isinstance(res.get("keywords"), list):
+        body["keywords"] = [str(x) for x in res["keywords"]][:12]
+    explanation = str(res.get("explanation") or "").strip()[:300]
+    question = str(res.get("question") or "").strip()[:300]
+    if not body:
+        out = public_job(job, with_text=True)
+        out["assistant"] = question or explanation or "Dazu habe ich nichts zu ändern gefunden."
+        return out
+    out = public_job(apply_edit(jid, idx, body), with_text=True)
+    out["assistant"] = explanation or "Erledigt."
+    return out
 
 
 @app.post("/api/jobs/{jid}/clips/{idx}/duplicate")
@@ -1179,13 +1349,16 @@ def export_project(jid: str, request: Request):
 
 @app.post("/api/jobs/{jid}/render")
 def render_all(jid: str, request: Request):
-    """Leave review mode and render every clip."""
+    """Leave review mode and render every clip – or render all finished clips again (e.g. with a new camera);
+    their current versions go to the trash."""
     require_auth(request)
     with lock:
         job = load_job(jid)
-        if job["status"] != "prüfen":
-            raise HTTPException(400, "Projekt ist nicht im Prüfmodus")
+        if job["status"] not in ("prüfen", "fertig", "fehler"):
+            raise HTTPException(400, "Bitte warten, bis das Projekt fertig ist.")
         require_source(job)
+        for c in job["clips"]:
+            keep_previous(c)
         job["status"], job["message"] = "wartet", "Clips werden gerendert"
         save_job(job)
     work.put(("render_all", jid, None))
@@ -1287,7 +1460,7 @@ def get_music(name: str, request: Request):
 @app.get("/files/{jid}/{name}")
 def get_file(jid: str, name: str, request: Request, dl: int = 0):
     require_auth(request)
-    if not re.fullmatch(r"((clip\d{1,2}|c[0-9a-f]{6})(_v\d+)?(_4x5|_1x1|_cover|_[a-z]{2})?\.(mp4|jpg|srt)|bestof_\d+\.(mp4|jpg))", name):
+    if not re.fullmatch(r"((clip\d{1,2}|c[0-9a-f]{6})(_v\d+)?(_4x5|_1x1|_cover|_[a-z]{2}|_\d{2}s)?\.(mp4|jpg|srt)|bestof_\d+\.(mp4|jpg))", name):
         raise HTTPException(404, "Unbekannt")
     path = os.path.join(job_dir(jid), name)
     if not os.path.exists(path):
@@ -1332,7 +1505,7 @@ FORMATS = {"4x5": (1080, 1350), "1x1": (1080, 1080)}
 def clip_files(clip):
     """Every file that belongs to the current version of a clip."""
     files = [clip.get(k) for k in ("file", "thumb", "srt", "cover")]
-    files += list((clip.get("formats") or {}).values())
+    files += list((clip.get("formats") or {}).values()) + list((clip.get("lengths") or {}).values())
     for t in (clip.get("translations") or {}).values():
         files += [t.get("file"), t.get("srt")]
     return [f for f in files if f]
@@ -1399,6 +1572,12 @@ def prepare(jid, idx, info):
     for w in words:  # clip_words gives clip-relative times; the marks are absolute word starts
         if round(w["s"] + clip["start"], 2) in beeped:
             w["beep"] = True
+    if s.get("speaker_colors"):
+        try:
+            for w, k in zip(words, pipeline.voice_speakers(src, clip["start"], clip["end"], words) or []):
+                w["spk"] = k
+        except Exception as e:
+            log(jid, "Sprecherfarben übersprungen: " + str(e)[:200])
     intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True), removed,
                                         natural=s.get("natural_pauses", True))
     intervals = pipeline.add_spans(intervals, reaction_spans(jid, clip["start"], clip["end"]), duration)
@@ -1431,11 +1610,34 @@ def prepare(jid, idx, info):
         s["split_layout"] = bool(split)
     music = os.path.join(MUSIC, s["music"]) if s.get("music") and os.path.exists(os.path.join(MUSIC, s["music"])) else None
 
-    # picture rhythm: speaker switches count as a change; zooms at jump cuts and to keep long takes alive
-    switches = [pipeline.remap(seg[0], intervals) for seg in (crop_segs or [])[1:]]
+    cams = []
+    if s.get("multicam", True) and job.get("cams") and not split and s.get("mode") == "auto" and not manual:
+        try:
+            cams = camera_inputs(jid, job, clip, duration, det, head, intervals)
+        except Exception as e:
+            log(jid, "Weitere Kameras übersprungen: " + str(e)[:200])
+    blur = []
+    if s.get("blur_faces") or s.get("blur_plates"):
+        try:
+            blur = pipeline.privacy_regions(src, info, clip["start"], clip["end"], bool(s.get("blur_faces")),
+                                            bool(s.get("blur_plates")))
+        except Exception as e:
+            log(jid, "Unkenntlich machen fehlgeschlagen: " + str(e)[:200])
+    W, H = info["width"], info["height"]
+    blur += [{"x": b[0] * W, "y": b[1] * H, "w": max(8, int(b[2] * W)), "h": max(8, int(b[3] * H))}
+             for b in clip.get("blur_boxes", [])]
+    music_offset, beats = 0.0, ()
+    if music:
+        beat = music_beat(music)
+        if beat:
+            music_offset, beats = pipeline.beat_offset(beat, pipeline.cut_points(intervals), out_len)
+
+    # picture rhythm: speaker and camera switches count as a change; zooms at jump cuts and to keep long takes alive
+    switches = [pipeline.remap(seg[0], intervals) for seg in (crop_segs or [])[1:]] + \
+               [t for cam in cams for on in cam["on"] for t in on]
     zoom_on, jumpcuts = s.get("zoom", True), s.get("jumpcut_zoom", True)
     zooms = pipeline.zoom_spans(out_words, intervals, out_len, jumpcuts=jumpcuts, rhythm=zoom_on, switches=switches,
-                                loop=s.get("loop_end", True)) if (zoom_on or jumpcuts) and not split else None
+                                loop=s.get("loop_end", True), beats=beats) if (zoom_on or jumpcuts) and not split else None
     changes = sorted(set([0.0, out_len] + switches + pipeline.cut_points(intervals) +
                          [e for z in (zooms or []) for e in z[:2]]))
     static_max = max((b - a for a, b in zip(changes, changes[1:])), default=out_len)
@@ -1457,7 +1659,71 @@ def prepare(jid, idx, info):
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
             "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail), "beeps": beeps,
             "end_text": end_text, "zooms": zooms, "static_max": static_max, "eye": eye, "quiet": quiet,
-            "roomtone_at": roomtone_at}
+            "roomtone_at": roomtone_at, "blur": blur, "cams": cams, "music_offset": music_offset}
+
+
+BEATS = {}
+
+
+def music_beat(path):
+    key = (path, os.path.getmtime(path))
+    if key not in BEATS:
+        try:
+            BEATS[key] = pipeline.music_beats(path)
+        except Exception:
+            BEATS[key] = None
+    return BEATS[key]
+
+
+def camera_inputs(jid, job, clip, duration, det, head, intervals):
+    """Extra cameras for one clip: when each one is shown (the close-up of whoever speaks) and how it is framed."""
+    fps_det = (det or {}).get("fps", 5)
+    off = int(round(head * fps_det))
+    main = None
+    if det and det.get("tracks"):  # the main camera's analysis covers the range before the start was snapped
+        main = dict(det, width=job["info"]["width"],
+                    tracks=[dict(t, motion={f - off: v for f, v in t["motion"].items() if f >= off}) for t in det["tracks"]])
+    dets, starts = [main], []
+    for cam in job["cams"]:
+        cs = clip["start"] + float(cam.get("offset") or 0)
+        ok = cam.get("offset") is not None and cs >= 0 and cs + duration <= cam["info"]["duration"] + 0.05
+        d = pipeline.detect_faces(os.path.join(JOBS, jid, cam["file"]), cam["info"], cs, cs + duration) if ok else None
+        if d is not None:
+            d["width"] = cam["info"]["width"]
+        dets.append(d)
+        starts.append(cs)
+    plan = pipeline.camera_plan(dets, duration)
+    out = []
+    for j, cam in enumerate(job["cams"], 1):
+        on = [(round(pipeline.remap(a, intervals), 3), round(pipeline.remap(b, intervals), 3)) for a, b, c in plan if c == j]
+        on = [x for x in on if x[1] - x[0] > 0.3]
+        if on and dets[j]:
+            out.append({"path": os.path.join(JOBS, jid, cam["file"]), "start": starts[j - 1], "info": cam["info"],
+                        "crop_segs": pipeline.speaker_segments(dets[j], duration), "on": on})
+    return out
+
+
+def shorten(p, length, fps):
+    """The same clip cut down to about `length` seconds, ending on a sentence end (at least 60 % of the length)."""
+    ws = p["out_words"]
+    ends = [w for w in ws if w["e"] <= length - 0.15]
+    if not ends:
+        return None
+    sent = [w for w in ends if w["w"][-1:] in ".!?" and w["e"] >= 0.6 * length]
+    T = min(p["out_len"], (sent or ends)[-1]["e"] + 0.15)
+    iv, acc = [], 0.0
+    for a, b in p["intervals"]:
+        if acc >= T - 1e-6:
+            break
+        take = min(b - a, T - acc)
+        iv.append((a, a + take))
+        acc += take
+    iv = pipeline.quantize(iv, fps)
+    T = sum(b - a for a, b in iv)
+    clipped = lambda spans: [(a, min(b, T)) + tuple(x[2:]) for x in spans for a, b in [x[:2]] if a < T - 0.2]
+    return dict(p, intervals=iv, out_len=T, out_words=[w for w in ws if w["s"] < T], end_text="",
+                zooms=clipped(p["zooms"] or []) or None, quiet=clipped(p["quiet"]), beeps=clipped(p["beeps"]),
+                cams=[dict(c, on=clipped(c["on"])) for c in p["cams"]])
 
 
 def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
@@ -1468,7 +1734,7 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
                                     p["s"], hook, p["out_len"], keywords, size, p["end_text"])
     out_len = pipeline.render_clip(p["src"], p["job"]["info"], clip["start"], clip["end"], d, base, p["s"], ass, burn,
                                    p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"], p["beeps"],
-                                   p["quiet"], p["roomtone_at"], p["eye"])
+                                   p["quiet"], p["roomtone_at"], p["eye"], p["blur"], p["cams"], p["music_offset"])
     os.remove(os.path.join(d, ass))
     return out_len
 
@@ -1521,6 +1787,15 @@ def render_one(jid, idx, info):
         base = name if fmt == "9x16" else name + "_" + fmt
         out_len = render_variant(jid, p, base, p["out_words"], hook, keywords, size, srt=fmt == "9x16")
         outputs[fmt] = base + ".mp4"
+    lengths = {}
+    if s.get("fmt_lengths"):  # shorter cuts of the same highlight for TikTok, Reels and Shorts
+        fps = pipeline.out_fps(info)
+        for target in (15, 30, 60):
+            q = shorten(p, target, fps) if out_len > target + 3 else None
+            if q and q["out_len"] >= 0.6 * target:
+                base = "%s_%ds" % (name, target)
+                render_variant(jid, q, base, q["out_words"], hook, keywords, (1080, 1920), srt=False)
+                lengths[str(target)] = base + ".mp4"
     pipeline.render_thumb(d, name + ".mp4", name, min(1.0, out_len / 2))
     cover = None
     if s.get("cover", True):
@@ -1546,7 +1821,7 @@ def render_one(jid, idx, info):
         except Exception as e:
             log(jid, "KI-Endkontrolle fehlgeschlagen: " + str(e)[:200])
 
-    keep = {name + ".mp4", name + ".jpg", name + ".srt", cover} | set(outputs.values())
+    keep = {name + ".mp4", name + ".jpg", name + ".srt", cover} | set(outputs.values()) | set(lengths.values())
     if not clip.get("prev"):  # with a kept previous version, its files go to the trash instead
         for old in clip_files(clip):
             if old not in keep:
@@ -1561,7 +1836,7 @@ def render_one(jid, idx, info):
             trash_add(job, "version", prev, idx)
         job["clips"][idx].update({
             "file": outputs["9x16"], "thumb": name + ".jpg", "srt": name + ".srt", "cover": cover,
-            "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "version": version, "status": "fertig",
+            "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "lengths": lengths, "version": version, "status": "fertig",
             "duration_out": round(out_len, 1), "speakers": len({seg[2] for seg in p["crop_segs"] or []}),
             "translations": {}, "checks": checks, "split": bool(p["split"]), "uid": uid,
         })
@@ -1902,9 +2177,11 @@ def extra_task(jid, kind, arg):
     """Translation or best-of on a finished project; a failure is reported but leaves the clips usable."""
     update(jid, status="läuft", progress=50)
     n = len(load_job(jid)["clips"])
-    label = {"translate": "Übersetzung", "bestof": "Best-of", "texts": "Texterstellung"}[kind]
+    label = {"translate": "Übersetzung", "bestof": "Best-of", "texts": "Texterstellung", "cam": "Kamera-Synchronisation"}[kind]
     try:
-        if kind == "texts":
+        if kind == "cam":
+            msg = sync_camera(jid, arg)
+        elif kind == "texts":
             job = load_job(jid)
             texts = pipeline.generate_texts(load_config().get("anthropic_key", ""), load_transcript(jid), job.get("context", ""))
             update(jid, texts=texts)
@@ -1935,7 +2212,7 @@ def worker():
                 process(jid)
             elif kind == "render_all":
                 render_clips(jid, load_job(jid)["info"])
-            elif kind in ("translate", "bestof", "texts"):
+            elif kind in ("translate", "bestof", "texts", "cam"):
                 extra_task(jid, kind, idx)
             else:
                 rerender(jid, idx)

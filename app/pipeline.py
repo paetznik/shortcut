@@ -553,6 +553,8 @@ def remap_words(words, intervals):
         nw = {"w": w["w"], "s": remap(w["s"], intervals), "e": remap(w["e"], intervals)}
         if w.get("beep"):
             nw["beep"] = True
+        if w.get("spk") is not None:
+            nw["spk"] = w["spk"]
         out.append(nw)
     return out
 
@@ -919,13 +921,30 @@ def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, k
         events.append("Dialogue: 1,%s,%s,Hook,,0,0,0,,{\\fad(120,250)\\fscx90\\fscy90\\t(0,150,\\fscx100\\fscy100)}%s"
                       % (ass_time(0), ass_time(end), ass_escape(hook_text.strip())))
 
+    spk_cols = [hex_to_ass(c) for c in SPEAKER_COLORS]
+
     def coloured(x):
-        return ("{\\c%s&}%s{\\r}" % (kw_col, txt(x["w"]))) if norm_word(x["w"]) in keys else txt(x["w"])
+        if norm_word(x["w"]) in keys:
+            return "{\\c%s&}%s{\\r}" % (kw_col, txt(x["w"]))
+        if x.get("spk"):  # the second (third) voice gets its own colour; the first stays white
+            return "{\\c%s&}%s{\\r}" % (spk_cols[min(x["spk"], 2)], txt(x["w"]))
+        return txt(x["w"])
 
     if look == "satz":
         chunks = chunk_words(words, 12, 42)
     else:
         chunks = chunk_words(words, max_words)
+    if any(w.get("spk") for w in words):  # a line never mixes two speakers
+        split = []
+        for ch in chunks:
+            part = [ch[0]]
+            for w in ch[1:]:
+                if w.get("spk", 0) != part[-1].get("spk", 0):
+                    split.append(part)
+                    part = []
+                part.append(w)
+            split.append(part)
+        chunks = split
     for n, chunk in enumerate(chunks, 1):
         c_end = chunk[-1]["e"]
         srt.append("%d\n%s --> %s\n%s\n" % (n, srt_time(chunk[0]["s"]), srt_time(c_end), " ".join(w["w"] for w in chunk)))
@@ -964,7 +983,7 @@ def cut_points(intervals):
     return pts
 
 
-def zoom_spans(words, intervals, total, every=4.5, jumpcuts=True, rhythm=True, switches=(), loop=False):
+def zoom_spans(words, intervals, total, every=4.5, jumpcuts=True, rhythm=True, switches=(), loop=False, beats=()):
     """Zoom spans (output time) as (start, end, ramp_in, ramp_out).
 
     Jump cuts: the framing changes at every cut (punch-in, hard, like a second camera), so a cut inside a sentence
@@ -987,6 +1006,9 @@ def zoom_spans(words, intervals, total, every=4.5, jumpcuts=True, rhythm=True, s
         for a, b in zip(changes, changes[1:]):  # fill every stretch that would stand still too long
             n = int((b - a) // every)
             soft += [round(a + (b - a) * k / (n + 1), 4) for k in range(1, n + 1)] if b - a > every else []
+    if beats:  # changes inside a take move onto the nearest beat of the music
+        soft = [min(beats, key=lambda x: abs(x - p)) if min(abs(x - p) for x in beats) <= 0.3 else p for p in soft]
+        soft = [p for p in soft if 0.6 < p < total - 0.4]
     points = sorted([(p, 0.0) for p in picked] + [(p, 0.5) for p in soft if all(abs(p - q) >= 0.6 for q in picked)])
     if loop and len(points) % 2:  # odd number of changes would end zoomed in: drop the last soft one
         k = max((i for i, (p, r) in enumerate(points) if r), default=len(points) - 1)
@@ -1076,7 +1098,7 @@ def filter_path(path):
 XFADE = 0.02  # each side of a cut reaches this far into the cut-away audio, for a 40 ms cross-fade
 
 
-def audio_chain(intervals, cut, enhance, music, music_volume, beeps=(), quiet=(), roomtone=None):
+def audio_chain(intervals, cut, enhance, music, music_volume, beeps=(), quiet=(), roomtone=None, music_idx=1):
     """Voice clean-up (rumble, AI noise reduction, sibilance, levelling), 40 ms cross-fades at every cut (the two
     sides overlap like in an editing program, so a cut never clicks or drops into silence and the length stays
     exact), breaths in pauses turned down, a bed of the room's own sound under the cleaned voice, and optional
@@ -1123,9 +1145,9 @@ def audio_chain(intervals, cut, enhance, music, music_volume, beeps=(), quiet=()
               "[vr][rt]amix=inputs=2:duration=first:normalize=0" % (idx, length - 0.08, int(length * 48000)))
     if music:
         a += (",asplit=2[vs][vm];"
-              "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=%.2f[m];"
+              "[%d:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=%.2f[m];"
               "[m][vs]sidechaincompress=threshold=0.03:ratio=10:attack=15:release=400[md];"
-              "[vm][md]amix=inputs=2:duration=first:normalize=0" % (music_volume / 100))
+              "[vm][md]amix=inputs=2:duration=first:normalize=0" % (music_idx, music_volume / 100))
     return a + ",loudnorm=I=-14:TP=-1.5:LRA=11[a]"
 
 
@@ -1153,7 +1175,9 @@ def stabilize_filter(video, start, duration, workdir):
 
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
                 size=(1080, 1920), zoom_spans_out=None, music=None, split=None, beeps=(), quiet=(), roomtone_at=None,
-                eye=0.4):
+                eye=0.4, blur=None, cams=None, music_offset=0.0):
+    """One clip from the source: cuts, framing, optional stabilisation, blurred areas, extra cameras (each a list
+    item {"path", "start", "info", "crop_segs", "on": [(t0, t1) output time]}), zooms, subtitles and sound."""
     ow, oh = size
     fps = out_fps(info)
     duration = end - start
@@ -1162,22 +1186,34 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
     graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh, split)
     if style.get("stabilize"):
         graph = graph.replace("[0:v]", "[0:v]" + stabilize_filter(video, start, duration, workdir) + ",", 1)
+    if blur:  # areas made unrecognisable on the source picture, before stabilising and cropping
+        graph = blur_graph(blur, info["width"], info["height"]) + graph.replace("[0:v]", "[vb]", 1)
+    cmd = [FFMPEG, "-y", "-ss", "%.3f" % start, "-t", "%.3f" % duration, "-i", video]
+    cams = [c for c in (cams or []) if c.get("on")] if not split else []
+    if cams:  # other cameras are laid over the main picture while they are on
+        graph += "[m0]"
+        for j, cam in enumerate(cams, 1):
+            cmd += ["-ss", "%.3f" % cam["start"], "-t", "%.3f" % duration, "-i", cam["path"]]
+            graph += ";" + camera_chain(j, cam["info"], cam.get("crop_segs"), sel, ow, oh, "c%d" % j, fps)
+            on = "+".join("between(t,%.3f,%.3f)" % s for s in cam["on"])
+            graph += ";[m%d][c%d]overlay=0:0:enable='%s'[m%d]" % (j - 1, j, on, j)
+        graph += ";[m%d]null" % len(cams)
     if zoom_spans_out and not split:
         graph += zoom_filter(zoom_spans_out, ow, oh, eye=eye)
     graph += ((",ass=" + ass_name) if burn else "") + "[v]"
-    cmd = [FFMPEG, "-y", "-ss", "%.3f" % start, "-t", "%.3f" % duration, "-i", video]
     has_audio = info.get("has_audio", True)
     if has_audio:
-        n_in = 1
+        n_in = 1 + len(cams)
+        music_idx = n_in
         if music:
-            cmd += ["-stream_loop", "-1", "-i", music]
+            cmd += ["-stream_loop", "-1"] + (["-ss", "%.3f" % music_offset] if music_offset else []) + ["-i", music]
             n_in += 1
         roomtone = None
         if roomtone_at and style.get("roomtone", True):
             cmd += ["-ss", "%.3f" % roomtone_at[0], "-t", "%.3f" % roomtone_at[1], "-i", video]
             roomtone = (n_in, roomtone_at[1])
         graph += ";" + audio_chain(intervals, cut, style.get("enhance_audio", True), music,
-                                   int(style.get("music_volume", 15)), beeps, quiet, roomtone)
+                                   int(style.get("music_volume", 15)), beeps, quiet, roomtone, music_idx)
     out = name + ".mp4"
     cmd += ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if has_audio else [])
     cmd += ["-c:v", "libx264", "-preset", "faster", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
@@ -2059,3 +2095,325 @@ def align_switches(segs, words, cuts=(), delay=0.2):
             out[i - 1][3] = [(min(p, nt), x) for p, x in out[i - 1][3]]
             out[i][3] = [(max(p, nt), x) for p, x in out[i][3]]
     return [tuple(s) for s in out]
+
+
+
+# ---------------------------------------------------------------- music beat
+
+def music_beats(path, seconds=120):
+    """Tempo and beat grid of a music file: (period, first beat) in seconds, or None if no clear beat.
+
+    Onset strength from the spectral flux, tempo from its autocorrelation (60-180 BPM, leaning towards 120),
+    phase from the strongest comb of onsets."""
+    import numpy as np
+
+    sr, hop, n = 11025, 256, 1024
+    p = subprocess.run([FFMPEG, "-v", "error", "-t", str(seconds), "-i", path, "-vn", "-ac", "1", "-ar", str(sr),
+                        "-f", "s16le", "-"], capture_output=True)
+    a = np.frombuffer(p.stdout, np.int16).astype(np.float32) / 32768
+    if len(a) < sr * 8:
+        return None
+    frames = np.lib.stride_tricks.sliding_window_view(a, n)[::hop] * np.hanning(n)
+    mag = np.log1p(10 * np.abs(np.fft.rfft(frames, axis=1)))
+    env = np.maximum(0, np.diff(mag, axis=0)).sum(axis=1)
+    env = np.maximum(env - np.convolve(env, np.ones(16) / 16, "same"), 0)
+    fps = sr / hop
+    lags = np.arange(int(fps * 60 / 180), int(fps * 60 / 60) + 1)
+    ac = np.array([np.dot(env[:-l], env[l:]) for l in lags])
+    bpm = 60 * fps / lags
+    weight = np.exp(-0.5 * (np.log2(bpm / 120) / 0.6) ** 2)
+    k = int(np.argmax(ac * weight))
+    if ac[k] < 1.15 * float(np.median(ac)):
+        return None
+    best = (-1.0, 0.0, 0.0)
+    for per in np.arange(lags[k] - 1.0, lags[k] + 1.0, 0.02):  # sub-frame period, else beats drift within a minute
+        idx = np.arange(0, len(env) - per - 1, per)
+        for ph in range(int(per)):
+            sc = float(env[np.round(idx + ph).astype(int)].sum())
+            if sc > best[0]:
+                best = (sc, per, ph)
+    _, per, ph = best
+    lead = (n - hop / 2) / sr  # the flux rises as soon as the onset enters the analysis window
+    return round(float(per / fps), 4), round(float((ph / fps + lead) % (per / fps)), 4)
+
+
+def beat_offset(beat, cuts, total):
+    """Where to start the music so that as many jump cuts as possible land on a beat; returns (offset, beat times
+    on the output timeline)."""
+    import numpy as np
+
+    period, phase = beat
+    best, best_off = -1, 0.0
+    for off in np.arange(0, period, 0.01):
+        first = (phase - off) % period
+        hits = sum(1 for c in cuts if min((c - first) % period, period - (c - first) % period) < 0.07)
+        if hits > best:
+            best, best_off = hits, float(off)
+    first = (phase - best_off) % period
+    return round(best_off, 3), [round(float(first + k * period), 4) for k in range(int(total / period) + 2)
+                                if first + k * period < total]
+
+
+# ---------------------------------------------------------------- speakers by voice
+
+def voice_speakers(video, start, end, words):
+    """Who speaks which word, from the voice alone: 0 = lower voice, 1 = higher voice; None if only one voice.
+
+    Words are grouped into utterances (split at pauses of 0.2 s), each described by its average mel spectrum
+    and pitch; two-way k-means decides, and only a clear separation with a real share of the second voice counts."""
+    import numpy as np
+
+    sr = 16000
+    p = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.3f" % start, "-t", "%.3f" % (end - start), "-i", video, "-vn",
+                        "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"], capture_output=True)
+    a = np.frombuffer(p.stdout, np.int16).astype(np.float32) / 32768
+    if len(a) < sr * 3 or len(words) < 6:
+        return None
+    utts, cur = [], [0]
+    for i in range(1, len(words)):
+        if words[i]["s"] - words[i - 1]["e"] >= 0.2:
+            utts.append(cur)
+            cur = []
+        cur.append(i)
+    utts.append(cur)
+    n_fft, hop = 512, 160
+    mel_pts = 700 * (10 ** (np.linspace(2595 * np.log10(1 + 80 / 700), 2595 * np.log10(1 + 7000 / 700), 26) / 2595) - 1)
+    bins = np.floor((n_fft + 1) * mel_pts / sr).astype(int)
+    fb = np.zeros((24, n_fft // 2 + 1))
+    for m in range(1, 25):
+        l, c, r = bins[m - 1], bins[m], bins[m + 1]
+        fb[m - 1, l:c] = (np.arange(l, c) - l) / max(1, c - l)
+        fb[m - 1, c:r] = (r - np.arange(c, r)) / max(1, r - c)
+
+    feats, keep, durs = [], [], []
+    for u in utts:
+        s0, s1 = int(words[u[0]]["s"] * sr), int(words[u[-1]]["e"] * sr)
+        seg = a[max(0, s0):min(len(a), s1)]
+        if len(seg) < sr * 0.35:
+            continue
+        fr = np.lib.stride_tricks.sliding_window_view(seg, n_fft)[::hop]
+        energy = (fr ** 2).mean(axis=1)
+        fr = fr[energy >= np.median(energy)]
+        spec = np.abs(np.fft.rfft(fr * np.hanning(n_fft), axis=1)) ** 2
+        mel = np.log(spec @ fb.T + 1e-9).mean(axis=0)
+        pitches = []
+        lo, hi = sr // 400, sr // 70
+        for f in fr[::4]:
+            ac = np.correlate(f, f, "full")[n_fft - 1:]
+            k = lo + int(np.argmax(ac[lo:hi]))
+            if ac[k] > 0.3 * ac[0]:
+                pitches.append(sr / k)
+        pitch = float(np.median(pitches)) if pitches else 0.0
+        feats.append(np.concatenate([mel - mel.mean(), [np.log(pitch + 1) * 4]]))
+        keep.append(u)
+        durs.append(len(seg) / sr)
+    if len(feats) < 4:
+        return None
+    X = np.array(feats)
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-6)
+    c = [X[0], X[int(np.argmax(((X - X[0]) ** 2).sum(axis=1)))]]
+    lab = None
+    for _ in range(15):
+        lab = np.array([int(((x - c[1]) ** 2).sum() < ((x - c[0]) ** 2).sum()) for x in X])
+        if lab.min() == lab.max():
+            return None
+        c = [X[lab == 0].mean(axis=0), X[lab == 1].mean(axis=0)]
+    within = np.mean([np.sqrt(((x - c[l]) ** 2).sum()) for x, l in zip(X, lab)])
+    share = min(sum(d for d, l in zip(durs, lab) if l == k) for k in (0, 1)) / sum(durs)
+    raw_pitch = np.array([f[-1] for f in feats])
+    p0, p1 = (float(np.exp(np.median(raw_pitch[lab == k]) / 4)) for k in (0, 1))
+    pitch_ratio = max(p0, p1) / max(1.0, min(p0, p1))
+    sep = float(np.sqrt(((c[0] - c[1]) ** 2).sum()) / within)
+    # one voice also splits into two groups somehow: demand a clear gap, and a pitch difference unless it is huge
+    if share < 0.12 or sep < 1.8 or (pitch_ratio < 1.12 and sep < 3.0):
+        return None
+    if c[0][-1] > c[1][-1]:  # speaker 0 is the lower voice, so the colours stay the same across clips
+        lab = 1 - lab
+    out = [None] * len(words)
+    for u, l in zip(keep, lab):
+        for i in u:
+            out[i] = int(l)
+    last = next((x for x in out if x is not None), 0)
+    for i in range(len(out)):  # short utterances take the voice before them
+        out[i] = last if out[i] is None else out[i]
+        last = out[i]
+    return out
+
+
+SPEAKER_COLORS = ("#FFFFFF", "#7DD3FC", "#F9A8D4")
+
+
+# ---------------------------------------------------------------- privacy: faces and number plates unrecognisable
+
+def privacy_regions(video, info, start, end, faces=True, plates=False):
+    """Moving areas to blur, in clip time and source pixels: [{"keys": [(t, cx, cy)], "w", "h", "on": [(t0, t1)]}].
+
+    Faces: every face clearly smaller than the biggest one (people in the background), found by YuNet five
+    times a second. Number plates: OpenCV's plate detector, kept only where it finds the plate repeatedly."""
+    import cv2
+    import numpy as np
+
+    W, H = info["width"], info["height"]
+    fps, aw = 5, 640
+    ah = int(round(H * aw / W / 2)) * 2
+    p = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.2f" % start, "-t", "%.2f" % (end - start), "-i", video,
+                        "-vf", "fps=%d,scale=%d:%d" % (fps, aw, ah), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                       capture_output=True)
+    n = len(p.stdout) // (aw * ah * 3)
+    if not n:
+        return []
+    frames = np.frombuffer(p.stdout[:n * aw * ah * 3], np.uint8).reshape(n, ah, aw, 3)
+    yunet = cv2.FaceDetectorYN.create(YUNET, "", (aw, ah), 0.55, 0.3, 50) if faces and os.path.exists(YUNET) else None
+    plate = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_russian_plate_number.xml") if plates else None
+    found = []  # (frame, kind, x, y, w, h)
+    for i, img in enumerate(frames):
+        if yunet is not None:
+            r = yunet.detect(img)[1]
+            for f in ([] if r is None else r):
+                found.append((i, "face", float(f[0]), float(f[1]), float(f[2]), float(f[3])))
+        if plate is not None:
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            for x, y, w, h in plate.detectMultiScale(g, 1.1, 6, minSize=(30, 10)):
+                found.append((i, "plate", float(x), float(y), float(w), float(h)))
+    tracks = []
+    for i, kind, x, y, w, h in found:
+        cx, cy = x + w / 2, y + h / 2
+        best = None
+        for t in tracks:
+            fi, tcx, tcy, tw = t["last"]
+            if t["kind"] == kind and 0 < i - fi <= 5 and abs(cx - tcx) < max(w, tw) and abs(cy - tcy) < max(h, tw):
+                best = t
+                break
+        if best is None:
+            best = {"kind": kind, "pts": [], "size": []}
+            tracks.append(best)
+        best["pts"].append((i / fps, cx, cy))
+        best["size"].append((w, h))
+        best["last"] = (i, cx, cy, w)
+    biggest = max([float(np.median([s[0] for s in t["size"]])) for t in tracks if t["kind"] == "face"] or [0])
+    scale = W / aw
+    out = []
+    for t in tracks:
+        if t["kind"] == "face" and (len(t["pts"]) < 2 or float(np.median([s[0] for s in t["size"]])) > 0.6 * biggest):
+            continue  # the people the video is about stay visible
+        if t["kind"] == "plate" and len(t["pts"]) < 3:
+            continue
+        pad = 1.35 if t["kind"] == "face" else 1.2
+        sw = float(np.max([s[0] for s in t["size"]])) * scale * pad
+        sh = float(np.max([s[1] for s in t["size"]])) * scale * pad
+        runs, cur = [], [t["pts"][0][0], t["pts"][0][0]]
+        for tt, _, _ in t["pts"][1:]:
+            if tt - cur[1] > 1.0:
+                runs.append(cur)
+                cur = [tt, tt]
+            cur[1] = tt
+        runs.append(cur)
+        keys = [(round(tt, 2), cx * scale, cy * scale) for tt, cx, cy in t["pts"]]
+        keys = keys[::2] + ([keys[-1]] if len(keys) % 2 == 0 else [])
+        out.append({"kind": t["kind"], "keys": keys, "w": int(sw) // 2 * 2 + 2, "h": int(sh) // 2 * 2 + 2,
+                    "on": [(max(0.0, a - 0.3), b + 0.4) for a, b in runs]})
+    return out
+
+
+def _piecewise(keys, col):
+    """ffmpeg expression moving linearly between keyframes (t, x, y) – column 1 = x, 2 = y."""
+    expr = "%.1f" % keys[-1][col]
+    for ka, kb in reversed(list(zip(keys[:-1], keys[1:]))):
+        ta, tb, a, b = ka[0], kb[0], ka[col], kb[col]
+        body = "%.1f" % a if abs(a - b) < 0.5 or tb - ta < 0.01 else "%.1f+%.1f*(t-%.2f)/%.2f" % (a, b - a, ta, tb - ta)
+        expr = "if(lt(t,%.2f),%s,%s)" % (tb, body, expr)
+    return expr
+
+
+def blur_graph(regions, W, H):
+    """Filter graph from [0:v] to [vb] that blurs every region (moving areas and fixed boxes)."""
+    if not regions:
+        return ""
+    n = len(regions)
+    g = ["[0:v]split=%d[bv0]%s" % (n + 1, "".join("[r%d]" % k for k in range(n)))]
+    for k, r in enumerate(regions):
+        w, h = min(r["w"], W - 2) // 2 * 2, min(r["h"], H - 2) // 2 * 2
+        if r.get("keys"):
+            x = "clip(%s-%d,0,%d)" % (_piecewise(r["keys"], 1), w // 2, W - w)
+            y = "clip(%s-%d,0,%d)" % (_piecewise(r["keys"], 2), h // 2, H - h)
+        else:
+            x, y = str(int(min(r["x"], W - w))), str(int(min(r["y"], H - h)))
+        on = "+".join("between(t,%.2f,%.2f)" % s for s in r.get("on") or []) or "1"
+        sigma = max(8, min(w, h) // 5)
+        g.append("[r%d]crop=%d:%d:'%s':'%s',gblur=sigma=%d:steps=2[b%d]" % (k, w, h, x, y, sigma, k))
+        g.append("[bv%d][b%d]overlay=x='%s':y='%s':enable='%s'[%s]"
+                 % (k, k, x, y, on, "vb" if k == n - 1 else "bv%d" % (k + 1)))
+    return ";".join(g) + ";"
+
+
+# ---------------------------------------------------------------- several cameras
+
+def sync_offset(main, other, seconds=600):
+    """Offset d in seconds with other_time = main_time + d, from the cross-correlation of the two sound tracks;
+    returns (d, confidence)."""
+    import numpy as np
+
+    def env(path):
+        p = subprocess.run([FFMPEG, "-v", "error", "-t", str(seconds), "-i", path, "-vn", "-ac", "1", "-ar", "8000",
+                            "-f", "s16le", "-"], capture_output=True)
+        a = np.abs(np.frombuffer(p.stdout, np.int16).astype(np.float32))
+        n = len(a) // 40
+        e = a[:n * 40].reshape(n, 40).mean(axis=1)  # 200 values per second
+        return (e - e.mean()) / (e.std() + 1e-6)
+
+    a, b = env(main), env(other)
+    if len(a) < 400 or len(b) < 400:
+        raise RuntimeError("Zu wenig Ton zum Synchronisieren")
+    size = 1 << int(np.ceil(np.log2(len(a) + len(b))))
+    corr = np.fft.irfft(np.fft.rfft(b, size) * np.conj(np.fft.rfft(a, size)), size)
+    k = int(np.argmax(corr))
+    lag = k if k < size // 2 else k - size
+    conf = float(corr[k] / (np.median(np.abs(corr)) + 1e-6))
+    return round(lag / 200.0, 3), round(conf, 1)
+
+
+def camera_plan(dets, duration, min_shot=2.0):
+    """Which camera to show when: [(t0, t1, cam)] in clip time. Per second the camera wins in which the face
+    whose mouth moves most is largest (the close-up of whoever speaks); it stays when nobody visibly speaks;
+    shots shorter than `min_shot` are merged into the one before."""
+    import numpy as np
+
+    wins = max(1, int(np.ceil(duration)))
+    choice, prev = [], 0
+    for wi in range(wins):
+        best, best_s = prev, 0.0
+        for cam, det in enumerate(dets):
+            if not det or not det.get("tracks"):
+                continue
+            fps = det["fps"]
+            for t in det["tracks"]:
+                m = sum(t["motion"].get(f, 0) for f in range(wi * fps, (wi + 1) * fps))
+                s = m * t["w"] / max(1, det.get("width", 1))
+                if s > best_s:
+                    best, best_s = cam, s
+        prev = best if best_s > 0 else prev
+        choice.append(prev)
+    runs = []
+    for wi, c in enumerate(choice):
+        if runs and runs[-1][2] == c:
+            runs[-1][1] = wi + 1
+        else:
+            runs.append([wi, wi + 1, c])
+    merged = []
+    for r in runs:
+        if merged and (r[1] - r[0] < min_shot or merged[-1][2] == r[2]):
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+    return [(float(a), float(min(duration, b)), c) for a, b, c in merged]
+
+
+def camera_chain(k, info, crop_segs, sel, ow, oh, label, fps):
+    """Picture of an extra camera (input k), cut and framed like the main one, as [label]."""
+    w, h = info["width"], info["height"]
+    if w / h > ow / oh + 0.01:
+        frame = crop_filter(crop_segs, w, h, ow / oh) + sel + ",scale=%d:%d:%s" % (ow, oh, SCALE)
+    else:
+        frame = sel.lstrip(",") + ("," if sel else "") + \
+            "scale=%d:%d:force_original_aspect_ratio=increase:%s,crop=%d:%d" % (ow, oh, SCALE, ow, oh)
+    return "[%d:v]fps=%d,%s,%s,setsar=1[%s]" % (k, fps, frame, SHARPEN, label)

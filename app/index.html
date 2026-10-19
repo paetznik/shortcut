@@ -99,6 +99,12 @@ details summary{cursor:pointer;color:var(--muted);font-weight:600;margin-top:16p
 .wd:hover{background:var(--panel2)}
 .wd.cut{text-decoration:line-through;color:var(--err);opacity:.7}
 .cutl{margin:4px 0 2px}
+.blurbox{position:relative;border-radius:8px;overflow:hidden;background:#000;user-select:none;cursor:crosshair;touch-action:none}
+.blurbox img{display:block;width:100%;pointer-events:none}
+.blurrect{position:absolute;border:2px dashed #fff;background:rgba(255,255,255,.25);backdrop-filter:blur(6px);border-radius:4px}
+.blurrect.drawing{border-color:var(--accent)}
+.blurrect button{position:absolute;top:-2px;right:-2px;border:0;background:var(--err);color:#fff;border-radius:0 4px 0 6px;font-size:13px;line-height:1;padding:3px 6px;cursor:pointer}
+.assist{background:var(--panel2);border-radius:9px;padding:8px 10px}
 .cutl canvas{width:100%;height:86px;display:block;background:var(--bg);border:1px solid var(--line);border-radius:8px;touch-action:none}
 .cutl:focus{outline:none}
 .cutl:focus canvas{border-color:var(--accent)}
@@ -326,12 +332,17 @@ function renderHome(){
       '<div><label>Hook-Dauer (Sek.)</label><input id="o_hook_seconds" type="number" min="1" max="10" value="'+d.hook_seconds+'"></div>'+
       '<div><label>Spracherkennung</label><select id="o_quality">'+opt("schnell",d.quality,"Schnell")+opt("ausgewogen",d.quality,"Ausgewogen")+opt("genau",d.quality,"Genau – large-v3-turbo (ca. doppelte Zeit)")+'</select></div>'+
       '<div><label>&nbsp;</label>'+chk("o_uppercase",d.uppercase,"GROSSBUCHSTABEN")+'</div>'+
+      '<div><label>&nbsp;</label>'+chk("o_speaker_colors",d.speaker_colors,"Sprecherfarben (2 Stimmen)")+'</div>'+
     '</div></details>'+
     '<details><summary>Musik und Formate</summary><div class="grid">'+
       '<div><label>Hintergrundmusik</label><select id="o_music">'+opt("",d.music,"Keine")+(S.music||[]).map(function(m){return opt(esc(m.name),d.music,esc(m.name))}).join("")+'</select></div>'+
       '<div><label>Musik-Lautstärke (%)</label><input id="o_music_volume" type="number" min="2" max="60" value="'+d.music_volume+'"></div>'+
-      '<div><label>Zusätzliche Formate</label>'+chk("o_fmt_4x5",d.fmt_4x5,"4:5 (Feed)")+chk("o_fmt_1x1",d.fmt_1x1,"1:1 (Quadrat)")+'</div>'+
+      '<div><label>Zusätzliche Formate</label>'+chk("o_fmt_4x5",d.fmt_4x5,"4:5 (Feed)")+chk("o_fmt_1x1",d.fmt_1x1,"1:1 (Quadrat)")+chk("o_fmt_lengths",d.fmt_lengths,"Zusätzlich 15/30/60 s")+'</div>'+
     '</div><p class="muted small">Musik lädst du in den <a href="#" onclick="openSettings();return false">Einstellungen</a> hoch. Sie wird automatisch leiser, sobald gesprochen wird. Jedes zusätzliche Format verlängert das Rendern.</p></details>'+
+    '<details><summary>Datenschutz</summary><div class="toggles">'+
+      chk("o_blur_faces",d.blur_faces,"Gesichter von Personen im Hintergrund unkenntlich machen")+
+      chk("o_blur_plates",d.blur_plates,"Kfz-Kennzeichen unkenntlich machen (experimentell)")+
+    '</div><p class="muted small">Die Hauptpersonen bleiben sichtbar. Weitere Bereiche (Bildschirme, Namensschilder) kannst du pro Clip im Editor per Rechteck markieren.</p></details>'+
     '<details><summary>Schnitt-Feinschliff</summary><div class="toggles">'+
       chk("o_jumpcut_zoom",d.jumpcut_zoom,"Jump-Cuts kaschieren (Bildausschnitt wechselt an jedem Schnitt)")+
       chk("o_natural_pauses",d.natural_pauses,"Pausen mit Gefühl kürzen (Spannungspausen bleiben)")+
@@ -356,7 +367,7 @@ function renderHome(){
 
 function readOpts(){
   var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check","jumpcut_zoom","natural_pauses","roomtone","blink_safe","loop_end","stabilize"].forEach(function(k){o[k]=$("o_"+k).checked});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check","jumpcut_zoom","natural_pauses","roomtone","blink_safe","loop_end","stabilize","fmt_lengths","speaker_colors","blur_faces","blur_plates"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
@@ -710,6 +721,113 @@ function tlKeys(i,e){
   e.preventDefault();
 }
 
+// ---------------------------------------------------------------- per-project extras in the clip editor
+function extrasUI(i){
+  var s=S.job.settings||{};
+  return '<div><label>Extras für dieses Projekt (gelten für alle Clips beim nächsten Rendern)</label><div class="toggles" style="margin:0">'+
+    chk("e_x_speaker_colors"+i,s.speaker_colors,"Sprecherfarben in den Untertiteln")+
+    chk("e_x_fmt_lengths"+i,s.fmt_lengths,"Zusätzlich 15-, 30- und 60-s-Fassungen")+
+    chk("e_x_blur_faces"+i,s.blur_faces,"Gesichter im Hintergrund unkenntlich")+
+    chk("e_x_blur_plates"+i,s.blur_plates,"Kennzeichen unkenntlich (experimentell)")+'</div></div>';
+}
+function extrasBody(i){
+  var o={};["speaker_colors","fmt_lengths","blur_faces","blur_plates"].forEach(function(k){var el=$("e_x_"+k+i);if(el) o[k]=el.checked});
+  return o;
+}
+
+// ---------------------------------------------------------------- areas made unrecognisable by hand
+function blurSet(i){
+  if(!S.blur) S.blur={};
+  if(!S.blur[i]) S.blur[i]=(S.job.clips[i].blur_boxes||[]).map(function(b){return b.slice()});
+  return S.blur[i];
+}
+function blurUI(c,i){
+  if(!S.job.info||S.job.source_deleted) return '';
+  return '<div><label>Bereich unkenntlich machen – auf dem Bild ein Rechteck ziehen (gilt für den ganzen Clip)</label>'+
+    '<div class="blurbox" id="bb'+i+'" onpointerdown="blurDown('+i+',event)"><img draggable="false" src="/api/jobs/'+S.job.id+'/frame?t='+(c.start+0.5).toFixed(2)+'">'+blurRects(i)+'</div>'+
+    '<div class="small muted" id="bn'+i+'">'+blurNote(i)+'</div></div>';
+}
+function blurRects(i){
+  return blurSet(i).map(function(b,k){return '<div class="blurrect" style="left:'+(b[0]*100)+'%;top:'+(b[1]*100)+'%;width:'+(b[2]*100)+'%;height:'+(b[3]*100)+'%"><button onpointerdown="event.stopPropagation()" onclick="blurDel('+i+','+k+')">×</button></div>'}).join("");
+}
+function blurNote(i){var n=blurSet(i).length;return n?n+" Bereich"+(n>1?"e":"")+" – wird beim Speichern weichgezeichnet":"Noch kein Bereich – z. B. für einen Bildschirm, ein Namensschild oder ein Kennzeichen"}
+function blurRedraw(i){var box=$("bb"+i);box.querySelectorAll(".blurrect").forEach(function(e){e.remove()});box.insertAdjacentHTML("beforeend",blurRects(i));$("bn"+i).textContent=blurNote(i)}
+function blurDel(i,k){blurSet(i).splice(k,1);blurRedraw(i)}
+function blurDown(i,ev){
+  if(ev.button) return;
+  ev.preventDefault();
+  var box=$("bb"+i),r=box.getBoundingClientRect(),x0=(ev.clientX-r.left)/r.width,y0=(ev.clientY-r.top)/r.height;
+  var el=document.createElement("div");el.className="blurrect drawing";box.appendChild(el);
+  var cur=null;
+  function mv(e){
+    var x=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),y=Math.min(1,Math.max(0,(e.clientY-r.top)/r.height));
+    cur=[Math.min(x0,x),Math.min(y0,y),Math.abs(x-x0),Math.abs(y-y0)];
+    el.style.left=cur[0]*100+"%";el.style.top=cur[1]*100+"%";el.style.width=cur[2]*100+"%";el.style.height=cur[3]*100+"%";
+  }
+  function up(){
+    window.removeEventListener("pointermove",mv);window.removeEventListener("pointerup",up);el.remove();
+    if(cur&&cur[2]>0.02&&cur[3]>0.02){if(blurSet(i).length>=8) return toast("Höchstens 8 Bereiche");blurSet(i).push(cur.map(function(v){return +v.toFixed(4)}))}
+    blurRedraw(i);
+  }
+  window.addEventListener("pointermove",mv);window.addEventListener("pointerup",up);
+}
+
+// ---------------------------------------------------------------- editing assistant
+function assistUI(i){
+  return '<div class="assist"><label>Schnitt-Assistent – schreib einfach, was anders sein soll</label><div class="row" style="gap:8px;flex-wrap:nowrap">'+
+    '<input id="e_ai'+i+'" placeholder="z. B. „Nimm den Teil über Preise raus“ oder „Mach ihn kürzer als 30 Sekunden“" onkeydown="if(event.key===\'Enter\')runAssist('+i+')" style="flex:1">'+
+    '<button class="btn sm primary" id="aib'+i+'" onclick="runAssist('+i+')">Ausführen</button></div><div class="small muted" id="air'+i+'">'+esc((S.assist||{})[tlKey(i)]||"")+'</div></div>';
+}
+function runAssist(i){
+  if(!S.settings.has_anthropic_key) return toast("Für den Schnitt-Assistenten bitte zuerst einen Claude-API-Schlüssel in den Einstellungen hinterlegen");
+  var t=$("e_ai"+i).value.trim();if(!t) return;
+  var b=$("aib"+i);b.disabled=true;b.textContent="Denkt nach …";
+  var key=tlKey(i);
+  api("POST","/api/jobs/"+S.job.id+"/clips/"+i+"/assist",{text:t}).then(function(j){
+    if(!S.assist) S.assist={};S.assist[key]="🤖 "+j.assistant;
+    S.job=j;S.removed={};S.beeped={};S.blur={};S.crop={};
+    if(document.activeElement) document.activeElement.blur();
+    renderJob();toast(j.assistant);
+  }).catch(function(e){b.disabled=false;b.textContent="Ausführen";toast(e.message)});
+}
+
+// ---------------------------------------------------------------- several cameras
+function camsCard(j){
+  if(!["fertig","fehler","prüfen","wartet","läuft"].includes(j.status)||j.source_deleted||!j.info) return '';
+  var cams=j.cams||[],on=(j.settings||{}).multicam!==false;
+  var rows=cams.map(function(c,n){
+    var st=c.offset==null?'<span class="muted">wird synchronisiert …</span>':'Versatz '+(c.offset>0?"+":"")+c.offset.toFixed(2)+' s'+(c.confidence!=null&&c.confidence<5?' · <span class="warn">Ton passt kaum – bitte prüfen</span>':' · ✓ synchron');
+    return '<div class="row" style="gap:10px;padding:6px 0;border-top:1px solid var(--line)"><b class="small">Kamera '+(n+2)+'</b><span class="small" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.name)+' · '+c.info.width+'×'+c.info.height+' · '+st+'</span><button class="btn sm ghost" onclick="delCam('+n+')">Entfernen</button></div>';
+  }).join("");
+  return '<details class="card" style="margin-top:16px"'+(S.camOpen||cams.length?" open":"")+' ontoggle="S.camOpen=this.open"><summary style="margin:0;color:var(--text)"><b>Mehrere Kameras</b> <span class="muted small">– weitere Aufnahmen desselben Gesprächs</span></summary>'+
+    '<p class="muted small">Lade die Aufnahmen der anderen Kameras hoch (mit Ton). Die App legt sie anhand des Tons synchron an und schneidet beim Rendern automatisch auf die Kamera, in der die sprechende Person am größten zu sehen ist. Der Ton kommt immer vom Hauptvideo.</p>'+
+    '<div class="row" style="gap:10px;margin-bottom:6px"><button class="btn sm" onclick="$(\'camFile\').click()">Kamera hinzufügen</button><input type="file" id="camFile" accept="video/*,.mkv" style="display:none" onchange="if(this.files[0]) uploadCam(this.files[0])">'+
+    (cams.length?chk("e_multicam",on,"Kameras beim Rendern nutzen").replace('type="checkbox"','type="checkbox" onchange="setMulticam(this.checked)"')+'<button class="btn sm" onclick="rerenderAll()">Alle Clips neu rendern</button>':'')+'</div>'+
+    '<div class="small muted" id="camUp"></div>'+rows+'</details>';
+}
+function uploadCam(f){
+  if(S.uploading) return toast("Es läuft bereits ein Upload");
+  S.uploading=true;var info=$("camUp");
+  function show(p){var el=$("camUp");if(el) el.textContent="Lade "+f.name+" hoch … "+p.toFixed(0)+" %"}
+  function fail(m){S.uploading=false;toast(m);var el=$("camUp");if(el) el.textContent=""}
+  api("POST","/api/uploads").then(function(u){
+    var old=window.showUp;window.showUp=show;
+    sendChunk(u.id,f,0,0,function(){
+      window.showUp=old;
+      api("POST","/api/jobs/"+S.job.id+"/cams",{upload_id:u.id,filename:f.name}).then(function(j){S.uploading=false;S.job=j;renderJob();toast("Kamera wird synchronisiert")}).catch(function(e){fail(e.message)});
+    },function(m){window.showUp=old;fail(m)});
+  }).catch(function(e){fail(e.message)});
+}
+function delCam(n){
+  if(!confirm("Diese Kamera entfernen?")) return;
+  api("DELETE","/api/jobs/"+S.job.id+"/cams/"+n).then(function(j){S.job=j;renderJob()}).catch(function(e){toast(e.message)});
+}
+function setMulticam(on){api("POST","/api/jobs/"+S.job.id+"/multicam",{on:on}).then(function(j){S.job=j;toast(on?"Kameras werden genutzt":"Nur Hauptkamera")}).catch(function(e){toast(e.message)})}
+function rerenderAll(){
+  if(!confirm("Alle Clips neu rendern? Die jetzigen Fassungen landen im Papierkorb.")) return;
+  api("POST","/api/jobs/"+S.job.id+"/render").then(function(j){S.job=j;renderJob();toast("Alle Clips werden neu gerendert")}).catch(function(e){toast(e.message)});
+}
+
 function editor(c,i,review){
   var hooks=(c.hooks||[]).filter(function(h){return h});
   return '<div class="edit'+(review||S.editing[i]?" on":"")+'" id="ed'+i+'">'+
@@ -720,12 +838,15 @@ function editor(c,i,review){
       (hooks.length>1?'<div class="chips">'+hooks.map(function(h,k){return '<button class="chip" onclick="$(\'e_h'+i+'\').value=S.job.clips['+i+'].hooks['+k+']">'+esc(h)+'</button>'}).join("")+'</div>':'')+
       (!review?'<button class="btn sm ghost" style="margin-top:6px" onclick="duplicateClip('+i+')">Mit diesem Hook als Variante B rendern</button>':'')+'</div>'+
     '<div><label>Text auf dem Titelbild</label><input id="e_cv'+i+'" value="'+esc(c.cover_text==null?c.title:c.cover_text)+'"></div>'+
+    assistUI(i)+
     cropUI(c,i)+
+    blurUI(c,i)+
     '<div><label>Schlüsselwörter (farbig, mit Komma getrennt)</label><input id="e_k'+i+'" value="'+esc((c.keywords||[]).join(", "))+'"></div>'+
     '<div><label>Wörter anklicken (Umschalt-Klick markiert einen Bereich)</label><div class="row" style="gap:6px;margin-bottom:6px"><button class="chip'+(chipMode(i)==="cut"?" on":"")+'" id="cmcut'+i+'" onclick="setChipMode('+i+',\'cut\')">✂ Schneiden</button><button class="chip'+(chipMode(i)==="beep"?" on":"")+'" id="cmbeep'+i+'" onclick="setChipMode('+i+',\'beep\')">🔇 Überpiepen</button></div><div class="words-cut" id="wc'+i+'">'+wordChips(c,i)+'</div><div class="muted small" id="wn'+i+'">'+chipNote(i)+'</div></div>'+
     '<div><label>Untertitel – Tippfehler hier korrigieren</label><textarea class="words" id="e_w'+i+'">'+esc(c.text||"")+'</textarea></div>'+
     '<div><label>Beschreibung für Social Media</label><textarea id="e_c'+i+'">'+esc(c.caption||"")+'</textarea></div>'+
     '<div class="muted small">Zeiten als Minuten:Sekunden, z. B. 3:12.5. Bei geänderten Zeiten passen sich die Untertitel an.</div>'+
+    extrasUI(i)+
     '<div class="row" style="gap:8px"><button class="btn sm primary" onclick="saveClip('+i+')">'+(review?"Speichern":"Speichern und neu rendern")+'</button>'+
     (!review?'<button class="btn sm" onclick="splitClip('+i+')">In Teile zerlegen</button>':'')+'<button class="btn sm danger" onclick="deleteClip('+i+')">Clip löschen</button></div></div>';
 }
@@ -757,6 +878,7 @@ function renderJob(){
   if(review) html+='<div class="hint blue" style="margin-top:14px"><div class="row" style="justify-content:space-between"><span>Prüfe Hook, Titelbild-Text und Untertitel jedes Clips. Wörter anklicken schneidet sie heraus, Tippfehler korrigierst du im Textfeld. Dann starte das Rendern.</span><button class="btn primary" onclick="renderAll()">Alle Clips rendern</button></div></div>';
   html+=energyTimeline(j);
   html+=transcriptCard(j);
+  html+=camsCard(j);
   html+=trashCard(j);
   html+=textsCard(j);
   html+=bestofCard(j);
@@ -773,7 +895,7 @@ function renderJob(){
       lengthNote(outLen)+audioBadge(c)+criteriaUI(c)+checksUI(c,i)+
       '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
       (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+(!review&&clipRef(c)?'<div class="muted small">📍 '+esc(refText(clipRef(c)))+'</div>':'')+pz+
-      (done&&!review?'<div class="row" style="margin-top:auto;gap:8px">'+dl(c.file,"MP4 9:16"," primary")+(f["4x5"]?dl(f["4x5"],"4:5"):'')+(f["1x1"]?dl(f["1x1"],"1:1"):'')+(c.cover?dl(c.cover,"Titelbild"):'')+dl(c.srt,"SRT")+
+      (done&&!review?'<div class="row" style="margin-top:auto;gap:8px">'+dl(c.file,"MP4 9:16"," primary")+(f["4x5"]?dl(f["4x5"],"4:5"):'')+(f["1x1"]?dl(f["1x1"],"1:1"):'')+(c.cover?dl(c.cover,"Titelbild"):'')+["15","30","60"].map(function(k){return c.lengths&&c.lengths[k]?dl(c.lengths[k],k+" s"):''}).join("")+dl(c.srt,"SRT")+
         '<button class="btn sm" onclick="openPostiz('+i+')">An Postiz</button>'+
         (c.caption?'<button class="btn sm ghost" onclick="copyCap('+i+')">Text kopieren</button>':'')+'<button class="btn sm ghost" onclick="toggleEdit('+i+')">Anpassen</button></div>'+translationsUI(c,i):'')+
       ((done||review)?editor(c,i,review):'')+
@@ -793,7 +915,8 @@ function copyCap(i){var c=S.job.clips[i];navigator.clipboard.writeText(c.title+"
 function clipBody(i){
   return {start:parseT($("e_s"+i).value),end:parseT($("e_e"+i).value),title:$("e_t"+i).value,hook_text:$("e_h"+i).value,
     cover_text:$("e_cv"+i).value,keywords:$("e_k"+i).value,text:$("e_w"+i).value,caption:$("e_c"+i).value,
-    removed:removedSet(i).map(parseFloat),beeped:beepSet(i).map(parseFloat),crop_keys:S.crop&&S.crop[i]?S.crop[i].keys:undefined};
+    removed:removedSet(i).map(parseFloat),beeped:beepSet(i).map(parseFloat),crop_keys:S.crop&&S.crop[i]?S.crop[i].keys:undefined,
+    blur_boxes:S.blur&&S.blur[i]?S.blur[i]:undefined,style:extrasBody(i)};
 }
 function saveClip(i){
   var body=clipBody(i);
