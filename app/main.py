@@ -38,7 +38,8 @@ DEFAULTS = {
     "remove_pauses": True, "hook": True, "hook_seconds": 3, "review": False,
     "sub_style": "pop", "keyword_color": "#4ADE80", "zoom": True, "enhance_audio": True, "music": "", "music_volume": 15,
     "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True, "precise_timing": True,
-    "ai_check": True,
+    "ai_check": True, "jumpcut_zoom": True, "blink_safe": True, "natural_pauses": True, "roomtone": True,
+    "stabilize": False, "loop_end": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -1151,7 +1152,8 @@ def export_project(jid: str, request: Request):
             dur = c["end"] - c["start"]
             words = pipeline.clip_words(segments, c["start"], c["end"])
             iv = pipeline.keep_intervals(words, dur, job["settings"].get("remove_pauses", True),
-                                         [r - c["start"] for r in c.get("removed", [])])
+                                         [r - c["start"] for r in c.get("removed", [])],
+                                         natural=job["settings"].get("natural_pauses", True))
             iv = pipeline.add_spans(iv, reaction_spans(jid, c["start"], c["end"]), dur)
             name = "clip%02d" % (i + 1)
             title = "%s – %s" % (name, c.get("title", ""))
@@ -1397,9 +1399,18 @@ def prepare(jid, idx, info):
     for w in words:  # clip_words gives clip-relative times; the marks are absolute word starts
         if round(w["s"] + clip["start"], 2) in beeped:
             w["beep"] = True
-    intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True), removed)
+    intervals = pipeline.keep_intervals(words, duration, s.get("remove_pauses", True), removed,
+                                        natural=s.get("natural_pauses", True))
     intervals = pipeline.add_spans(intervals, reaction_spans(jid, clip["start"], clip["end"]), duration)
-    intervals = pipeline.quantize(intervals, pipeline.out_fps(info))
+    if s.get("loop_end", True):
+        intervals = pipeline.tighten_ends(intervals, [w for w in words if round(w["s"], 2) not in {round(r, 2) for r in removed}])
+    fps = pipeline.out_fps(info)
+    if s.get("blink_safe", True):
+        try:
+            intervals = pipeline.refine_cuts(src, info, clip["start"], intervals, words, fps)
+        except Exception as e:
+            log(jid, "Schnittpunkt-Feinschliff übersprungen: " + str(e)[:200])
+    intervals = pipeline.quantize(intervals, fps)
     out_words = pipeline.remap_words(words, intervals)
     beeps = [(w["s"], w["e"]) for w in out_words if w.get("beep")]
     for w in out_words:  # blacked out in the subtitles too
@@ -1415,14 +1426,38 @@ def prepare(jid, idx, info):
         if split_wanted:
             split = pipeline.split_pair(det)
         crop_segs = None if split else shift_segs(pipeline.speaker_segments(det, duration + head + tail), head, duration)
+        crop_segs = pipeline.align_switches(crop_segs, words, [c - head for c in (det or {}).get("cuts", [])])
         s["mode"] = "auto"
         s["split_layout"] = bool(split)
     music = os.path.join(MUSIC, s["music"]) if s.get("music") and os.path.exists(os.path.join(MUSIC, s["music"])) else None
+
+    # picture rhythm: speaker switches count as a change; zooms at jump cuts and to keep long takes alive
+    switches = [pipeline.remap(seg[0], intervals) for seg in (crop_segs or [])[1:]]
+    zoom_on, jumpcuts = s.get("zoom", True), s.get("jumpcut_zoom", True)
+    zooms = pipeline.zoom_spans(out_words, intervals, out_len, jumpcuts=jumpcuts, rhythm=zoom_on, switches=switches,
+                                loop=s.get("loop_end", True)) if (zoom_on or jumpcuts) and not split else None
+    changes = sorted(set([0.0, out_len] + switches + pipeline.cut_points(intervals) +
+                         [e for z in (zooms or []) for e in z[:2]]))
+    static_max = max((b - a for a, b in zip(changes, changes[1:])), default=out_len)
+    tracks = [t for t in (det or {}).get("tracks", []) if t.get("eye")]
+    eye = sum(t["eye"] * t["seen"] for t in tracks) / sum(t["seen"] for t in tracks) if tracks and crop_segs else 0.42
+
+    quiet, roomtone_at = [], None
+    if s.get("roomtone", True):
+        for a, b in zip(out_words, out_words[1:]):  # pauses that stay: breaths and noises go down
+            if b["s"] - a["e"] > 0.25:
+                quiet.append((round(a["e"] + 0.06, 3), round(b["s"] - 0.06, 3)))
+        if s.get("enhance_audio", True):
+            try:
+                near = [w for w in pipeline.all_words(load_transcript(jid)) if w["e"] > clip["start"] - 25 and w["s"] < clip["end"] + 25]
+                roomtone_at = pipeline.roomtone_spot(src, clip["start"], clip["end"], near)
+            except Exception:
+                roomtone_at = None
     return {"job": job, "clip": clip, "s": s, "src": src, "duration": duration, "intervals": intervals,
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
             "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail), "beeps": beeps,
-            "end_text": end_text,
-            "zooms": pipeline.zoom_spans(out_words, intervals, out_len) if s.get("zoom", True) else None}
+            "end_text": end_text, "zooms": zooms, "static_max": static_max, "eye": eye, "quiet": quiet,
+            "roomtone_at": roomtone_at}
 
 
 def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
@@ -1432,7 +1467,8 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
     burn = pipeline.write_subtitles(words, os.path.join(d, ass), os.path.join(d, base + ".srt") if srt else None,
                                     p["s"], hook, p["out_len"], keywords, size, p["end_text"])
     out_len = pipeline.render_clip(p["src"], p["job"]["info"], clip["start"], clip["end"], d, base, p["s"], ass, burn,
-                                   p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"], p["beeps"])
+                                   p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"], p["beeps"],
+                                   p["quiet"], p["roomtone_at"], p["eye"])
     os.remove(os.path.join(d, ass))
     return out_len
 
@@ -1498,6 +1534,9 @@ def render_one(jid, idx, info):
 
     checks = pipeline.quality_checks(d, outputs["9x16"], info, load_transcript(jid), clip["start"], clip["end"],
                                      p["det"], p["crop_segs"], s.get("mode"), p["split_wanted"], p["split"], out_len)
+    if p["static_max"] > 6 and not s.get("zoom", True):
+        checks.append({"level": "info", "msg": "Das Bild steht bis zu %.0f s ohne Veränderung – mit „Dynamische Zooms“ "
+                                               "bleibt es lebendiger." % p["static_max"]})
     key = load_config().get("anthropic_key", "")
     if key and job_settings(jid).get("ai_check", True):
         try:

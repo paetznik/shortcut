@@ -457,10 +457,41 @@ def is_filler(word):
     return re.sub(r"[^\wäöüß]", "", word.lower()) in FILLERS
 
 
-def keep_intervals(words, duration, remove_pauses, removed=(), max_pause=0.35, pad=0.1):
+def _ends(word, marks):
+    return word.rstrip("\"'»«“”‚‘)").endswith(marks)
+
+
+def pause_pads(words, natural, pad=0.1, max_pause=0.35):
+    """How much pause stays before and after each word, and the gap that is still bridged instead of cut.
+
+    Natural mode keeps the rhythm of speech: a beat after a question or colon and before a short punchline,
+    a little more air after sentence ends than inside sentences, tighter pauses for fast talkers."""
+    if not natural or not words:
+        return [pad] * len(words), [pad] * len(words), max_pause
+    rate = len(words) / max(1.0, words[-1]["e"] - words[0]["s"])
+    base = 0.08 if rate > 3.2 else 0.12 if rate < 2.2 else 0.1
+    bridge = 0.15 if rate > 3.2 else 0.25 if rate < 2.2 else 0.2
+    before, after = [], []
+    for i, w in enumerate(words):
+        t = w["w"]
+        after.append(0.3 if _ends(t, ("?", ":", "…", "...")) else 0.16 if _ends(t, (".", "!")) else base)
+        b = base
+        if i and _ends(words[i - 1]["w"], (".", "!", "?")):
+            b = 0.12
+            for n, x in enumerate(words[i:i + 6], 1):  # short punchline sentence: a beat before it
+                if _ends(x["w"], (".", "!", "?")):
+                    if n <= 5 and _ends(x["w"], ("!",)):
+                        b = 0.3
+                    break
+        before.append(b)
+    return before, after, bridge
+
+
+def keep_intervals(words, duration, remove_pauses, removed=(), max_pause=0.35, pad=0.1, natural=False):
     """Parts of the clip (relative seconds) that stay after cutting pauses, filler words and words the user struck out.
 
     `removed` holds the start times of struck-out words; a struck-out word always forces a cut."""
+    pad_before, pad_after, max_pause = pause_pads(words, natural, pad, max_pause)
     cut = {round(float(s), 2) for s in removed}
     gone = [round(w["s"], 2) in cut for w in words]
     if not remove_pauses:
@@ -487,8 +518,8 @@ def keep_intervals(words, duration, remove_pauses, removed=(), max_pause=0.35, p
         if is_filler(w["w"]):
             continue
         nxt_cut = next((x["s"] for x, g in zip(words[i + 1:], gone[i + 1:]) if g), duration)
-        a = max(0.0, prev_cut_end if blocked else 0.0, w["s"] - pad)
-        b = min(duration, nxt_cut, w["e"] + pad)
+        a = max(0.0, prev_cut_end if blocked else 0.0, w["s"] - pad_before[i])
+        b = min(duration, nxt_cut, w["e"] + pad_after[i])
         if out and not blocked and a - out[-1][1] < max_pause:
             out[-1][1] = max(out[-1][1], b)
         else:
@@ -585,17 +616,17 @@ def detect_faces(video, info, start, end, faces=True):
                 t["last"] = -9999
         if yunet is not None:
             found = yunet.detect(img)[1]
-            faces_ = [] if found is None else [(f[0], f[1], f[2], f[3], f[10:14]) for f in found]
+            faces_ = [] if found is None else [(f[0], f[1], f[2], f[3], f[10:14], f[4:10]) for f in found]
         else:
             boxes = list(frontal.detectMultiScale(gray, 1.1, 5, minSize=min_size)) or \
                 list(profile.detectMultiScale(gray, 1.1, 5, minSize=min_size))
-            faces_ = [(x, y, w, h, None) for x, y, w, h in boxes]
+            faces_ = [(x, y, w, h, None, None) for x, y, w, h in boxes]
         used = set()
-        for x, y, w, h, mouth_pts in faces_:
+        for x, y, w, h, mouth_pts, eye_pts in faces_:
             cx = x + w / 2
             best = min((t for t in tracks if id(t) not in used), key=lambda t: abs(t["last"] - cx), default=None)
             if best is None or abs(best["last"] - cx) > 0.12 * aw:
-                best = {"cx": [], "w": [], "last": cx, "seen": 0, "motion": {}, "patch": None, "pos": {}}
+                best = {"cx": [], "w": [], "last": cx, "seen": 0, "motion": {}, "patch": None, "pos": {}, "yaw": [], "eye": []}
                 tracks.append(best)
             used.add(id(best))
             best["cx"].append(cx)
@@ -603,6 +634,10 @@ def detect_faces(video, info, start, end, faces=True):
             best["last"] = cx
             best["seen"] += 1
             best["pos"][i] = cx
+            if eye_pts is not None:  # eyes and nose: where the person looks and how high the eyes sit
+                rx, ry, lx, ly, nx, _ = [float(v) for v in eye_pts]
+                best["yaw"].append((nx - (rx + lx) / 2) / max(4.0, abs(lx - rx)))
+                best["eye"].append((ry + ly) / 2 / ah)
             if mouth_pts is not None:  # mouth corners from the landmarks
                 mx0, my0, mx1, my1 = [float(v) for v in mouth_pts]
                 mw = max(8, abs(mx1 - mx0))
@@ -618,9 +653,17 @@ def detect_faces(video, info, start, end, faces=True):
                 best["patch"] = (i, patch)
 
     scale = W / aw
+    cw = H * 9 / 16
+
+    def lead(t):
+        """Lead room: shift the frame towards where the person looks (up to ~11 % of the crop width)."""
+        yaw = float(np.median(t["yaw"])) if len(t["yaw"]) >= 3 else 0.0
+        return 0.0 if abs(yaw) < 0.12 else max(-0.6, min(0.6, yaw)) * 0.18 * cw
+
     result["tracks"] = [{"cx": int(float(np.median(t["cx"])) * scale), "w": int(float(np.median(t["w"])) * scale * 1.6),
                          "seen": t["seen"] / max(1, len(frames)), "motion": t["motion"],
-                         "pos": {k: v * scale for k, v in t["pos"].items()}}
+                         "pos": {k: v * scale for k, v in t["pos"].items()}, "lead": lead(t),
+                         "eye": float(np.median(t["eye"])) if t["eye"] else None}
                         for t in tracks if t["seen"] >= max(3, len(frames) * 0.08)]
     return result
 
@@ -669,7 +712,7 @@ def speaker_segments(det, duration):
         t = tracks[k]
         pts, last = [], None
         for wi in range(a, b):
-            xs = [t["pos"][f] for f in range(wi * fps, (wi + 1) * fps) if f in t["pos"]]
+            xs = [t["pos"][f] + t.get("lead", 0.0) for f in range(wi * fps, (wi + 1) * fps) if f in t["pos"]]
             if not xs:
                 continue
             x = float(np.median(xs))
@@ -684,7 +727,7 @@ def speaker_segments(det, duration):
         if segs:
             segs[-1] = (segs[-1][0], t0) + segs[-1][2:]
         if not pts:
-            pts = [(t0, float(t["cx"]))]
+            pts = [(t0, float(t["cx"]) + t.get("lead", 0.0))]
         segs.append((t0, t1, int(pts[0][1]), [(max(t0, min(t1, pt)), int(x)) for pt, x in pts]))
     return segs
 
@@ -821,8 +864,13 @@ def norm_word(w):
 
 
 def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, keywords=(), size=(1080, 1920),
-                    end_text=""):
-    """Subtitles in one of several looks; keywords get their own colour, the active word the highlight colour."""
+                    end_text="", lead=0.07):
+    """Subtitles in one of several looks; keywords get their own colour, the active word the highlight colour.
+
+    Every word shows `lead` seconds before it is spoken: reading takes a moment, so text that appears exactly on
+    the sound feels late (broadcast subtitles do the same)."""
+    if lead:
+        words = [dict(w, s=max(0.0, w["s"] - lead), e=max(0.0, w["e"] - lead)) for w in words]
     pw, ph = size
     k = ph / 1920
     look = style.get("sub_style", "pop")
@@ -907,42 +955,63 @@ def write_subtitles(words, ass_path, srt_path, style, hook_text="", total=0.0, k
 
 # ---------------------------------------------------------------- zooms
 
-def zoom_spans(words, intervals, total, every=4.0):
-    """Punch-in zoom spans (output time): the zoom toggles at cuts and at sentence starts, at least `every` s apart,
-    so jump cuts look intentional and long takes get movement."""
-    points = []
-    acc = 0.0
+def cut_points(intervals):
+    """Output times of the jump cuts."""
+    pts, acc = [], 0.0
     for a, b in intervals[:-1]:
         acc += b - a
-        points.append(acc)
-    for prev, w in zip(words, words[1:]):
-        if prev["w"][-1:] in ".!?":
-            points.append(w["s"])
-    points = sorted(p for p in points if 1.0 < p < total - 1.0)
-    picked, last = [], 0.0
-    for p in points:
-        if p - last >= 2.5:
+        pts.append(round(acc, 4))
+    return pts
+
+
+def zoom_spans(words, intervals, total, every=4.5, jumpcuts=True, rhythm=True, switches=(), loop=False):
+    """Zoom spans (output time) as (start, end, ramp_in, ramp_out).
+
+    Jump cuts: the framing changes at every cut (punch-in, hard, like a second camera), so a cut inside a sentence
+    looks intentional instead of like a glitch. Rhythm: the picture changes at sentence starts and never stands
+    still longer than about `every` seconds – counting cuts, speaker switches and zooms; changes inside one take
+    are a soft push (0.5 s). Loop: the clip ends in the same framing it starts with."""
+    hard = [p for p in cut_points(intervals) if 0.6 < p < total - 0.4] if jumpcuts else []
+    picked, last = [], -9.0
+    for p in hard:
+        if p - last >= 0.8:
             picked.append(p)
             last = p
-    t = picked[-1] if picked else 0.0
-    while t + every < total - 1.0:  # long stretches without sentence ends still get a change
-        t += every
-        picked.append(t)
-    picked = sorted(set(round(p, 2) for p in picked))
-    spans, on = [], False
-    edges = [0.0] + picked + [total]
-    for a, b in zip(edges, edges[1:]):
+    soft = []
+    if rhythm:
+        for prev, w in zip(words, words[1:]):
+            p = round(w["s"], 4)
+            if prev["w"][-1:] in ".!?" and 1.0 < p < total - 1.0 and all(abs(p - q) >= 2.5 for q in picked + soft):
+                soft.append(p)
+        changes = sorted(set([0.0, total] + picked + soft + [round(s, 4) for s in switches if 0 < s < total]))
+        for a, b in zip(changes, changes[1:]):  # fill every stretch that would stand still too long
+            n = int((b - a) // every)
+            soft += [round(a + (b - a) * k / (n + 1), 4) for k in range(1, n + 1)] if b - a > every else []
+    points = sorted([(p, 0.0) for p in picked] + [(p, 0.5) for p in soft if all(abs(p - q) >= 0.6 for q in picked)])
+    if loop and len(points) % 2:  # odd number of changes would end zoomed in: drop the last soft one
+        k = max((i for i, (p, r) in enumerate(points) if r), default=len(points) - 1)
+        points.pop(k)
+    spans, on, prev = [], False, (0.0, 0.0)
+    for p in points + [(total, 0.0)]:
         if on:
-            spans.append((a, b))
-        on = not on
+            spans.append((prev[0], p[0], prev[1], p[1]))
+        on, prev = not on, p
     return spans
 
 
-def zoom_filter(spans, ow, oh, amount=0.1):
+def zoom_filter(spans, ow, oh, amount=0.1, eye=0.4):
+    """Scale up within the spans; the crop keeps the eyes near the upper third instead of zooming into the middle."""
     if not spans:
         return ""
-    z = "(1+%.3f*(%s))" % (amount, "+".join("between(t,%.2f,%.2f)" % s for s in spans))
-    return (",scale=w='trunc(%d*%s/2)*2':h='trunc(%d*%s/2)*2':eval=frame,crop=%d:%d" % (ow, z, oh, z, ow, oh))
+
+    def term(a, b, ra, rb):
+        up = "gte(t,%.4f)" % a if not ra else "clip((t-%.4f)/%.2f,0,1)" % (a, ra)
+        down = "lt(t,%.4f)" % b if not rb else "clip((%.4f-t)/%.2f,0,1)" % (b, rb)
+        return "%s*%s" % (up, down)
+
+    z = "(1+%.3f*(%s))" % (amount, "+".join(term(*s) for s in spans))
+    return (",scale=w='trunc(%d*%s/2)*2':h='trunc(%d*%s/2)*2':eval=frame,"
+            "crop=%d:%d:'(in_w-out_w)/2':'clip(%.3f*in_h-0.36*out_h,0,in_h-out_h)'" % (ow, z, oh, z, ow, oh, eye))
 
 
 # ---------------------------------------------------------------- rendering
@@ -1004,18 +1073,30 @@ def filter_path(path):
     return "'" + path.replace("\\", "/").replace(":", "\\:") + "'"
 
 
-def audio_chain(intervals, cut, enhance, music, music_volume, beeps=()):
-    """Voice clean-up (rumble, AI noise reduction, sibilance, levelling), soft 12 ms fades at every cut so the
-    pause cutter never clicks, and optional background music that ducks under speech."""
+XFADE = 0.02  # each side of a cut reaches this far into the cut-away audio, for a 40 ms cross-fade
+
+
+def audio_chain(intervals, cut, enhance, music, music_volume, beeps=(), quiet=(), roomtone=None):
+    """Voice clean-up (rumble, AI noise reduction, sibilance, levelling), 40 ms cross-fades at every cut (the two
+    sides overlap like in an editing program, so a cut never clicks or drops into silence and the length stays
+    exact), breaths in pauses turned down, a bed of the room's own sound under the cleaned voice, and optional
+    background music that ducks under speech."""
     head = "[0:a]aformat=sample_rates=48000:channel_layouts=stereo"
     if cut and len(intervals) > 1:
         n = len(intervals)
         parts = [head + ",asplit=%d%s" % (n, "".join("[s%d]" % i for i in range(n)))]
         for i, (a, b) in enumerate(intervals):
-            ln = b - a
-            fade = ",afade=t=in:st=0:d=0.012,afade=t=out:st=%.4f:d=0.012" % (ln - 0.012) if ln > 0.05 else ""
-            parts.append("[s%d]atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS%s[p%d]" % (i, a, b, fade, i))
-        parts.append("%sconcat=n=%d:v=0:a=1" % ("".join("[p%d]" % i for i in range(n)), n))
+            a2 = a - XFADE if i else a
+            b2 = b + XFADE if i < n - 1 else b
+            ln = b2 - a2
+            fade = (",afade=t=in:st=0:d=0.012" if not i else "") + \
+                   (",afade=t=out:st=%.4f:d=0.012" % (ln - 0.012) if i == n - 1 and ln > 0.05 else "")
+            parts.append("[s%d]atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS%s[p%d]" % (i, a2, b2, fade, i))
+        prev = "p0"
+        for i in range(1, n):
+            nxt = "x%d" % i
+            parts.append("[%s][p%d]acrossfade=d=%.3f:c1=qsin:c2=qsin%s" % (prev, i, 2 * XFADE, "" if i == n - 1 else "[%s]" % nxt))
+            prev = nxt
         a = ";".join(parts)
     elif cut:
         a = head + ",atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS" % intervals[0]
@@ -1031,6 +1112,15 @@ def audio_chain(intervals, cut, enhance, music, music_volume, beeps=()):
               "sine=frequency=1000:sample_rate=48000:duration=%.2f,aformat=sample_rates=48000:channel_layouts=stereo,"
               "volume=0.18,volume=enable='not(%s)':volume=0[bp];"
               "[vb][bp]amix=inputs=2:duration=first:normalize=0" % (on, total, on))
+    if quiet:  # breaths and noises in the remaining pauses: about 9 dB down, not muted
+        a += ",volume=enable='%s':volume=0.35" % "+".join("between(t,%.3f,%.3f)" % q for q in quiet)
+    if roomtone and enhance:
+        # a loop of the quietest stretch of the recording at the level the noise reduction leaves under speech,
+        # so pauses keep the same 'air' instead of dropping to digital silence
+        idx, length = roomtone
+        a += ("[vr];[%d:a]aformat=sample_rates=48000:channel_layouts=stereo,highpass=f=80,"
+              "afade=t=in:d=0.08,afade=t=out:st=%.3f:d=0.08,aloop=loop=-1:size=%d,volume=0.15[rt];"
+              "[vr][rt]amix=inputs=2:duration=first:normalize=0" % (idx, length - 0.08, int(length * 48000)))
     if music:
         a += (",asplit=2[vs][vm];"
               "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=%.2f[m];"
@@ -1039,24 +1129,55 @@ def audio_chain(intervals, cut, enhance, music, music_volume, beeps=()):
     return a + ",loudnorm=I=-14:TP=-1.5:LRA=11[a]"
 
 
+_FILTERS = {}
+
+
+def has_filter(name):
+    if name not in _FILTERS:
+        out = subprocess.run([FFMPEG, "-hide_banner", "-filters"], capture_output=True, text=True).stdout
+        _FILTERS[name] = (" %s " % name) in out
+    return _FILTERS[name]
+
+
+def stabilize_filter(video, start, duration, workdir):
+    """Two-pass stabilisation (vidstab) of the clip range, before cropping, so handheld shake is not magnified by
+    the portrait crop; falls back to ffmpeg's simpler deshake filter."""
+    if not (has_filter("vidstabdetect") and has_filter("vidstabtransform")):
+        return "deshake=rx=32:ry=32"
+    trf = "stab_%d_%d.trf" % (round(start * 100), round(duration * 100))
+    if not os.path.exists(os.path.join(workdir, trf)):
+        run([FFMPEG, "-y", "-v", "error", "-ss", "%.3f" % start, "-t", "%.3f" % duration, "-i", video,
+             "-vf", "vidstabdetect=shakiness=6:accuracy=10:result=%s" % trf, "-f", "null", "-"], cwd=workdir)
+    return "vidstabtransform=input=%s:smoothing=14:zoom=3:optzoom=0:interpol=bicubic:crop=black" % trf
+
+
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
-                size=(1080, 1920), zoom_spans_out=None, music=None, split=None, beeps=()):
+                size=(1080, 1920), zoom_spans_out=None, music=None, split=None, beeps=(), quiet=(), roomtone_at=None,
+                eye=0.4):
     ow, oh = size
     fps = out_fps(info)
     duration = end - start
     cut = bool(intervals) and not (len(intervals) == 1 and intervals[0][0] <= 0.01 and intervals[0][1] >= duration - 0.01)
     sel = (",select='%s',setpts=N/%d/TB" % (select_expr(intervals, fps), fps)) if cut else ""
     graph = video_chain(info, style.get("mode", "auto"), crop_segs, sel, ow, oh, split)
-    if style.get("zoom", True) and zoom_spans_out and not split:
-        graph += zoom_filter(zoom_spans_out, ow, oh)
+    if style.get("stabilize"):
+        graph = graph.replace("[0:v]", "[0:v]" + stabilize_filter(video, start, duration, workdir) + ",", 1)
+    if zoom_spans_out and not split:
+        graph += zoom_filter(zoom_spans_out, ow, oh, eye=eye)
     graph += ((",ass=" + ass_name) if burn else "") + "[v]"
     cmd = [FFMPEG, "-y", "-ss", "%.3f" % start, "-t", "%.3f" % duration, "-i", video]
     has_audio = info.get("has_audio", True)
     if has_audio:
+        n_in = 1
         if music:
             cmd += ["-stream_loop", "-1", "-i", music]
+            n_in += 1
+        roomtone = None
+        if roomtone_at and style.get("roomtone", True):
+            cmd += ["-ss", "%.3f" % roomtone_at[0], "-t", "%.3f" % roomtone_at[1], "-i", video]
+            roomtone = (n_in, roomtone_at[1])
         graph += ";" + audio_chain(intervals, cut, style.get("enhance_audio", True), music,
-                                   int(style.get("music_volume", 15)), beeps)
+                                   int(style.get("music_volume", 15)), beeps, quiet, roomtone)
     out = name + ".mp4"
     cmd += ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"] if has_audio else [])
     cmd += ["-c:v", "libx264", "-preset", "faster", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
@@ -1795,3 +1916,146 @@ def best_cover_time(video, info, start, end):
         if score > best:
             best, best_t = score, 0.3 + i / 2
     return best_t
+
+
+# ---------------------------------------------------------------- cut polish: no blinks at cuts, room tone
+
+def refine_cuts(video, info, start, intervals, words, fps, loop=False, limit=16):
+    """Moves cut points by a few frames so no clip starts, ends or jumps on closed eyes or mid-movement.
+
+    Every cut point may move inside its pause (never into a word, at most 0.12 s); per candidate frame the score
+    is: eyes open (Haar eye detector inside the YuNet face) > no face found > eyes closed, minus picture motion
+    (a hand or head in mid-move blurs and looks cut off), minus a small cost for moving at all."""
+    import cv2
+    import numpy as np
+
+    if not intervals or not os.path.exists(YUNET):
+        return intervals
+    W, H = info["width"], info["height"]
+    aw = 480
+    ah = int(round(H * aw / W / 2)) * 2
+    try:
+        det = cv2.FaceDetectorYN.create(YUNET, "", (aw, ah), 0.6, 0.3, 5)
+    except cv2.error:
+        return intervals
+    eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+    step = 1.0 / fps
+    iv = [list(x) for x in intervals]
+    duration = iv[-1][1]
+
+    def word_edges(a, b):
+        inside = [w for w in words if w["e"] > a and w["s"] < b]
+        return (inside[0]["s"], inside[-1]["e"]) if inside else (a, b)
+
+    # (interval index, 0 = start / 1 = end, lowest, highest)
+    jobs = []
+    for i, (a, b) in enumerate(iv):
+        first, last = word_edges(a, b)
+        lo_a = max(0.0, iv[i - 1][1] + 0.05) if i else 0.0
+        hi_b = min(duration if i == len(iv) - 1 else iv[i + 1][0] - 0.05, duration)
+        jobs.append((i, 0, max(lo_a, a - 0.12), min(first - 0.02, a + 0.12)))
+        jobs.append((i, 1, max(last + 0.02, b - 0.12), min(hi_b, b + 0.12)))
+    jobs = [j for j in jobs if j[3] - j[2] >= step][:limit]
+
+    def score(img, prev):
+        found = det.detect(img)[1]
+        s = 1.0
+        if found is not None and len(found):
+            x, y, w, h = [int(v) for v in max(found, key=lambda r: r[2] * r[3])[:4]]
+            face = cv2.cvtColor(img[max(0, y):max(0, y) + h // 2 + 1, max(0, x):max(0, x) + w], cv2.COLOR_BGR2GRAY)
+            s = 2.0 if face.size and len(eyes.detectMultiScale(face, 1.1, 4)) else 0.0
+        if prev is not None:
+            s -= min(1.0, float(np.mean(cv2.absdiff(img, prev))) / 12.0)
+        return s
+
+    for i, side, lo, hi in jobs:
+        # a start shows its own frame, an end shows the frame just before it
+        f0 = lo - side * step - step
+        raw = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.3f" % max(0.0, start + f0), "-t", "%.3f" % (hi - lo + 3 * step),
+                              "-i", video, "-vf", "scale=%d:%d" % (aw, ah), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                             capture_output=True).stdout
+        n = len(raw) // (aw * ah * 3)
+        if n < 2:
+            continue
+        frames = np.frombuffer(raw[:n * aw * ah * 3], np.uint8).reshape(n, ah, aw, 3)
+        orig = iv[i][side]
+        best, best_v, orig_s = -9.0, orig, None
+        for k in range(1, n):
+            v = f0 + k * step + side * step  # cut point that makes frame k the one seen at the cut
+            if v > hi + 1e-6:
+                break
+            if v < lo - 1e-6:
+                continue
+            sc = score(frames[k], frames[k - 1]) - 2.0 * abs(v - orig)
+            if orig_s is None and abs(v - orig) < step / 2 + 1e-6:
+                orig_s = sc
+            if sc > best:
+                best, best_v = sc, v
+        if orig_s is not None and best > orig_s + 0.5:
+            iv[i][side] = round(best_v, 4)
+    out = [(a, b) for a, b in iv if b - a > 0.1]
+    return out or intervals
+
+
+def roomtone_spot(video, start, end, words, length=0.6):
+    """Start of the quietest stretch without speech in or near the clip, for the room-tone bed; None if none."""
+    import numpy as np
+
+    lo, hi = max(0.0, start - 20), end + 20
+    p = subprocess.run([FFMPEG, "-v", "error", "-ss", "%.3f" % lo, "-t", "%.3f" % (hi - lo), "-i", video, "-vn",
+                        "-ac", "1", "-ar", "8000", "-f", "s16le", "-"], capture_output=True)
+    a = np.frombuffer(p.stdout, np.int16).astype(np.float32)
+    if p.returncode != 0 or len(a) < 8000:
+        return None
+    gaps, prev = [], lo
+    for w in sorted(words, key=lambda w: w["s"]):
+        if w["s"] - prev >= length + 0.2:
+            gaps.append((prev + 0.1, w["s"] - 0.1))
+        prev = max(prev, w["e"])
+    best, at = None, None
+    for g0, g1 in gaps:
+        t = g0
+        while t + length <= g1:
+            seg = a[int((t - lo) * 8000):int((t + length - lo) * 8000)]
+            if len(seg):
+                rms = float(np.sqrt(np.mean(seg ** 2)))
+                if rms > 3 and (best is None or rms < best):  # digital silence is no room tone
+                    best, at = rms, t
+            t += 0.2
+    return (round(at, 3), length) if at is not None else None
+
+
+def tighten_ends(intervals, words):
+    """Loop ending: start right on the first word and stop right after the last one, so the restart of a short
+    video on TikTok, Reels or Shorts flows on without a gap."""
+    if not intervals or not words:
+        return intervals
+    iv = [list(x) for x in intervals]
+    inside = [w for w in words if not is_filler(w["w"]) and any(a <= (w["s"] + w["e"]) / 2 <= b for a, b in iv)]
+    if not inside:
+        return intervals
+    iv[0][0] = max(iv[0][0], inside[0]["s"] - 0.04)
+    iv[-1][1] = min(iv[-1][1], inside[-1]["e"] + 0.12)
+    return [(a, b) for a, b in iv if b - a > 0.05] or intervals
+
+
+def align_switches(segs, words, cuts=(), delay=0.2):
+    """Speaker switches in the framing move to just after the new speaker's first word (J-cut: the voice comes
+    first, the picture follows), instead of the one-second grid of the face analysis. Camera cuts stay put."""
+    if not segs or len(segs) < 2 or any(len(s) < 4 for s in segs):
+        return segs
+    out = [[s[0], s[1], s[2], list(s[3] or [])] for s in segs]
+    starts = [w["s"] for k, w in enumerate(words) if k == 0 or w["s"] - words[k - 1]["e"] >= 0.25]
+    for i in range(1, len(out)):
+        t = out[i][0]
+        if any(abs(t - c) < 0.15 for c in cuts):
+            continue
+        near = [x for x in starts if abs(x - t) <= 0.8]
+        if not near:
+            continue
+        nt = round(min(near, key=lambda x: abs(x - t)) + delay, 3)
+        if out[i - 1][0] + 0.5 < nt < out[i][1] - 0.5:
+            out[i - 1][1] = out[i][0] = nt
+            out[i - 1][3] = [(min(p, nt), x) for p, x in out[i - 1][3]]
+            out[i][3] = [(max(p, nt), x) for p, x in out[i][3]]
+    return [tuple(s) for s in out]

@@ -32,6 +32,7 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 - Ton: Schnitte bildgenau, 12-ms-Blenden an jeder Schnittstelle, RNNoise-Rauschunterdrückung.
 - Text: Spracherkennung wahlweise mit large-v3-turbo, wortgenaue Zeitstempel per Forced Alignment (torchaudio MMS) für die Clip-Bereiche, Untertitel-Umbruch nach Sinngrenzen.
 - Kontrolle: optionale KI-Endkontrolle anhand von Standbildern des fertigen Clips.
+- Schnitt-Feinschliff: 40-ms-Kreuzblenden an jedem Tonschnitt (Länge bleibt exakt), Sprecherwechsel im Bild 0,2 s nach dem ersten Wort (J-Cut), Bildausschnitt wechselt an jedem Jump-Cut (Punch-in), Schnittpunkte rücken um wenige Bilder weg von geschlossenen Augen und Bewegungsunschärfe, Pausen nach Sprechtempo mit Spannungspausen nach Fragen und vor kurzen Pointen, Atmer in Pausen −9 dB, Raumton-Teppich aus der leisesten Stelle der Aufnahme, optionale Stabilisierung (vidstab), Blickraum in Blickrichtung und Zooms auf Augenhöhe, Untertitel 70 ms vor dem Wort, Loop-Ende, Bild steht nie länger als ca. 4,5 s still.
 
 ## Bedienung per Klick
 

@@ -332,6 +332,14 @@ function renderHome(){
       '<div><label>Musik-Lautstärke (%)</label><input id="o_music_volume" type="number" min="2" max="60" value="'+d.music_volume+'"></div>'+
       '<div><label>Zusätzliche Formate</label>'+chk("o_fmt_4x5",d.fmt_4x5,"4:5 (Feed)")+chk("o_fmt_1x1",d.fmt_1x1,"1:1 (Quadrat)")+'</div>'+
     '</div><p class="muted small">Musik lädst du in den <a href="#" onclick="openSettings();return false">Einstellungen</a> hoch. Sie wird automatisch leiser, sobald gesprochen wird. Jedes zusätzliche Format verlängert das Rendern.</p></details>'+
+    '<details><summary>Schnitt-Feinschliff</summary><div class="toggles">'+
+      chk("o_jumpcut_zoom",d.jumpcut_zoom,"Jump-Cuts kaschieren (Bildausschnitt wechselt an jedem Schnitt)")+
+      chk("o_natural_pauses",d.natural_pauses,"Pausen mit Gefühl kürzen (Spannungspausen bleiben)")+
+      chk("o_roomtone",d.roomtone,"Atmer leiser, Raumton statt Stille")+
+      chk("o_blink_safe",d.blink_safe,"Nicht bei geschlossenen Augen oder mitten in einer Bewegung schneiden")+
+      chk("o_loop_end",d.loop_end,"Loop-Ende: ohne Vor- und Nachlauf, endet im Bildausschnitt des Anfangs")+
+      chk("o_stabilize",d.stabilize,"Verwackelte Aufnahmen stabilisieren (verlängert das Rendern)")+
+    '</div><p class="muted small">Immer aktiv: weiche Tonübergänge an jedem Schnitt, Sprecherwechsel im Bild kurz nach dem ersten Wort (J-Cut), Blickraum in Blickrichtung, Zooms auf Augenhöhe, Untertitel 70 ms vor dem Wort. „Dynamische Zooms“ sorgt zusätzlich dafür, dass das Bild nie länger als etwa 4,5 s stillsteht.</p></details>'+
     '<div style="margin-top:14px"><label>Worum geht es im Video? (optional, hilft der KI)</label><textarea id="o_context" placeholder="z. B. Podcast über Selbstständigkeit, Zielgruppe junge Gründer"></textarea></div>'+
     '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="saveDefaults()">Einstellungen als Standard speichern</button></div>'+
     '</div><div id="storage"></div><div id="queue"></div><div class="jobs" id="jobs"></div>');
@@ -348,7 +356,7 @@ function renderHome(){
 
 function readOpts(){
   var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check"].forEach(function(k){o[k]=$("o_"+k).checked});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check","jumpcut_zoom","natural_pauses","roomtone","blink_safe","loop_end","stabilize"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
