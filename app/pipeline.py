@@ -1208,7 +1208,7 @@ def stabilize_filter(video, start, duration, workdir):
 
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
                 size=(1080, 1920), zoom_spans_out=None, music=None, split=None, beeps=(), quiet=(), roomtone_at=None,
-                eye=0.4, blur=None, cams=None, music_offset=0.0, cut_kinds=None):
+                eye=0.4, blur=None, cams=None, music_offset=0.0, cut_kinds=None, cut_len=None):
     """One clip from the source: cuts, framing, optional stabilisation, blurred areas, extra cameras (each a list
     item {"path", "start", "info", "crop_segs", "on": [(t0, t1) output time]}), zooms, subtitles and sound."""
     ow, oh = size
@@ -1234,7 +1234,7 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
             graph += ";[m%d][c%d]overlay=0:0:enable='%s'[m%d]" % (j - 1, j, on, j)
         graph += ";[m%d]null" % len(cams)
     if soft:
-        graph += "[full];" + dissolve_chain("full", intervals, fps, kinds=cut_kinds)
+        graph += "[full];" + dissolve_chain("full", intervals, fps, length=cut_len or DISSOLVE, kinds=cut_kinds)
     if zoom_spans_out and not split:
         graph += zoom_filter(zoom_spans_out, ow, oh, eye=eye)
     graph += ((",ass=" + ass_name) if burn else "") + "[v]"

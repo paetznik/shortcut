@@ -45,6 +45,11 @@ Erstellt aus langen deutschsprachigen Videos automatisch Shorts/Reels im Hochfor
 - Papierkorb: gelöschte Clips und durch Neu-Rendern ersetzte Fassungen bleiben 14 Tage erhalten und lassen sich wiederherstellen (eine ältere Fassung tauscht mit der aktuellen).
 - Mehrere Videos auf einmal hochladen: alle bekommen dieselben Einstellungen und werden nacheinander verarbeitet.
 - Morph-Cut (Standard): bei Jump-Cuts in derselben Einstellung werden Zwischenbilder mit Bewegungskompensation berechnet (minterpolate), Kopf und Körper gleiten in die neue Position; bei Kamera-, Ausschnitt- oder Sprecherwechsel und bei zu großer Bildänderung automatisch Überblendung. Bildanzahl exakt, Ton bleibt synchron.
+- Feinregler: Länge von Morph-Cut/Überblendung (0,1–0,4 s) pro Projekt, Übergang pro Schnitt (Automatisch, Morph, Überblendung, hart) – an der Stelle im Original verankert.
+- Vorher/Nachher: alte Fassung (Papierkorb) oder Vorschau neben der aktuellen, synchron abgespielt, Ton wahlweise links/rechts.
+- Zwischenspeicher je Projekt für Gesichts-, Szenen-, Stimm-, Morph-, Raumton-, Unkenntlich- und Kamera-Analysen: Neu-Rendern rechnet nur, was sich geändert hat.
+- Editor fürs Handy: Bereiche Schnitt/Texte/Bild/Extras einklappbar, große Griffe, Knöpfe statt Tastenkürzel, Aktionen unten fixiert.
+- Freigabe-Link: öffentliche, nicht erratbare Seite /s/… mit allen fertigen Clips; Freigeben oder Änderung wünschen mit Namen und Kommentar; Rückmeldungen am Clip, Link jederzeit zurückziehbar.
 - Schnelle Vorschau im Clip-Editor: ungespeicherte Änderungen in 540×960 in wenigen Sekunden ansehen, ohne die langsamen Extras; erst „Speichern und neu rendern“ erzeugt die volle Qualität.
 - Übergang an Schnitten wählbar: Morph-Cut, weiche Überblendung ( 0,2 s, Länge und Lippensynchronität bleiben exakt), Zoom-Sprung oder harter Schnitt; Pausen werden nur noch deutlich gekürzt, kein Stück zwischen zwei Schnitten unter 1 s.
 - Weitere Highlights nachträglich finden: im fertigen Projekt Anzahl und Länge wählen, ohne neues Hochladen; vorhandene Clips werden nicht wiederholt.

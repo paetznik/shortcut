@@ -41,7 +41,7 @@ DEFAULTS = {
     "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True, "precise_timing": True,
     "ai_check": True, "jumpcut_zoom": True, "blink_safe": True, "natural_pauses": True, "roomtone": True,
     "stabilize": False, "loop_end": True, "fmt_lengths": False, "speaker_colors": False, "blur_faces": False,
-    "blur_plates": False, "multicam": True, "cut_style": "morph",
+    "blur_plates": False, "multicam": True, "cut_style": "morph", "cut_length": 200,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -265,6 +265,7 @@ def clean_settings(s):
         except (TypeError, ValueError):
             pass
     out["clips"] = max(1, min(15, out["clips"]))
+    out["cut_length"] = max(100, min(400, out["cut_length"]))
     out["min_len"] = max(5, min(170, out["min_len"]))
     out["max_len"] = max(out["min_len"] + 5, min(180, out["max_len"]))
     out["font_size"] = max(40, min(140, out["font_size"]))
@@ -562,6 +563,13 @@ def apply_edit(jid, idx, body):
                 clip["removed"] = sorted({round(float(x), 2) for x in body["removed"]})[:2000]
             except (TypeError, ValueError):
                 raise HTTPException(400, "Ungültige Wortauswahl")
+        if "cut_overrides" in body:  # transition fixed by hand for single cuts: {source time: kind}
+            try:
+                over = {str(round(float(t), 2)): v for t, v in (body["cut_overrides"] or {}).items()
+                        if v in ("morph", "fade", "cut")}
+            except (TypeError, ValueError, AttributeError):
+                raise HTTPException(400, "Ungültige Übergänge")
+            clip["cut_overrides"] = dict(list(over.items())[:100])
         if "blur_boxes" in body:  # areas made unrecognisable by hand: [x, y, w, h] as parts of the source picture
             try:
                 boxes = [[round(min(1.0, max(0.0, float(v))), 4) for v in b[:4]] for b in body["blur_boxes"] or []]
@@ -988,6 +996,8 @@ def preview_override(body):
     if "keywords" in body:
         kw = body["keywords"].split(",") if isinstance(body["keywords"], str) else body["keywords"] or []
         o["keywords"] = [str(k).strip() for k in kw if str(k).strip()][:12]
+    if isinstance(body.get("cut_overrides"), dict):
+        o["cut_overrides"] = {str(t): v for t, v in body["cut_overrides"].items() if v in ("morph", "fade", "cut")}
     if isinstance(body.get("style"), dict):
         o["style"] = body["style"]
     return o
@@ -1026,7 +1036,8 @@ def make_preview(jid, idx, override):
     except Exception as e:
         raise HTTPException(500, "Vorschau fehlgeschlagen: " + str(e)[:300])
     return {"file": name + ".mp4", "duration": round(p["out_len"], 1), "seconds": round(time.time() - t0, 1),
-            "cuts": len(p["intervals"]) - 1, "morphs": (p.get("cut_kinds") or []).count("morph")}
+            "cuts": len(p["intervals"]) - 1, "morphs": (p.get("cut_kinds") or []).count("morph"),
+            "cut_list": p.get("cuts_info", [])}
 
 
 # ---------------------------------------------------------------- editing assistant (chat)
@@ -1674,6 +1685,35 @@ def shift_segs(segs, offset, duration):
     return out or None
 
 
+def cached(jid, name, key, fn):
+    """Result of an analysis step from the project's cache, or computed and stored. The key holds every input
+    (source file with size and time stamp, clip range, cut plan ...), so a changed input never gets an old answer."""
+    import pickle
+
+    raw = json.dumps(key, sort_keys=True, default=str)
+    path = os.path.join(JOBS, jid, "cache", "%s_%s.pkl" % (name, hashlib.sha1(raw.encode()).hexdigest()[:20]))
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+    value = fn()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            pickle.dump(value, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+    return value
+
+
+def file_sig(path):
+    st = os.stat(path)
+    return [os.path.basename(path), st.st_size, int(st.st_mtime)]
+
+
 def prepare(jid, idx, info, override=None, fast=False):
     """Everything a render of this clip needs: cut intervals, words on the output timeline, zooms, framing, music.
 
@@ -1693,7 +1733,10 @@ def prepare(jid, idx, info, override=None, fast=False):
     manual = manual_crop(clip, info)
     split_wanted = s.get("mode") == "split"
     # faces are only needed for automatic framing; scene cuts are always looked for
-    det = pipeline.detect_faces(src, info, clip["start"], clip["end"], faces=not manual and s.get("mode") in ("auto", "split"))
+    sig = file_sig(src)
+    want_faces = not manual and s.get("mode") in ("auto", "split")
+    det = cached(jid, "faces", [sig, clip["start"], clip["end"], want_faces],
+                 lambda: pipeline.detect_faces(src, info, clip["start"], clip["end"], faces=want_faces))
     head, tail = snap_to_cuts(det, clip["end"] - clip["start"]) if not manual else (0.0, 0.0)
     clip["start"], clip["end"] = round(clip["start"] + head, 2), round(clip["end"] - tail, 2)
     duration = clip["end"] - clip["start"]
@@ -1705,7 +1748,9 @@ def prepare(jid, idx, info, override=None, fast=False):
             w["beep"] = True
     if s.get("speaker_colors"):
         try:
-            for w, k in zip(words, pipeline.voice_speakers(src, clip["start"], clip["end"], words) or []):
+            voices = cached(jid, "voices", [sig, clip["start"], clip["end"], [(w["s"], w["e"]) for w in words]],
+                            lambda: pipeline.voice_speakers(src, clip["start"], clip["end"], words))
+            for w, k in zip(words, voices or []):
                 w["spk"] = k
         except Exception as e:
             log(jid, "Sprecherfarben übersprungen: " + str(e)[:200])
@@ -1717,7 +1762,9 @@ def prepare(jid, idx, info, override=None, fast=False):
     fps = pipeline.out_fps(info)
     if s.get("blink_safe", True) and not fast:
         try:
-            intervals = pipeline.refine_cuts(src, info, clip["start"], intervals, words, fps)
+            iv0 = intervals
+            intervals = cached(jid, "cuts", [sig, clip["start"], iv0, [(w["s"], w["e"]) for w in words], fps],
+                               lambda: pipeline.refine_cuts(src, info, clip["start"], iv0, words, fps))
         except Exception as e:
             log(jid, "Schnittpunkt-Feinschliff übersprungen: " + str(e)[:200])
     intervals = pipeline.quantize(intervals, fps)
@@ -1750,21 +1797,38 @@ def prepare(jid, idx, info, override=None, fast=False):
     blur = []
     if (s.get("blur_faces") or s.get("blur_plates")) and not fast:
         try:
-            blur = pipeline.privacy_regions(src, info, clip["start"], clip["end"], bool(s.get("blur_faces")),
-                                            bool(s.get("blur_plates")))
+            blur = cached(jid, "privacy", [sig, clip["start"], clip["end"], bool(s.get("blur_faces")), bool(s.get("blur_plates"))],
+                          lambda: pipeline.privacy_regions(src, info, clip["start"], clip["end"], bool(s.get("blur_faces")),
+                                                           bool(s.get("blur_plates"))))
         except Exception as e:
             log(jid, "Unkenntlich machen fehlgeschlagen: " + str(e)[:200])
     W, H = info["width"], info["height"]
     blur += [{"x": b[0] * W, "y": b[1] * H, "w": max(8, int(b[2] * W)), "h": max(8, int(b[3] * H))}
              for b in clip.get("blur_boxes", [])]
+    # transitions at the jump cuts: blend length from the settings, morph only where both sides show the same
+    # shot (camera cuts, framing or camera switches get a dissolve), and what was fixed by hand for single cuts
+    cut_len = max(0.1, min(0.4, int(s.get("cut_length", 200)) / 1000))
+    cut_style = s.get("cut_style", "morph")
     kinds = None
-    if s.get("cut_style", "morph") == "morph" and len(intervals) > 1 and not split:
-        # morph only where both sides show the same shot; camera cuts, framing or camera switches get a dissolve
-        changes = [seg[0] for seg in (crop_segs or [])[1:]] + [c - head for c in (det or {}).get("cuts", [])] +                   [t for cam in cams for on in cam.get("on_src", []) for t in on]
-        try:
-            kinds = pipeline.cut_kinds(src, info, clip["start"], intervals, pipeline.out_fps(info), crop_segs, changes)
-        except Exception as e:
-            log(jid, "Morph-Prüfung übersprungen: " + str(e)[:200])
+    if cut_style in ("morph", "weich") and len(intervals) > 1 and not split:
+        if cut_style == "morph":
+            changes = [seg[0] for seg in (crop_segs or [])[1:]] + [c - head for c in (det or {}).get("cuts", [])] + \
+                      [t for cam in cams for on in cam.get("on_src", []) for t in on]
+            try:
+                kinds = cached(jid, "kinds", [sig, clip["start"], intervals, crop_segs, changes, cut_len],
+                               lambda: pipeline.cut_kinds(src, info, clip["start"], intervals, pipeline.out_fps(info),
+                                                          crop_segs, changes, cut_len))
+            except Exception as e:
+                log(jid, "Morph-Prüfung übersprungen: " + str(e)[:200])
+        kinds = list(kinds or ["fade"] * (len(intervals) - 1))
+        for k, (a, b) in enumerate(intervals[:-1]):
+            at = clip["start"] + b
+            fixed = next((v for t, v in (clip.get("cut_overrides") or {}).items() if abs(float(t) - at) <= 0.2), None)
+            if fixed in ("morph", "fade", "cut"):
+                kinds[k] = fixed
+    cuts_info = [{"at": round(clip["start"] + b, 2), "out": round(pipeline.remap(b, intervals), 2),
+                  "kind": kinds[k] if kinds else ("zoom" if cut_style == "zoom" else "cut")}
+                 for k, (a, b) in enumerate(intervals[:-1])]
     music_offset, beats = 0.0, ()
     if music:
         beat = music_beat(music)
@@ -1792,14 +1856,16 @@ def prepare(jid, idx, info, override=None, fast=False):
         if s.get("enhance_audio", True):
             try:
                 near = [w for w in pipeline.all_words(load_transcript(jid)) if w["e"] > clip["start"] - 25 and w["s"] < clip["end"] + 25]
-                roomtone_at = pipeline.roomtone_spot(src, clip["start"], clip["end"], near)
+                roomtone_at = cached(jid, "roomtone", [sig, clip["start"], clip["end"]],
+                                     lambda: pipeline.roomtone_spot(src, clip["start"], clip["end"], near))
             except Exception:
                 roomtone_at = None
     return {"job": job, "clip": clip, "s": s, "src": src, "duration": duration, "intervals": intervals,
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
             "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail), "beeps": beeps,
             "end_text": end_text, "zooms": zooms, "static_max": static_max, "eye": eye, "quiet": quiet,
-            "roomtone_at": roomtone_at, "blur": blur, "cams": cams, "music_offset": music_offset, "cut_kinds": kinds}
+            "roomtone_at": roomtone_at, "blur": blur, "cams": cams, "music_offset": music_offset, "cut_kinds": kinds,
+            "cut_len": cut_len, "cuts_info": cuts_info}
 
 
 BEATS = {}
@@ -1827,7 +1893,9 @@ def camera_inputs(jid, job, clip, duration, det, head, intervals):
     for cam in job["cams"]:
         cs = clip["start"] + float(cam.get("offset") or 0)
         ok = cam.get("offset") is not None and cs >= 0 and cs + duration <= cam["info"]["duration"] + 0.05
-        d = pipeline.detect_faces(os.path.join(JOBS, jid, cam["file"]), cam["info"], cs, cs + duration) if ok else None
+        cpath = os.path.join(JOBS, jid, cam["file"])
+        d = cached(jid, "camfaces", [file_sig(cpath), cs, duration],
+                   lambda: pipeline.detect_faces(cpath, cam["info"], cs, cs + duration)) if ok else None
         if d is not None:
             d["width"] = cam["info"]["width"]
         dets.append(d)
@@ -1877,7 +1945,7 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
     out_len = pipeline.render_clip(p["src"], p["job"]["info"], clip["start"], clip["end"], d, base, p["s"], ass, burn,
                                    p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"], p["beeps"],
                                    p["quiet"], p["roomtone_at"], p["eye"], p["blur"], p["cams"], p["music_offset"],
-                                   p.get("cut_kinds"))
+                                   p.get("cut_kinds"), p.get("cut_len", pipeline.DISSOLVE))
     os.remove(os.path.join(d, ass))
     return out_len
 
@@ -1943,7 +2011,8 @@ def render_one(jid, idx, info):
     cover = None
     if s.get("cover", True):
         try:
-            at = pipeline.best_cover_time(p["src"], info, clip["start"], clip["end"])
+            at = cached(jid, "cover", [file_sig(p["src"]), clip["start"], clip["end"]],
+                        lambda: pipeline.best_cover_time(p["src"], info, clip["start"], clip["end"]))
         except Exception:
             at = None
         pipeline.render_cover(p["src"], info, clip["start"], at if at is not None else min(p["duration"] / 2, 1.5), d,
@@ -1981,7 +2050,7 @@ def render_one(jid, idx, info):
             "file": outputs["9x16"], "thumb": name + ".jpg", "srt": name + ".srt", "cover": cover,
             "formats": {k: v for k, v in outputs.items() if k != "9x16"}, "lengths": lengths, "version": version, "status": "fertig",
             "duration_out": round(out_len, 1), "speakers": len({seg[2] for seg in p["crop_segs"] or []}),
-            "translations": {}, "checks": checks, "split": bool(p["split"]), "uid": uid,
+            "translations": {}, "checks": checks, "cuts": p.get("cuts_info", []), "split": bool(p["split"]), "uid": uid,
         })
         save_job(job)
     export_files(jid, clip_files(load_job(jid)["clips"][idx]), "Clip %d" % (idx + 1))
@@ -2505,3 +2574,154 @@ def icon(size: int):
 def share_target_fallback():
     """Normally answered by the service worker; without it, just open the app."""
     return Response(status_code=303, headers={"Location": "/"})
+
+
+# ---------------------------------------------------------------- share link for clients or the team (no login)
+
+def job_by_share(token):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", token or ""):
+        raise HTTPException(404, "Link ungültig oder abgelaufen")
+    for jid in os.listdir(JOBS):
+        try:
+            job = load_job(jid)
+        except Exception:
+            continue
+        sh = job.get("share") or {}
+        if sh.get("token") and hmac.compare_digest(sh["token"], token):
+            return job
+    raise HTTPException(404, "Link ungültig oder abgelaufen")
+
+
+@app.post("/api/jobs/{jid}/share")
+def create_share(jid: str, request: Request):
+    """Link with which others can watch the finished clips, approve them or ask for changes – without a login."""
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        if not (job.get("share") or {}).get("token"):
+            job["share"] = {"token": secrets.token_urlsafe(24), "created": time.time()}
+            save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.delete("/api/jobs/{jid}/share")
+def delete_share(jid: str, request: Request):
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        job.pop("share", None)
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+@app.delete("/api/jobs/{jid}/feedback/{uid}")
+def clear_feedback(jid: str, uid: str, request: Request):
+    require_auth(request)
+    with lock:
+        job = load_job(jid)
+        (job.get("feedback") or {}).pop(uid, None)
+        save_job(job)
+    return public_job(job, with_text=True)
+
+
+def shared_clips(job):
+    fb = job.get("feedback") or {}
+    return [{"uid": c["uid"], "title": c.get("title", ""), "caption": c.get("caption", ""), "file": c["file"],
+             "cover": c.get("cover"), "thumb": c.get("thumb"), "duration": c.get("duration_out"),
+             "feedback": fb.get(c["uid"], [])[-20:]}
+            for c in job.get("clips", []) if c.get("file") and c.get("uid")]
+
+
+@app.get("/api/share/{token}")
+def share_data(token: str):
+    job = job_by_share(token)
+    return {"name": job["name"], "clips": shared_clips(job)}
+
+
+@app.get("/s/{token}/files/{name}")
+def share_file(token: str, name: str):
+    job = job_by_share(token)
+    allowed = {f for c in job.get("clips", []) for f in (c.get("file"), c.get("cover"), c.get("thumb")) if f}
+    if name not in allowed:
+        raise HTTPException(404, "Unbekannt")
+    return FileResponse(os.path.join(job_dir(job["id"]), name), headers={"Cache-Control": "private, max-age=600"})
+
+
+@app.post("/api/share/{token}/clips/{uid}")
+async def share_feedback(token: str, uid: str, request: Request):
+    """Approval or change request for one clip from someone with the link."""
+    body = await request.json()
+    status = body.get("status")
+    if status not in ("ok", "change"):
+        raise HTTPException(400, "Ungültig")
+    name = re.sub(r"\s+", " ", str(body.get("name") or "")).strip()[:60] or "Unbekannt"
+    comment = str(body.get("comment") or "").strip()[:1000]
+    if status == "change" and not comment:
+        raise HTTPException(400, "Bitte kurz beschreiben, was geändert werden soll.")
+    job = job_by_share(token)
+    with lock:
+        job = load_job(job["id"])
+        if uid not in {c.get("uid") for c in job.get("clips", [])}:
+            raise HTTPException(404, "Unbekannt")
+        fb = job.setdefault("feedback", {})
+        if sum(len(v) for v in fb.values()) >= 500:
+            raise HTTPException(429, "Zu viele Rückmeldungen für dieses Projekt")
+        fb.setdefault(uid, []).append({"name": name, "status": status, "comment": comment, "at": time.time()})
+        save_job(job)
+    title = next((c.get("title", "") for c in job["clips"] if c.get("uid") == uid), "")
+    log(job["id"], "Rückmeldung von %s zu „%s“: %s" % (name, title[:40], "freigegeben" if status == "ok" else "Änderung gewünscht"))
+    return {"clips": shared_clips(job)}
+
+
+SHARE_PAGE = r"""<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Clips zur Freigabe</title>
+<style>
+:root{--bg:#0f1115;--panel:#181b22;--panel2:#20242d;--line:#2a2f3a;--text:#eef0f4;--muted:#9aa3b2;--accent:#ff3d6e;--ok:#4ade80;--warn:#ffb02e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:18px 16px;border-bottom:1px solid var(--line)}header b{font-size:18px}main{max-width:1100px;margin:0 auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px}
+.c{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+video{width:100%;aspect-ratio:9/16;max-height:68vh;background:#000;display:block}.b{padding:12px;display:flex;flex-direction:column;gap:8px}
+.t{font-weight:700}.cap{white-space:pre-wrap;color:var(--muted);font-size:14px}.muted{color:var(--muted);font-size:13px}
+button{font:inherit;border:1px solid var(--line);background:var(--panel2);color:var(--text);border-radius:9px;padding:8px 12px;cursor:pointer}
+button.ok{border-color:var(--ok)}button.ch{border-color:var(--warn)}button:disabled{opacity:.5}
+textarea,input{font:inherit;width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px 10px}
+textarea{min-height:70px}.row{display:flex;gap:8px;flex-wrap:wrap}.fb{font-size:13px;border-top:1px solid var(--line);padding-top:6px}
+.st-ok{color:var(--ok)}.st-change{color:var(--warn)}.who{position:sticky;top:0;background:var(--bg);padding:10px 0 12px;z-index:2}
+</style></head><body><header><b id="name">Clips zur Freigabe</b><div class="muted">Bitte jeden Clip ansehen und freigeben oder eine Änderung wünschen.</div></header>
+<main><div class="who"><input id="who" placeholder="Dein Name (wird bei deiner Rückmeldung angezeigt)" maxlength="60"></div><div class="grid" id="grid">Lade …</div></main>
+<script>
+var T=location.pathname.split("/")[2],D=null;
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+try{document.getElementById("who").value=localStorage.getItem("sc_who")||""}catch(e){}
+document.getElementById("who").addEventListener("change",function(){try{localStorage.setItem("sc_who",this.value)}catch(e){}});
+function fbHtml(list){return list.map(function(f){return '<div class="fb"><span class="st-'+f.status+'">'+(f.status==="ok"?"✓ Freigegeben":"✎ Änderung gewünscht")+'</span> · '+esc(f.name)+' · '+new Date(f.at*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"})+(f.comment?'<div>'+esc(f.comment)+'</div>':'')+'</div>'}).join("")}
+function render(){
+  document.getElementById("name").textContent=D.name;document.title=D.name+" – Freigabe";
+  document.getElementById("grid").innerHTML=D.clips.length?D.clips.map(function(c,i){
+    return '<div class="c"><video src="/s/'+T+'/files/'+c.file+'" controls playsinline preload="metadata"'+(c.thumb?' poster="/s/'+T+'/files/'+c.thumb+'"':'')+'></video><div class="b">'+
+      '<div class="muted">Clip '+(i+1)+(c.duration?' · '+Math.round(c.duration)+' s':'')+'</div><div class="t">'+esc(c.title)+'</div>'+(c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+
+      '<div class="row"><button class="ok" onclick="send('+i+',\'ok\')">✓ Freigeben</button><button class="ch" onclick="toggle('+i+')">✎ Änderung wünschen</button></div>'+
+      '<div id="ch'+i+'" style="display:none"><textarea id="tx'+i+'" placeholder="Was soll anders sein? z. B. „Bitte erst ab dem Satz mit dem Kunden beginnen“"></textarea><div class="row" style="margin-top:6px"><button onclick="send('+i+',\'change\')">Senden</button></div></div>'+
+      '<div id="fb'+i+'">'+fbHtml(c.feedback)+'</div></div></div>';
+  }).join(""):'<p class="muted">Noch keine fertigen Clips.</p>';
+}
+function toggle(i){var e=document.getElementById("ch"+i);e.style.display=e.style.display==="none"?"block":"none"}
+function send(i,st){
+  var who=document.getElementById("who").value.trim();
+  if(!who){alert("Bitte oben deinen Namen eintragen.");document.getElementById("who").focus();return}
+  var tx=document.getElementById("tx"+i),c=D.clips[i];
+  fetch("/api/share/"+T+"/clips/"+c.uid,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:who,status:st,comment:st==="change"?tx.value:""})})
+    .then(function(r){return r.json().then(function(j){if(!r.ok) throw new Error(j.detail||"Fehler");return j})})
+    .then(function(j){D.clips=j.clips;render();}).catch(function(e){alert(e.message)});
+}
+fetch("/api/share/"+T).then(function(r){if(!r.ok) throw new Error("Dieser Link ist ungültig oder wurde zurückgezogen.");return r.json()}).then(function(j){D=j;render()})
+  .catch(function(e){document.getElementById("grid").innerHTML='<p>'+esc(e.message)+'</p>'});
+</script></body></html>"""
+
+
+@app.get("/s/{token}", response_class=HTMLResponse)
+def share_page(token: str):
+    job_by_share(token)
+    return HTMLResponse(SHARE_PAGE, headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
