@@ -41,7 +41,8 @@ DEFAULTS = {
     "fmt_4x5": False, "fmt_1x1": False, "cover": True, "audio_analysis": True, "two_stage": True, "reuse_transcript": True, "precise_timing": True,
     "ai_check": True, "jumpcut_zoom": True, "blink_safe": True, "natural_pauses": True, "roomtone": True,
     "stabilize": False, "loop_end": True, "fmt_lengths": False, "speaker_colors": False, "blur_faces": False,
-    "blur_plates": False, "multicam": True, "cut_style": "morph", "cut_length": 200,
+    "blur_plates": False, "multicam": True, "cut_style": "morph", "cut_length": 200, "visual_analysis": True,
+    "tournament": True,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -868,9 +869,13 @@ def more_highlights_task(jid, arg):
     s = job["settings"]
     update(jid, progress=10, message="Suche %d weitere Highlights …" % count)
     audio = load_audio(jid) if s.get("audio_analysis", True) else None
+    if s.get("visual_analysis", True) and load_visual(jid) is None and not job.get("source_deleted"):
+        run_visual_analysis(jid, os.path.join(JOBS, jid, job["source"]), job["info"])
+    visual = load_visual(jid) if s.get("visual_analysis", True) else None
     clips, source = pipeline.find_highlights(load_transcript(jid), load_config().get("anthropic_key", ""), count, mn, mx,
                                              job.get("context", ""), lambda m: log(jid, m), audio,
-                                             s.get("two_stage", True), exclude=job["clips"])
+                                             s.get("two_stage", True), exclude=job["clips"], visual=visual,
+                                             use_tournament=s.get("tournament", True))
     if not clips:
         return "Fertig – keine weiteren passenden Highlights gefunden (kürzere Mindestlänge probieren)"
     for c in clips:
@@ -2208,6 +2213,37 @@ def load_audio(jid):
         return json.load(f)
 
 
+def load_visual(jid):
+    path = os.path.join(JOBS, jid, "visual.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run_visual_analysis(jid, src, info):
+    """Smiles, head movement and gestures over the whole video (two frames a second), for the highlight search."""
+    update(jid, progress=71, message="Analysiere Bild (Mimik, Gestik, Bewegung) …")
+    t0 = time.time()
+    try:
+        vis = pipeline.analyze_visual(src, info, progress=lambda f: update(
+            jid, message="Analysiere Bild (Mimik, Gestik, Bewegung) … %d %%" % round(f * 100)))
+    except Cancelled:
+        raise
+    except Exception as e:
+        log(jid, "Bildanalyse fehlgeschlagen: " + str(e)[:200])
+        return
+    if not vis:
+        return
+    with open(os.path.join(JOBS, jid, "visual.json"), "w", encoding="utf-8") as f:
+        json.dump(vis, f)
+    counts = {}
+    for ev in vis["events"]:
+        counts[ev["type"]] = counts.get(ev["type"], 0) + 1
+    log(jid, "Bildanalyse (%.0f s): %s" % (time.time() - t0, ", ".join(
+        "%d× %s" % (n, pipeline.VISUAL_LABELS[k]) for k, n in counts.items()) or "keine Auffälligkeiten"))
+
+
 def run_audio_analysis(jid, wav, segments):
     """Loudness, liveliness and speech rate over the whole video; kept in audio.json, a small curve goes to the job."""
     update(jid, progress=71, message="Analysiere Ton (Lautstärke, Stimme, Tempo, Reaktionen) …")
@@ -2317,12 +2353,17 @@ def process(jid):
         run_audio_analysis(jid, wav, segments)
         os.remove(wav)
 
+    if job["settings"].get("visual_analysis", True) and load_visual(jid) is None:
+        run_visual_analysis(jid, src, info)
+
     s = job["settings"]
     update(jid, progress=72, message="Suche die besten Highlights …")
     key = load_config().get("anthropic_key", "")
     audio = load_audio(jid) if s.get("audio_analysis", True) else None
+    visual = load_visual(jid) if s.get("visual_analysis", True) else None
     clips, source = pipeline.find_highlights(segments, key, s["clips"], s["min_len"], s["max_len"], job.get("context", ""),
-                                             lambda m: log(jid, m), audio, s.get("two_stage", True))
+                                             lambda m: log(jid, m), audio, s.get("two_stage", True), visual=visual,
+                                             use_tournament=s.get("tournament", True))
     if not clips:
         raise RuntimeError("Keine passenden Highlights gefunden. Versuche eine kürzere Mindestlänge.")
     for c in clips:

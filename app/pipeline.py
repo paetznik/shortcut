@@ -149,18 +149,27 @@ def split_touching(clips):
     return clips
 
 
-def annotated_transcript(segments, audio):
-    """Transcript lines with hints from the audio analysis, e.g. ⟨laut, lebhafte Stimme⟩ or ⟨Lachen/Reaktion⟩."""
+def annotated_transcript(segments, audio, visual=None, topics=None):
+    """Transcript lines with hints from the sound and picture analysis, e.g. ⟨laut, lebhafte Stimme, lächelt⟩ or
+    ⟨Lachen/Reaktion⟩, and a header line at the start of every topic."""
     lines = []
+    for k, t in enumerate(topics or []):
+        lines.append((t["start"] - 0.001, "### Thema %d: %s" % (k + 1, t["title"])))
     for seg in segments:
         line = "[%.1f-%.1f] %s" % (seg["s"], seg["e"], seg["text"])
+        tags = []
         w = audio_window(audio, seg["s"], seg["e"]) if audio else None
         if w:
             tags = [TAG_LABELS[t] for t in w["tags"] if t != "reaktion"]
             if w["mean"] > 1.2 and not tags:
                 tags.append("energiegeladen")
-            if tags:
-                line += " ⟨" + ", ".join(tags) + "⟩"
+        v = visual_window(visual, seg["s"], seg["e"]) if visual else None
+        if v:
+            tags += [VISUAL_LABELS[t] for t in v["tags"]]
+            if v["mean"] > 1.5 and not v["tags"]:
+                tags.append("viel Bewegung im Bild")
+        if tags:
+            line += " ⟨" + ", ".join(tags) + "⟩"
         lines.append((seg["s"], line))
     for ev in (audio or {}).get("events", []):
         if ev["type"] == "reaktion":
@@ -245,7 +254,7 @@ HOOK_WORDS = [
 ]
 
 
-def score_windows(segments, min_len, max_len, audio=None):
+def score_windows(segments, min_len, max_len, audio=None, visual=None):
     """All candidate windows (whole segments, min_len..max_len) with a score from speech density, emphasis,
     hook words and the audio analysis."""
     target = (min_len + max_len) / 2
@@ -279,6 +288,13 @@ def score_windows(segments, min_len, max_len, audio=None):
                         score += 3 * max(0.0, hook["peak"])
                     if after and "reaktion" in after["tags"]:
                         score += 6
+                if visual:
+                    vw = visual_window(visual, start, segments[j]["e"])
+                    vh = visual_window(visual, start, min(segments[j]["e"], start + 5))
+                    if vw:
+                        score += 2 * vw["mean"] + 3 * ("laechelt" in vw["tags"]) + 2 * ("gestik" in vw["tags"])
+                    if vh:
+                        score += 2 * max(0.0, vh["peak"])
                 cands.append({"start": start, "end": segments[j]["e"], "score": score, "text": text.strip()})
             j += 1
     return cands
@@ -309,7 +325,8 @@ def highlights_heuristic(segments, n, min_len, max_len, audio=None, cands=None):
     return clips
 
 
-def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=None, two_stage=True, exclude=()):
+def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=None, two_stage=True, exclude=(),
+                    visual=None, use_tournament=True):
     """The n best clips; `exclude` holds existing clips (start/end) – new ones must not repeat them."""
     words = all_words(segments)
     clips, source = None, "heuristik"
@@ -322,20 +339,21 @@ def find_highlights(segments, api_key, n, min_len, max_len, context, log, audio=
     if api_key:
         try:
             if two_stage:
-                clips = highlights_claude_two_stage(segments, api_key, ask, min_len, max_len, context, audio, log)
+                clips = highlights_claude_two_stage(segments, api_key, ask, min_len, max_len, context, audio, log,
+                                                    visual, use_tournament)
             else:
                 clips = highlights_claude(segments, api_key, ask, min_len, max_len, context, audio)
             source = "claude"
         except Exception as e:  # fall back to heuristic
             log("KI-Auswahl fehlgeschlagen, nutze automatische Auswahl: " + str(e)[:200])
-    cands = score_windows(segments, min_len, max_len, audio)
+    cands = score_windows(segments, min_len, max_len, audio, visual)
     if not clips:
         clips = highlights_heuristic(segments, ask, min_len, max_len, audio, cands)
     for rank, c in enumerate(clips):  # Claude lists the best first; keep that order if it gives no score
         c.setdefault("score", 100 - rank)
 
     def select(primary, pool, max_l):
-        chosen = [c for c in (snap(c, words, min_len, max_l) for c in primary) if c and free(c)]
+        chosen = [c for c in (snap(repair_context(c, words, max_l), words, min_len, max_l) for c in primary) if c and free(c)]
         chosen = remove_overlaps(chosen, 1.5)[:n]
         top = max([x["score"] for x in pool] or [1]) or 1
         for c in sorted(pool, key=lambda c: -c["score"]):  # fill free stretches with the best remaining windows
@@ -1620,18 +1638,23 @@ def sentence_lines(words, start, end):
     return "\n".join("[%.1f-%.1f] %s" % (s[0]["s"], s[-1]["e"], " ".join(w["w"] for w in s)) for s in sentences(sel))
 
 
-def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context, audio, log):
+def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context, audio, log, visual=None,
+                                use_tournament=True):
     """Stage 1: many candidates, each rated on fixed criteria. Stage 2: the best ones get a sentence-level fine cut,
     titles and hooks, and may be rejected after a closer look."""
     words = all_words(segments)
-    k = min(20, max(12, n * 3))
+    k = min(24, max(14, n * 4))
     extra = ("\nKontext vom Ersteller: " + context.strip()) if context and context.strip() else ""
+    topics = find_topics(api_key, segments, log) if segments and segments[-1]["e"] > 150 else []
     prompt1 = (
         "Du bist ein sehr anspruchsvoller Social-Media-Editor für TikTok, Instagram Reels und YouTube Shorts.\n"
         "Unten steht das Transkript eines deutschsprachigen Videos mit Zeitstempeln in Sekunden. Hinweise in ⟨⟩ "
-        "stammen aus einer automatischen Tonanalyse (Lautstärke, lebhafte Stimme, Tempo, Lachen/Applaus).%s\n\n"
+        "stammen aus einer automatischen Ton- und Bildanalyse (Lautstärke, lebhafte Stimme, Tempo, Lachen/Applaus, "
+        "Lächeln, lebhafte Gestik).%s%s\n\n"
         "Sammle die %d vielversprechendsten Kandidaten für eigenständige Kurzvideos (je %d-%d Sekunden, Start und Ende "
-        "auf Zeitstempeln des Transkripts, Überschneidungen erlaubt). Bewerte jeden streng von 0 bis 10:\n"
+        "auf Zeitstempeln des Transkripts, Überschneidungen erlaubt). Verteile sie über möglichst viele Themen. "
+        "Folgt eine starke Antwort auf eine Frage, beginnt der Kandidat mit der (kurzen) Frage. "
+        "Bewerte jeden streng von 0 bis 10:\n"
         "- hook: Fesseln die ersten 3 Sekunden sofort (Frage, steile These, Überraschung, Konflikt, Emotion)?\n"
         "- standalone: Versteht man den Ausschnitt ohne den Rest des Videos?\n"
         "- value: Bietet er einen echten Mehrwert (Tipp, Erkenntnis, Geschichte) oder starke Emotion?\n"
@@ -1640,7 +1663,8 @@ def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context,
         "Antworte NUR mit einem JSON-Array: "
         '[{"start": 12.3, "end": 48.0, "scores": {"hook": 7, "standalone": 8, "value": 6, "payoff": 7}, '
         '"reason": "ein Satz, warum der Ausschnitt funktioniert"}]\n\nTRANSKRIPT:\n%s'
-    ) % (extra, k, min_len, max_len, annotated_transcript(segments, audio))
+    ) % (extra, "\nZeilen mit ### markieren den Beginn eines Themas." if topics else "", k, min_len, max_len,
+         annotated_transcript(segments, audio, visual, topics))
     cands = claude_json(api_key, prompt1, r"\[.*\]", max_tokens=6000, feature="KI-Auswahl")
     rated = []
     for c in cands:
@@ -1654,8 +1678,11 @@ def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context,
                       "reason": str(c.get("reason", ""))[:300]})
     if not rated:
         raise RuntimeError("Claude hat keine Kandidaten geliefert.")
-    snapped = [x for x in (snap(c, words, min_len, max_len) for c in rated) if x]
-    best = remove_overlaps(snapped, 1.5)[: n + 2]
+    snapped = [x for x in (snap(repair_context(c, words, max_len), words, min_len, max_len) for c in rated) if x]
+    pool = remove_overlaps(snapped, 6.0)[: min(14, max(2 * n + 4, 8))]
+    if use_tournament and len(pool) >= 3:
+        pool = tournament(api_key, pool, words, log)
+    best = pick_diverse(pool, n + 2, topics)
     log("KI-Auswahl Durchgang 1: %d Kandidaten bewertet, %d in der engeren Wahl" % (len(rated), len(best)))
 
     # stage 2: fine cut with sentence-level timestamps and some room before and after
@@ -1668,14 +1695,17 @@ def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context,
         "Du bekommst %d Rohschnitte für Kurzvideos aus einem deutschsprachigen Video, jeweils mit Sätzen davor und "
         "danach (Zeitstempel in Sekunden).%s\nPrüfe jeden Rohschnitt genau und lege den finalen Schnitt fest:\n"
         "- Start auf den Satz, der sofort fesselt; lass schwache Einleitungen, Begrüßungen und Füllsätze weg.\n"
-        "- Ende nach dem abgeschlossenen Gedanken bzw. der Pointe, nicht mitten in der Auflösung.\n"
+        "- Kontext: Versteht man den Start ohne Vorwissen? Bezieht er sich zurück (\"das\", \"er\", \"deshalb\", eine "
+        "Antwort ohne ihre Frage), beginne mit dem Satz bzw. der Frage davor.\n"
+        "- Spannungsbogen: Hook – Aufbau – Auflösung. Finde den Satz mit der Pointe bzw. Auflösung (payoff_end = sein "
+        "Ende). Das Ende liegt direkt danach – nie davor, und ohne Leerlauf oder Themenwechsel danach.\n"
         "- Länge %d-%d Sekunden; Start und Ende exakt auf Satzgrenzen aus der Liste.\n"
         "- \"keep\": false, wenn der Ausschnitt bei genauem Hinsehen schwach oder ohne Vorwissen unverständlich ist.\n"
         "Schreibe außerdem Titel, eine Begründung, 3 Hook-Texte (max. 8 Wörter, unterschiedliche Ansätze), eine "
         "Beschreibung mit 3-5 Hashtags und 2-6 Schlüsselwörter, die wörtlich im Clip vorkommen.\n\n"
         "Antworte NUR mit einem JSON-Array: "
-        '[{"id": 0, "keep": true, "start": 14.2, "end": 51.8, "title": "...", "reason": "...", '
-        '"hooks": ["...", "...", "..."], "caption": "...", "keywords": ["..."]}]\n\n%s'
+        '[{"id": 0, "keep": true, "start": 14.2, "end": 51.8, "payoff_end": 50.9, "arc": "Hook: … / Pointe: …", '
+        '"title": "...", "reason": "...", "hooks": ["...", "...", "..."], "caption": "...", "keywords": ["..."]}]\n\n%s'
     ) % (len(best), extra, min_len, max_len, "\n\n".join(blocks))
     try:
         refined = {int(r.get("id", -1)): r for r in claude_json(api_key, prompt2, r"\[.*\]", max_tokens=6000,
@@ -1692,15 +1722,22 @@ def highlights_claude_two_stage(segments, api_key, n, min_len, max_len, context,
         if r:
             try:
                 c["start"], c["end"] = float(r.get("start", c["start"])), float(r.get("end", c["end"]))
+                pe = float(r["payoff_end"]) if r.get("payoff_end") is not None else None
+                # the cut ends right after the payoff: later when it was cut off, earlier when idle talk follows
+                if pe and c["start"] + min_len * 0.6 <= pe <= c["end"] + 20 and pe - c["start"] <= max_len:
+                    c["end"] = pe + 0.3
+                    c["payoff"] = True
             except (TypeError, ValueError):
                 pass
+            if r.get("arc"):
+                c["arc"] = str(r["arc"])[:200]
             for key in ("title", "caption", "hooks", "keywords"):
                 if r.get(key):
                     c[key] = r[key]
             c["reason"] = str(r.get("reason") or c["reason"])[:300]
         c["hook"] = c["reason"]
         c.setdefault("title", c["reason"][:70])
-        out.append(c)
+        out.append(repair_context(c, words, max_len))
     # rejected ones go to the back: they are used only if nothing better is left
     out.sort(key=lambda c: (c.get("rejected", False), -c["score"]))
     if refined:
@@ -2560,3 +2597,242 @@ def cut_kinds(video, info, start, intervals, fps, crop_segs=None, switches=(), l
                 kind = "fade"
         kinds.append(kind)
     return kinds
+
+
+
+# ---------------------------------------------------------------- highlight finding: picture, topics, context, ranking
+
+VISUAL_LABELS = {"laechelt": "lächelt", "gestik": "lebhafte Gestik"}
+
+
+def analyze_visual(video, info, fps=2, width=320, progress=None):
+    """Cheap picture analysis of the whole video (two frames a second): smiles (Haar smile detector inside the
+    YuNet face), head movement and overall motion (gestures), each relative to the video's own typical level,
+    combined into one energy value per half second. Runs of smiling or lively gestures become events."""
+    import cv2
+    import numpy as np
+
+    W, H = info["width"], info["height"]
+    ah = int(round(H * width / W / 2)) * 2
+    size = width * ah * 3
+    proc = subprocess.Popen([FFMPEG, "-v", "error", "-i", video, "-vf", "fps=%d,scale=%d:%d" % (fps, width, ah),
+                             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], stdout=subprocess.PIPE)
+    yunet = cv2.FaceDetectorYN.create(YUNET, "", (width, ah), 0.6, 0.3, 5) if os.path.exists(YUNET) else None
+    smile_cc = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+    motion, head, smile = [], [], []
+    prev_small, prev_face = None, None
+    total = max(1, int(info.get("duration", 0) * fps))
+    k = 0
+    while True:
+        buf = proc.stdout.read(size)
+        if len(buf) < size:
+            break
+        img = np.frombuffer(buf, np.uint8).reshape(ah, width, 3)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (80, max(2, int(80 * ah / width)))).astype(np.float32)
+        motion.append(0.0 if prev_small is None else float(np.mean(np.abs(small - prev_small))))
+        prev_small = small
+        face = None
+        if yunet is not None:
+            found = yunet.detect(img)[1]
+            if found is not None and len(found):
+                face = max(found, key=lambda r: r[2] * r[3])[:4]
+        sm, hd = 0.0, 0.0
+        if face is not None:
+            x, y, w, h = [int(v) for v in face]
+            low = gray[max(0, y + h // 2):max(0, y + h), max(0, x):max(0, x + w)]
+            if low.size and min(low.shape) >= 12:
+                sm = 1.0 if len(smile_cc.detectMultiScale(low, 1.7, 18, minSize=(max(8, w // 4), max(5, h // 8)))) else 0.0
+            if prev_face is not None:
+                px, py, pw, _ = prev_face
+                hd = (abs((x + w / 2) - (px + pw / 2)) + abs((y + h / 2) - (py + h / 2))) / max(8.0, w)
+            prev_face = (x, y, w, h)
+        else:
+            prev_face = None
+        smile.append(sm)
+        head.append(hd)
+        k += 1
+        if progress and k % 200 == 0:
+            progress(min(1.0, k / total))
+    proc.wait()
+    if len(motion) < 4:
+        return None
+    m, hh, s = np.array(motion), np.array(head), np.array(smile)
+    # a smile counts when it is seen in most frames of a second, single hits are noise
+    s_smooth = np.convolve(s, np.ones(3) / 3, "same")
+    zm, zh = _robust_z(m), _robust_z(hh)
+    energy = np.clip(0.6 * zm + 0.4 * zh + 1.5 * (s_smooth > 0.6), -2, 5)
+    step = 1.0 / fps
+    events = _merge_events(s_smooth > 0.6, step, "laechelt", 1.0) + _merge_events(zm > 2.2, step, "gestik", 1.0)
+    return {"step": step, "energy": [round(float(v), 2) for v in energy], "events": events}
+
+
+def visual_window(vis, s, e):
+    if not vis:
+        return None
+    st, en = vis["step"], vis["energy"]
+    vals = en[int(s / st): max(int(s / st) + 1, int(e / st))]
+    if not vals:
+        return None
+    kinds = sorted({ev["type"] for ev in vis["events"] if ev["e"] > s and ev["s"] < e})
+    return {"mean": round(sum(vals) / len(vals), 2), "peak": round(max(vals), 2), "tags": kinds}
+
+
+def find_topics(api_key, segments, log):
+    """The video split into its topics: [{"start", "end", "title"}] – so the highlights can be spread over them."""
+    lines = "\n".join("[%.0f] %s" % (s["s"], s["text"][:160]) for s in segments)
+    prompt = (
+        "Hier ist das Transkript eines deutschsprachigen Videos (Startzeit in Sekunden je Abschnitt). Teile es in seine "
+        "inhaltlichen Themenblöcke (3-12, je nach Länge, mindestens 45 Sekunden), lückenlos von Anfang bis Ende. "
+        "Gib jedem einen kurzen Titel (max. 6 Wörter).\n"
+        "Antworte NUR mit JSON: [{\"start\": 0, \"title\": \"...\"}]\n\nTRANSKRIPT:\n" + lines)
+    try:
+        raw = claude_json(api_key, prompt, r"\[.*\]", max_tokens=1500, feature="KI-Themen")
+    except Exception as e:
+        log("Themen-Einteilung übersprungen: " + str(e)[:200])
+        return []
+    starts = []
+    for t in raw:
+        try:
+            starts.append((float(t["start"]), str(t.get("title", ""))[:60]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    starts.sort()
+    end = segments[-1]["e"] if segments else 0
+    topics = [{"start": a, "end": (starts[i + 1][0] if i + 1 < len(starts) else end), "title": t}
+              for i, (a, t) in enumerate(starts) if a < end]
+    if topics:
+        topics[0]["start"] = 0.0
+        log("Themen: %d Blöcke erkannt (%s)" % (len(topics), ", ".join(t["title"] for t in topics[:6])))
+    return topics
+
+
+def topic_of(c, topics):
+    mid = (c["start"] + c["end"]) / 2
+    return next((k for k, t in enumerate(topics) if t["start"] <= mid < t["end"]), -1)
+
+
+def pick_diverse(cands, k, topics, tolerance=1.5):
+    """The k best non-overlapping candidates, each further clip from an already used topic counting a bit less –
+    so strong moments from different topics win over a third clip on the same thing."""
+    left = sorted(cands, key=lambda c: (c.get("rejected", False), -c.get("score", 0)))
+    chosen, used = [], {}
+    while left and len(chosen) < k:
+        def adjusted(c):
+            t = topic_of(c, topics) if topics else -1
+            return (c.get("rejected", False), -(c.get("score", 0) * (0.8 ** used.get(t, 0) if t >= 0 else 1)))
+        left.sort(key=adjusted)
+        c = left.pop(0)
+        if all(overlap(c, o) <= tolerance for o in chosen):
+            chosen.append(c)
+            t = topic_of(c, topics) if topics else -1
+            used[t] = used.get(t, 0) + 1
+            if topics and t >= 0:
+                c["topic"] = topics[t]["title"]
+    return chosen
+
+
+LEAD_FILLERS = {"ja", "genau", "also", "okay", "ok", "so", "gut", "naja", "na", "ähm", "äh", "hm", "ne", "nee"}
+DEPENDENT = {"und", "aber", "deshalb", "darum", "deswegen", "dann", "dadurch", "dafür", "dazu", "daher", "trotzdem",
+             "außerdem", "sondern", "denn", "weil", "sonst", "allerdings", "jedenfalls", "nämlich", "wobei", "er",
+             "dies", "diese", "dieser", "dieses", "davon", "darauf", "daran", "dabei", "darüber"}
+
+
+def _plain(w):
+    return re.sub(r"[^\wäöüß]", "", w.lower())
+
+
+def repair_context(clip, words, max_len):
+    """A clip must make sense without the rest of the video:
+    - leading fillers ("Ja, genau, also …") are skipped,
+    - an answer gets its question: if the sentence before (up to 12 s) is a question, the clip starts with it,
+    - a start that refers back ("Deshalb …", "Das …", "Und dann …") takes in the sentence before it,
+    as long as the clip stays within max_len. Notes what was changed in clip["context_fix"]."""
+    c = dict(clip)
+    inside = [w for w in words if w["s"] >= c["start"] - 0.05 and w["e"] <= c["end"] + 0.05]
+    if not inside:
+        return c
+    k = 0
+    while k < min(3, len(inside) - 1) and _plain(inside[k]["w"]) in LEAD_FILLERS:
+        k += 1
+    if k:
+        c["start"] = round(inside[k]["s"] - 0.05, 2)
+        c["context_fix"] = "Füllwörter am Anfang weggelassen"
+    first = inside[k]
+    before = [w for w in words if w["e"] <= first["s"] + 0.01 and w["s"] >= first["s"] - 12]
+    sents = sentences(before)
+    prev = sents[-1] if sents else None
+    if prev:
+        prev_text = " ".join(w["w"] for w in prev)
+        fits = c["end"] - prev[0]["s"] <= max_len
+        if prev_text.rstrip().endswith("?") and fits and first["s"] - prev[0]["s"] <= 10:
+            c["start"] = round(prev[0]["s"] - 0.05, 2)
+            c["context_fix"] = "mit der Frage davor begonnen"
+        elif _plain(first["w"]) in DEPENDENT and fits:
+            c["start"] = round(prev[0]["s"] - 0.05, 2)
+            c["context_fix"] = "Satz davor für den Zusammenhang dazugenommen"
+    return c
+
+
+def clip_text(words, c, limit=90):
+    ws = [w["w"] for w in words if w["s"] >= c["start"] - 0.05 and w["e"] <= c["end"] + 0.05]
+    return " ".join(ws[:limit]) + (" …" if len(ws) > limit else "")
+
+
+def tournament(api_key, cands, words, log, rounds=4):
+    """Candidates compared in pairs by Claude ("which one makes the stronger short video?"). Models judge more
+    reliably side by side than with absolute marks. Each candidate meets about `rounds` others; the share of
+    duels won is blended with the stage-1 mark. Returns the candidates with an updated "score"."""
+    import random
+
+    m = len(cands)
+    if m < 3:
+        return cands
+    order = sorted(range(m), key=lambda i: -cands[i]["score"])
+    pairs = set()
+    if m <= 8:
+        pairs = {(a, b) for a in range(m) for b in range(a + 1, m)}
+    else:
+        rnd = random.Random(42)
+        for pos, i in enumerate(order):  # neighbours in the ranking (the close calls) plus random opponents
+            for j in order[pos + 1:pos + 3]:
+                pairs.add(tuple(sorted((i, j))))
+            for j in rnd.sample([x for x in range(m) if x != i], min(2, m - 1)):
+                pairs.add(tuple(sorted((i, j))))
+    pairs = sorted(pairs)[:40]
+    texts = "\n\n".join("### K%d (%.0f s)\n%s" % (i, c["end"] - c["start"], clip_text(words, c)) for i, c in enumerate(cands))
+    duel = "\n".join("%d: K%d gegen K%d" % (n, a, b) for n, (a, b) in enumerate(pairs))
+    prompt = (
+        "Du bist ein sehr anspruchsvoller Editor für TikTok, Reels und YouTube Shorts. Unten stehen Kandidaten für "
+        "Kurzvideos aus demselben deutschsprachigen Video. Entscheide bei jedem Duell, welcher Kandidat das stärkere "
+        "eigenständige Kurzvideo ergibt (Hook in den ersten Sekunden, ohne Vorwissen verständlich, Mehrwert oder "
+        "Emotion, klare Pointe). Kein Unentschieden.\n"
+        "Antworte NUR mit JSON: [{\"duel\": 0, \"winner\": \"K3\"}]\n\nKANDIDATEN:\n%s\n\nDUELLE:\n%s" % (texts, duel))
+    try:
+        res = claude_json(api_key, prompt, r"\[.*\]", max_tokens=2500, feature="KI-Turnier")
+    except Exception as e:
+        log("Turnier übersprungen: " + str(e)[:200])
+        return cands
+    wins, games = [0] * m, [0] * m
+    for r in res:
+        try:
+            a, b = pairs[int(r["duel"])]
+            w = int(str(r["winner"]).strip().upper().lstrip("K"))
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        if w not in (a, b):
+            continue
+        games[a] += 1
+        games[b] += 1
+        wins[w] += 1
+    if not sum(games):
+        return cands
+    top = max(c["score"] for c in cands) or 1
+    out = []
+    for i, c in enumerate(cands):
+        rate = (wins[i] + 0.5) / (games[i] + 1)  # a little smoothing for candidates with few duels
+        c = dict(c, duel_wins=wins[i], duels=games[i])
+        c["score"] = round(100 * (0.4 * c["score"] / top + 0.6 * rate))
+        out.append(c)
+    log("KI-Turnier: %d Duelle zwischen %d Kandidaten" % (int(sum(games) / 2), m))
+    return out

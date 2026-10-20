@@ -348,7 +348,7 @@ function renderHome(){
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
       '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("split",d.mode,"Geteilt bei 2 Personen")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
     '</div>'+
-    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_two_stage",d.two_stage,"Gründliche KI-Auswahl (2 Durchgänge)")+chk("o_reuse_transcript",d.reuse_transcript,"Transkript wiederverwenden, wenn das Video schon verarbeitet wurde")+chk("o_precise_timing",d.precise_timing,"Wortgenaue Zeitstempel")+chk("o_ai_check",d.ai_check,"KI-Endkontrolle mit Standbildern")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
+    '<div class="toggles">'+chk("o_remove_pauses",d.remove_pauses,"Pausen und Füllwörter rausschneiden")+chk("o_hook",d.hook,"Hook-Text am Anfang einblenden")+chk("o_zoom",d.zoom,"Dynamische Zooms")+chk("o_enhance_audio",d.enhance_audio,"Ton verbessern")+chk("o_cover",d.cover,"Titelbild erstellen")+chk("o_audio_analysis",d.audio_analysis,"Tonanalyse für die Auswahl nutzen")+chk("o_visual_analysis",d.visual_analysis,"Bildanalyse (Mimik, Gestik) für die Auswahl")+chk("o_tournament",d.tournament,"KI-Turnier: Kandidaten paarweise vergleichen")+chk("o_two_stage",d.two_stage,"Gründliche KI-Auswahl (2 Durchgänge)")+chk("o_reuse_transcript",d.reuse_transcript,"Transkript wiederverwenden, wenn das Video schon verarbeitet wurde")+chk("o_precise_timing",d.precise_timing,"Wortgenaue Zeitstempel")+chk("o_ai_check",d.ai_check,"KI-Endkontrolle mit Standbildern")+chk("o_review",d.review,"Vor dem Rendern prüfen und korrigieren")+'</div>'+
     '<details><summary>Untertitel, Hook und Qualität</summary><div class="grid">'+
       '<div><label>Untertitel-Stil</label><select id="o_sub_style">'+opt("pop",d.sub_style,"Pop – Wort für Wort")+opt("box",d.sub_style,"Box – mit Hintergrund")+opt("minimal",d.sub_style,"Minimal")+opt("satz",d.sub_style,"Ganze Sätze")+'</select></div>'+
       '<div><label>Hervorhebung (aktives Wort)</label><input id="o_highlight" type="color" value="'+d.highlight+'"></div>'+
@@ -394,7 +394,7 @@ function renderHome(){
 
 function readOpts(){
   var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume","cut_style"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","two_stage","reuse_transcript","precise_timing","ai_check","natural_pauses","roomtone","blink_safe","loop_end","stabilize","fmt_lengths","speaker_colors","blur_faces","blur_plates"].forEach(function(k){o[k]=$("o_"+k).checked});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","visual_analysis","tournament","two_stage","reuse_transcript","precise_timing","ai_check","natural_pauses","roomtone","blink_safe","loop_end","stabilize","fmt_lengths","speaker_colors","blur_faces","blur_plates"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
@@ -785,6 +785,15 @@ function makePreview(i){
     var bb=$("pvb"+i);if(bb){bb.disabled=false;bb.textContent="▶ Schnelle Vorschau"}
   }).catch(function(e){clearInterval(tick);var bb=$("pvb"+i);if(bb){bb.disabled=false;bb.textContent="▶ Schnelle Vorschau"}toast(e.message)});
 }
+// why this clip: topic, what the context repair did, story arc, tournament
+function whyInfo(c){
+  var bits=[];
+  if(c.topic) bits.push("Thema: "+esc(c.topic));
+  if(c.duels) bits.push("Turnier: "+c.duel_wins+" von "+c.duels+" Duellen gewonnen");
+  if(c.context_fix) bits.push("Kontext: "+esc(c.context_fix));
+  if(c.arc) bits.push("Bogen: "+esc(c.arc));
+  return bits.length?'<div class="muted small why">'+bits.join(" · ")+'</div>':'';
+}
 function cutOpts(v){
   return opt("morph",v||"morph","Morph-Cut – fließend (empfohlen)")+opt("weich",v,"Weich überblenden")+opt("zoom",v,"Zoom-Sprung (Punch-in)")+opt("hart",v,"Harter Schnitt");
 }
@@ -1076,7 +1085,7 @@ function renderJob(){
     return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+(c.variant_of!=null?' · Variante von Clip '+(c.variant_of+1):'')+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
       (c.series?'<div><span class="pill rev">Teil '+c.series.part+'/'+c.series.total+'</span></div>':'')+(c.manual&&!c.series?'<div><span class="pill">Von Hand markiert</span></div>':'')+
       lengthNote(outLen)+audioBadge(c)+criteriaUI(c)+checksUI(c,i)+
-      '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+
+      '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+whyInfo(c)+
       (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+(!review&&clipRef(c)?'<div class="muted small">📍 '+esc(refText(clipRef(c)))+'</div>':'')+pz+
       (done&&!review?'<div class="row" style="margin-top:auto;gap:8px">'+dl(c.file,"MP4 9:16"," primary")+(f["4x5"]?dl(f["4x5"],"4:5"):'')+(f["1x1"]?dl(f["1x1"],"1:1"):'')+(c.cover?dl(c.cover,"Titelbild"):'')+["15","30","60"].map(function(k){return c.lengths&&c.lengths[k]?dl(c.lengths[k],k+" s"):''}).join("")+dl(c.srt,"SRT")+
         '<button class="btn sm" onclick="openPostiz('+i+')">An Postiz</button>'+
