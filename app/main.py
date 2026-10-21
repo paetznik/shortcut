@@ -42,7 +42,7 @@ DEFAULTS = {
     "ai_check": True, "jumpcut_zoom": True, "blink_safe": True, "natural_pauses": True, "roomtone": True,
     "stabilize": False, "loop_end": True, "fmt_lengths": False, "speaker_colors": False, "blur_faces": False,
     "blur_plates": False, "multicam": True, "cut_style": "morph", "cut_length": 200, "visual_analysis": True,
-    "tournament": True,
+    "tournament": True, "quote_clips": 2, "upscale": False,
 }
 # settings stored in config.json; secrets are never sent back to the browser
 CONFIG_TEXT = ("vocabulary", "nc_url", "nc_user", "nc_folder", "pz_url")
@@ -161,7 +161,7 @@ def health():
     except Exception:
         torch_ok = False
     return {"ok": True, "face_model": os.path.exists(pipeline.YUNET), "denoise_model": os.path.exists(pipeline.RNNOISE),
-            "aligner": torch_ok}
+            "aligner": torch_ok, "upscale_model": os.path.exists(pipeline.SR_MODEL)}
 
 
 @app.get("/api/state")
@@ -267,6 +267,7 @@ def clean_settings(s):
             pass
     out["clips"] = max(1, min(15, out["clips"]))
     out["cut_length"] = max(100, min(400, out["cut_length"]))
+    out["quote_clips"] = max(0, min(5, out["quote_clips"]))
     out["min_len"] = max(5, min(170, out["min_len"]))
     out["max_len"] = max(out["min_len"] + 5, min(180, out["max_len"]))
     out["font_size"] = max(40, min(140, out["font_size"]))
@@ -850,6 +851,7 @@ async def more_highlights(jid: str, request: Request):
     body = await request.json()
     job = load_job(jid)
     s = job["settings"]
+    kind = "quotes" if body.get("kind") == "quotes" else "highlights"
     try:
         count = max(1, min(10, int(body.get("count", 3))))
         mn = max(5, min(170, int(float(body.get("min_len", s["min_len"])))))
@@ -860,32 +862,42 @@ async def more_highlights(jid: str, request: Request):
         raise HTTPException(400, "Für dieses Projekt gibt es kein Transkript.")
     if len(job["clips"]) + count > 40:
         raise HTTPException(400, "Zu viele Clips in diesem Projekt (max. 40)")
-    return queue_extra(jid, "more", [count, mn, mx], "Suche %d weitere Highlight%s …" % (count, "s" if count > 1 else ""))
+    return queue_extra(jid, "more", [count, mn, mx, kind], "Suche %d weitere %s …" % (
+        count, ("Zitat-Clips" if count > 1 else "Zitat-Clip") if kind == "quotes" else ("Highlights" if count > 1 else "Highlight")))
 
 
 def more_highlights_task(jid, arg):
-    count, mn, mx = arg
+    count, mn, mx = arg[:3]
+    quotes = len(arg) > 3 and arg[3] == "quotes"
     job = load_job(jid)
     s = job["settings"]
-    update(jid, progress=10, message="Suche %d weitere Highlights …" % count)
+    update(jid, progress=10, message="Suche %d weitere %s …" % (count, "Zitat-Clips" if quotes else "Highlights"))
     audio = load_audio(jid) if s.get("audio_analysis", True) else None
     if s.get("visual_analysis", True) and load_visual(jid) is None and not job.get("source_deleted"):
         run_visual_analysis(jid, os.path.join(JOBS, jid, job["source"]), job["info"])
     visual = load_visual(jid) if s.get("visual_analysis", True) else None
-    clips, source = pipeline.find_highlights(load_transcript(jid), load_config().get("anthropic_key", ""), count, mn, mx,
-                                             job.get("context", ""), lambda m: log(jid, m), audio,
-                                             s.get("two_stage", True), exclude=job["clips"], visual=visual,
-                                             use_tournament=s.get("tournament", True))
+    if quotes:  # new quotes must not repeat earlier quotes; they may lie inside longer clips
+        source = "claude" if load_config().get("anthropic_key") else "heuristik"
+        clips = pipeline.find_quotes(load_transcript(jid), load_config().get("anthropic_key", ""), count,
+                                     job.get("context", ""), lambda m: log(jid, m), audio,
+                                     exclude=[c for c in job["clips"] if c.get("quote_clip")])
+    else:
+        clips, source = pipeline.find_highlights(load_transcript(jid), load_config().get("anthropic_key", ""), count, mn, mx,
+                                                 job.get("context", ""), lambda m: log(jid, m), audio,
+                                                 s.get("two_stage", True), exclude=job["clips"], visual=visual,
+                                                 use_tournament=s.get("tournament", True))
     if not clips:
-        return "Fertig – keine weiteren passenden Highlights gefunden (kürzere Mindestlänge probieren)"
+        return "Fertig – keine weiteren passenden %s gefunden" % ("Zitate" if quotes else "Highlights (kürzere Mindestlänge probieren)")
     for c in clips:
-        c.update(status="wartet", hook_text=c.get("title", ""), uid=uuid.uuid4().hex[:6], cover_text=c.get("title", ""))
+        c.update(status="wartet", hook_text="" if c.get("quote_clip") else c.get("title", ""), uid=uuid.uuid4().hex[:6],
+                 cover_text=c.get("title", ""))
     with lock:
         job = load_job(jid)
         first = len(job["clips"])
         job["clips"] += clips
         save_job(job)
-    log(jid, "%d weitere Highlights gefunden (%s)" % (len(clips), "Claude KI" if source == "claude" else "Automatik"))
+    log(jid, "%d weitere %s gefunden (%s)" % (len(clips), "Zitat-Clips" if quotes else "Highlights",
+                                             "Claude KI" if source == "claude" else "Automatik"))
     for k, i in enumerate(range(first, first + len(clips))):
         update(jid, progress=round(20 + k / len(clips) * 75, 1), message="Rendere neuen Clip %d von %d …" % (k + 1, len(clips)))
         render_one(jid, i, job["info"])
@@ -1865,7 +1877,21 @@ def prepare(jid, idx, info, override=None, fast=False):
                                      lambda: pipeline.roomtone_spot(src, clip["start"], clip["end"], near))
             except Exception:
                 roomtone_at = None
-    return {"job": job, "clip": clip, "s": s, "src": src, "duration": duration, "intervals": intervals,
+    upscaled, band = None, None
+    if s.get("upscale") and not fast and s.get("mode") != "blur" and pipeline.needs_upscale(info):
+        t0 = time.time()
+        band = pipeline.upscale_band(info, crop_segs, split)
+        try:
+            upscaled = pipeline.upscale_range(src, info, clip["start"], duration, os.path.join(JOBS, jid),
+                                              pipeline.out_fps(info), band, progress=lambda f: update(
+                                                  jid, message="KI-Hochskalierung Clip %d … %d %%" % (idx + 1, round(f * 100))))
+            if upscaled:
+                log(jid, "Clip %d: KI-Hochskalierung (%.0f s)" % (idx + 1, time.time() - t0))
+        except Cancelled:
+            raise
+        except Exception as e:
+            log(jid, "KI-Hochskalierung übersprungen: " + str(e)[:200])
+    return {"job": job, "clip": clip, "s": s, "src": src, "duration": duration, "intervals": intervals, "upscaled": upscaled, "band": band,
             "out_words": out_words, "out_len": out_len, "crop_segs": crop_segs, "music": music,
             "det": det, "split": split, "split_wanted": split_wanted, "snapped": (head, tail), "beeps": beeps,
             "end_text": end_text, "zooms": zooms, "static_max": static_max, "eye": eye, "quiet": quiet,
@@ -1947,10 +1973,18 @@ def render_variant(jid, p, base, words, hook, keywords, size, srt=True):
     ass = base + ".ass"
     burn = pipeline.write_subtitles(words, os.path.join(d, ass), os.path.join(d, base + ".srt") if srt else None,
                                     p["s"], hook, p["out_len"], keywords, size, p["end_text"])
-    out_len = pipeline.render_clip(p["src"], p["job"]["info"], clip["start"], clip["end"], d, base, p["s"], ass, burn,
-                                   p["intervals"], p["crop_segs"], size, p["zooms"], p["music"], p["split"], p["beeps"],
-                                   p["quiet"], p["roomtone_at"], p["eye"], p["blur"], p["cams"], p["music_offset"],
-                                   p.get("cut_kinds"), p.get("cut_len", pipeline.DISSOLVE))
+    src, info, start, end = p["src"], p["job"]["info"], clip["start"], clip["end"]
+    crop, blur, split = p["crop_segs"], p["blur"], p["split"]
+    if p.get("upscaled"):  # 2x super-resolution copy of the used strip of this range: timeline from 0, more pixels
+        x0, x1 = p["band"]
+        src, start, end = os.path.join(d, p["upscaled"]), 0.0, end - start
+        info = dict(info, width=(x1 - x0) * 2, height=info["height"] * 2)
+        crop, blur = pipeline.scale_segs(crop, 2, x0), pipeline.scale_regions(blur, 2, x0)
+        split = tuple((x - x0) * 2 for x in split) if split else split
+    out_len = pipeline.render_clip(src, info, start, end, d, base, p["s"], ass, burn,
+                                   p["intervals"], crop, size, p["zooms"], p["music"], split, p["beeps"],
+                                   p["quiet"], p["roomtone_at"], p["eye"], blur, p["cams"], p["music_offset"],
+                                   p.get("cut_kinds"), p.get("cut_len", pipeline.DISSOLVE), audio_src=p["src"])
     os.remove(os.path.join(d, ass))
     return out_len
 
@@ -2366,9 +2400,12 @@ def process(jid):
                                              use_tournament=s.get("tournament", True))
     if not clips:
         raise RuntimeError("Keine passenden Highlights gefunden. Versuche eine kürzere Mindestlänge.")
+    if s.get("quote_clips", 0):
+        update(jid, message="Suche Zitat-Clips …")
+        clips += pipeline.find_quotes(segments, key, s["quote_clips"], job.get("context", ""), lambda m: log(jid, m), audio)
     for c in clips:
         c["status"] = "entwurf" if s.get("review") else "wartet"
-        c["hook_text"] = c.get("title", "")
+        c["hook_text"] = "" if c.get("quote_clip") else c.get("title", "")
         c["uid"] = uuid.uuid4().hex[:6]
         c["cover_text"] = c.get("title", "")
     update(jid, clips=clips, selector=source)

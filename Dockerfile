@@ -13,6 +13,9 @@ RUN pip install --no-cache-dir torch==2.8.0 torchaudio==2.8.0 --index-url https:
 RUN mkdir -p /opt/models \
  && curl -fsSL -o /opt/models/face_detection_yunet_2023mar.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx \
  && curl -fsSL -o /opt/models/sh.rnnn https://raw.githubusercontent.com/GregorR/rnnoise-models/master/somnolent-hogwash-2018-09-01/sh.rnnn
+# FSRCNN-small x2 super-resolution network (TensorFlow graph; its weights are read and run with PyTorch) for
+# narrow crops; optional: without it the app simply scales as before
+RUN (curl -fsSL -o /opt/models/FSRCNN-small_x2.pb https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN-small_x2.pb || true)
 
 WORKDIR /app
 COPY app/ /app/

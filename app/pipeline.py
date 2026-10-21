@@ -1226,7 +1226,7 @@ def stabilize_filter(video, start, duration, workdir):
 
 def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, intervals, crop_segs,
                 size=(1080, 1920), zoom_spans_out=None, music=None, split=None, beeps=(), quiet=(), roomtone_at=None,
-                eye=0.4, blur=None, cams=None, music_offset=0.0, cut_kinds=None, cut_len=None):
+                eye=0.4, blur=None, cams=None, music_offset=0.0, cut_kinds=None, cut_len=None, audio_src=None):
     """One clip from the source: cuts, framing, optional stabilisation, blurred areas, extra cameras (each a list
     item {"path", "start", "info", "crop_segs", "on": [(t0, t1) output time]}), zooms, subtitles and sound."""
     ow, oh = size
@@ -1265,7 +1265,7 @@ def render_clip(video, info, start, end, workdir, name, style, ass_name, burn, i
             n_in += 1
         roomtone = None
         if roomtone_at and style.get("roomtone", True):
-            cmd += ["-ss", "%.3f" % roomtone_at[0], "-t", "%.3f" % roomtone_at[1], "-i", video]
+            cmd += ["-ss", "%.3f" % roomtone_at[0], "-t", "%.3f" % roomtone_at[1], "-i", audio_src or video]
             roomtone = (n_in, roomtone_at[1])
         graph += ";" + audio_chain(intervals, cut, style.get("enhance_audio", True), music,
                                    int(style.get("music_volume", 15)), beeps, quiet, roomtone, music_idx)
@@ -2836,3 +2836,283 @@ def tournament(api_key, cands, words, log, rounds=4):
         out.append(c)
     log("KI-Turnier: %d Duelle zwischen %d Kandidaten" % (int(sum(games) / 2), m))
     return out
+
+
+
+# ---------------------------------------------------------------- quote clips: single strong sentences
+
+def find_quotes(segments, api_key, k, context, log, audio=None, exclude=(), min_len=5, max_len=15):
+    """k short clips (5-15 s) of single, quotable statements – strong claims, punchlines, memorable one-liners –
+    that work on their own. Claude picks them; without a key the strongest short sentences by wording and sound.
+    Quotes may lie inside a longer highlight (that is the point: a second, sharper cut), but not in another quote."""
+    words = all_words(segments)
+    if not words or k <= 0:
+        return []
+    exclude = [{"start": e["start"], "end": e["end"]} for e in exclude]
+    sents = [s for s in sentences(words) if 2.5 <= s[-1]["e"] - s[0]["s"] <= max_len]
+    picked = []
+    if api_key:
+        extra = ("\nKontext vom Ersteller: " + context.strip()) if context and context.strip() else ""
+        lines = "\n".join("[%.1f-%.1f] %s" % (s[0]["s"], s[-1]["e"], " ".join(w["w"] for w in s)) for s in sentences(words))
+        prompt = (
+            "Du bist Social-Media-Editor. Suche im Transkript eines deutschsprachigen Videos die %d stärksten "
+            "ZITATE für sehr kurze Clips (%d-%d Sekunden): einzelne Sätze oder zwei bis drei zusammenhängende Sätze, "
+            "die für sich allein wirken – eine steile These, eine Pointe, eine überraschende Zahl, ein Satz zum "
+            "Weitersagen. Kein Vorwissen nötig, kein angefangener Gedanke.%s\n"
+            "Start und Ende exakt auf Satzgrenzen aus der Liste. Sortiert, bestes zuerst.\n"
+            "Antworte NUR mit JSON: [{\"start\": 12.3, \"end\": 21.0, \"quote\": \"das Zitat in Kurzform\", "
+            "\"title\": \"...\", \"score\": 1-100, \"caption\": \"Beschreibung mit 3-5 Hashtags\", "
+            "\"keywords\": [\"1-3 Wörter aus dem Zitat\"]}]\n\nSÄTZE:\n%s") % (k + 3, min_len, max_len, extra, lines)
+        try:
+            for q in claude_json(api_key, prompt, r"\[.*\]", max_tokens=3000, feature="KI-Zitate"):
+                try:
+                    picked.append({"start": float(q["start"]), "end": float(q["end"]), "title": str(q.get("title") or q.get("quote") or "")[:100],
+                                   "quote": str(q.get("quote") or "")[:200], "score": int(q.get("score") or 50),
+                                   "caption": str(q.get("caption") or ""), "keywords": q.get("keywords") or []})
+                except (TypeError, ValueError, KeyError):
+                    continue
+        except Exception as e:
+            log("KI-Zitatsuche fehlgeschlagen, nutze automatische Auswahl: " + str(e)[:200])
+    if not picked:
+        for s in sents:  # without AI: short sentences with strong wording, a clear ending and energy in the voice
+            text = " ".join(w["w"] for w in s)
+            low = text.lower()
+            sc = sum(low.count(h) for h in HOOK_WORDS) * 3 + text.count("!") * 4 + (6 if text.endswith("?") else 0)
+            sc += 4 if len(s) <= 14 else 0
+            aw = audio_window(audio, s[0]["s"], s[-1]["e"]) if audio else None
+            if aw:
+                sc += 4 * aw["mean"] + 2 * len(aw["tags"])
+            if sc > 4:
+                picked.append({"start": s[0]["s"], "end": s[-1]["e"], "title": text[:80], "quote": text[:200],
+                               "score": sc, "caption": "", "keywords": guess_keywords(text)})
+        top = max([q["score"] for q in picked] or [1]) or 1
+        for q in picked:
+            q["score"] = max(1, round(q["score"] / top * 100))
+    out = []
+    for q in sorted(picked, key=lambda q: -q["score"]):
+        if len(out) >= k:
+            break
+        sq = snap(q, words, min_len, max_len)
+        if not sq or sq["end"] - sq["start"] > max_len + 0.6:
+            continue
+        if all(overlap(sq, o) <= 0.5 for o in out + exclude):
+            sq.update(quote_clip=True, hook="Zitat-Clip: " + q["quote"][:120], hooks=[], hook_text="",
+                      keywords=[str(x) for x in (q.get("keywords") or []) if str(x).strip()][:4])
+            out.append(sq)
+    log("%d Zitat-Clips gefunden" % len(out))
+    return out
+
+
+# ---------------------------------------------------------------- AI upscaling of narrow crops
+
+SR_MODEL = os.environ.get("SR_MODEL", "/opt/models/FSRCNN-small_x2.pb")
+
+
+def upscale_band(info, crop_segs, split=None, size=(1080, 1920), margin=24):
+    """The horizontal strip [x0, x1) of the source that the portrait crop (or both split crops) ever uses."""
+    w, h = info["width"], info["height"]
+    cw, _ = crop_box(w, h, size[0] / size[1] if not split else size[0] / (size[1] // 2))
+    centres = list(split) if split else [x for s in (crop_segs or []) for x in [s[2]] + [p[1] for p in (s[3] if len(s) > 3 and s[3] else [])]]
+    if not centres:
+        centres = [w / 2]
+    lo = min(max(0, c - cw / 2) for c in centres)
+    hi = max(min(w, c + cw / 2) for c in centres)
+    x0 = int(max(0, lo - margin)) // 2 * 2
+    x1 = min(w, int(hi + margin + 1) // 2 * 2)
+    if x1 - x0 < cw:
+        x0, x1 = max(0, int((w - cw) / 2) // 2 * 2), min(w, int((w + cw) / 2 + 2) // 2 * 2)
+    return x0, x1
+
+
+def needs_upscale(info, size=(1080, 1920)):
+    """True when the portrait crop of this source has clearly fewer pixels than the output (e.g. 405 of 1080)."""
+    w, h = info["width"], info["height"]
+    ow, oh = size
+    cw, ch = crop_box(w, h, ow / oh)
+    return cw < ow * 0.8
+
+
+def upscale_range(video, info, start, duration, workdir, fps, band=None, factor=2, progress=None):
+    """The clip range of the source, upscaled with FSRCNN (a small super-resolution network, run on the CPU
+    with PyTorch) on the brightness channel and plain bicubic on the colour channels – sharper edges and
+    finer detail than ordinary scaling. Kept as a high-quality intermediate file with the original sound and
+    reused for every format and re-render of the same range. Returns its file name, or None without the model."""
+    import cv2
+    import numpy as np
+
+    if not os.path.exists(SR_MODEL):
+        return None
+    x0, x1 = band or (0, info["width"])  # only the strip of the picture that the crop uses
+    name = "up_%d_%d_%d_%d.mp4" % (round(start * 100), round(duration * 100), x0, x1)
+    out = os.path.join(workdir, name)
+    if os.path.exists(out):
+        return name
+    net = sr_model()
+    W, H = x1 - x0, info["height"]
+    dec = subprocess.Popen([FFMPEG, "-v", "error", "-ss", "%.3f" % start, "-t", "%.3f" % duration, "-i", video,
+                            "-vf", "fps=%d,crop=%d:%d:%d:0" % (fps, W, H, x0), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                           stdout=subprocess.PIPE)
+    enc = subprocess.Popen([FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "%dx%d" % (W * factor, H * factor),
+                            "-r", str(fps), "-i", "-", "-ss", "%.3f" % start, "-t", "%.3f" % duration, "-i", video,
+                            "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "12",
+                            "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", out + ".tmp.mp4"], stdin=subprocess.PIPE)
+    size = W * H * 3
+    total = max(1, int(duration * fps))
+    k = 0
+    try:
+        while True:
+            buf = dec.stdout.read(size)
+            if len(buf) < size:
+                break
+            img = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
+            ycc = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+            y = net(ycc[:, :, 0].astype(np.float32) / 255.0)
+            y = np.clip(y * 255.0 + 0.5, 0, 255).astype(np.uint8)
+            if y.shape != (H * factor, W * factor):
+                y = cv2.resize(y, (W * factor, H * factor), interpolation=cv2.INTER_CUBIC)
+            cc = cv2.resize(ycc[:, :, 1:], (W * factor, H * factor), interpolation=cv2.INTER_CUBIC)
+            up = cv2.cvtColor(np.dstack([y, cc]), cv2.COLOR_YCrCb2BGR)
+            enc.stdin.write(up.tobytes())
+            k += 1
+            if progress and k % 25 == 0:
+                progress(k / total)
+    finally:
+        enc.stdin.close()
+        enc.wait()
+        dec.wait()
+    if enc.returncode != 0 or not k:
+        raise RuntimeError("Hochskalierung fehlgeschlagen")
+    os.replace(out + ".tmp.mp4", out)
+    return name
+
+
+def scale_regions(blur, f, x0=0):
+    """Blur regions in source pixels, for a strip from x0 of the source that was upscaled by f."""
+    out = []
+    for r in blur or []:
+        r = dict(r)
+        if "x" in r:
+            r["x"] = (r["x"] - x0) * f
+        for k in ("y", "w", "h"):
+            if k in r:
+                r[k] = r[k] * f
+        if r.get("keys"):
+            r["keys"] = [(t, (x - x0) * f, y * f) for t, x, y in r["keys"]]
+        if "w" in r:
+            r["w"], r["h"] = int(r["w"]) // 2 * 2, int(r["h"]) // 2 * 2
+        out.append(r)
+    return out
+
+
+def scale_segs(segs, f, x0=0):
+    if not segs:
+        return segs
+    return [tuple([s[0], s[1], int((s[2] - x0) * f)] + ([[(t, int((x - x0) * f)) for t, x in s[3]]] if len(s) > 3 and s[3] else []))
+            for s in segs]
+
+
+def _pb_consts(path):
+    """The constant tensors (weights) of a TensorFlow GraphDef file, read with a minimal protobuf parser:
+    {name: numpy array}. Enough for small frozen models; no TensorFlow needed."""
+    import struct
+
+    import numpy as np
+
+    def varint(b, i):
+        r = s = 0
+        while True:
+            c = b[i]
+            i += 1
+            r |= (c & 0x7F) << s
+            s += 7
+            if c < 0x80:
+                return r, i
+
+    def fields(b):
+        i, out = 0, []
+        while i < len(b):
+            key, i = varint(b, i)
+            f, wt = key >> 3, key & 7
+            if wt == 0:
+                v, i = varint(b, i)
+            elif wt == 1:
+                v, i = b[i:i + 8], i + 8
+            elif wt == 2:
+                ln, i = varint(b, i)
+                v, i = b[i:i + ln], i + ln
+            elif wt == 5:
+                v, i = b[i:i + 4], i + 4
+            else:
+                raise ValueError("protobuf wire type %d" % wt)
+            out.append((f, v))
+        return out
+
+    consts = {}
+    for f, node in fields(open(path, "rb").read()):
+        if f != 1:
+            continue
+        nf = fields(node)
+        if dict(nf).get(2) != b"Const":
+            continue
+        name = dict(nf)[1].decode()
+        for k, attr in nf:
+            if k != 5:
+                continue
+            af = dict(fields(attr))
+            if af.get(1) != b"value":
+                continue
+            tensor = dict(fields(af[2])).get(8)
+            if tensor is None:
+                continue
+            tf = fields(tensor)
+            dims = [dict(fields(d)).get(1, 0) for k2, shp in tf if k2 == 2 for k3, d in fields(shp) if k3 == 2]
+            content = b"".join(v for k2, v in tf if k2 == 4)
+            if content:
+                arr = np.frombuffer(content, "<f4").copy()
+            else:  # repeated float_val, packed or not
+                vals = []
+                for k2, v in tf:
+                    if k2 == 5:
+                        vals += list(struct.unpack("<%df" % (len(v) // 4), v)) if isinstance(v, bytes) else []
+                arr = np.array(vals, np.float32)
+            if dims and arr.size == int(np.prod(dims)):
+                arr = arr.reshape(dims)
+            elif dims and arr.size == 1:
+                arr = np.full(dims, arr[0], np.float32)
+            consts[name] = arr
+    return consts
+
+
+_SR = {}
+
+
+def sr_model():
+    """FSRCNN x2 (Dong et al.) rebuilt in PyTorch from the weights of the TensorFlow file: 5x5 feature extraction
+    (56), 1x1 shrinking (12), four 3x3 mapping layers, 1x1 expanding (56), all with PReLU, then a 1x1 layer to
+    4 channels rearranged into the 2x image (depth-to-space)."""
+    if "net" in _SR:
+        return _SR["net"]
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    torch.set_num_threads(THREADS)
+    c = _pb_consts(SR_MODEL)
+    W = lambda k: torch.from_numpy(c[k]).permute(3, 2, 0, 1).contiguous()  # HWIO -> OIHW
+    B = lambda k: torch.from_numpy(c[k].reshape(-1))
+    last = max(int(k[1:]) for k in c if re.fullmatch(r"f\d+", k))  # FSRCNN: 8 layers, FSRCNN-small: 5
+    layers = [(W("f%d" % i), B("b%d" % i), B("alpha%d" % i).view(1, -1, 1, 1)) for i in range(1, last)]
+    ys = {i: float(np.asarray(c.get("mul_%d/y" % (2 * i - 1), 0.5)).reshape(-1)[0]) for i in range(1, last)}
+    w8, b8 = W("f%d" % last), float(c["b%d" % last].reshape(-1)[0])
+
+    @torch.no_grad()
+    def net(y):
+        x = torch.from_numpy(y)[None, None]
+        for i, (w, b, a) in enumerate(layers, 1):
+            x = F.conv2d(x, w, b, padding=w.shape[-1] // 2)
+            x = F.relu(x) + a * (x - x.abs()) * ys[i]  # PReLU as written in the graph
+        x = F.conv2d(x, w8, None)
+        return (F.pixel_shuffle(x, 2) + b8)[0, 0].numpy()
+
+    _SR["net"] = net
+    return net

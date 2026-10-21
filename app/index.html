@@ -344,6 +344,7 @@ function renderHome(){
     '</div>'+src[S.srcTab]+
     '<div class="grid">'+
       '<div><label>Anzahl Clips</label><input id="o_clips" type="number" min="1" max="15" value="'+d.clips+'"></div>'+
+      '<div><label>Zitat-Clips zusätzlich (5–15 s)</label><input id="o_quote_clips" type="number" min="0" max="5" value="'+(d.quote_clips==null?2:d.quote_clips)+'"></div>'+
       '<div><label>Länge min. (Sek.)</label><input id="o_min_len" type="number" min="5" max="170" value="'+d.min_len+'"></div>'+
       '<div><label>Länge max. (Sek.)</label><input id="o_max_len" type="number" min="10" max="180" value="'+d.max_len+'"></div>'+
       '<div><label>Bildausschnitt</label><select id="o_mode">'+opt("auto",d.mode,"Sprecher folgen (automatisch)")+opt("split",d.mode,"Geteilt bei 2 Personen")+opt("crop",d.mode,"Mitte zuschneiden")+opt("blur",d.mode,"Ganzes Bild + Unschärfe")+'</select></div>'+
@@ -377,6 +378,7 @@ function renderHome(){
       chk("o_blink_safe",d.blink_safe,"Nicht bei geschlossenen Augen oder mitten in einer Bewegung schneiden")+
       chk("o_loop_end",d.loop_end,"Loop-Ende: ohne Vor- und Nachlauf, endet im Bildausschnitt des Anfangs")+
       chk("o_stabilize",d.stabilize,"Verwackelte Aufnahmen stabilisieren (verlängert das Rendern)")+
+      chk("o_upscale",d.upscale,"KI-Hochskalierung, wenn der Ausschnitt zu wenig Pixel hat (verlängert das Rendern)")+
     '</div><p class="muted small">Immer aktiv: weiche Tonübergänge an jedem Schnitt, weniger Mini-Schnitte (kein Teil kürzer als 1 s), Sprecherwechsel im Bild kurz nach dem ersten Wort (J-Cut), Blickraum in Blickrichtung, Zooms auf Augenhöhe, Untertitel 70 ms vor dem Wort. „Dynamische Zooms“ sorgt zusätzlich dafür, dass das Bild nie länger als etwa 4,5 s stillsteht.</p></details>'+
     '<div style="margin-top:14px"><label>Worum geht es im Video? (optional, hilft der KI)</label><textarea id="o_context" placeholder="z. B. Podcast über Selbstständigkeit, Zielgruppe junge Gründer"></textarea></div>'+
     '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="saveDefaults()">Einstellungen als Standard speichern</button></div>'+
@@ -393,8 +395,8 @@ function renderHome(){
 }
 
 function readOpts(){
-  var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume","cut_style"].forEach(function(k){o[k]=$("o_"+k).value});
-  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","visual_analysis","tournament","two_stage","reuse_transcript","precise_timing","ai_check","natural_pauses","roomtone","blink_safe","loop_end","stabilize","fmt_lengths","speaker_colors","blur_faces","blur_plates"].forEach(function(k){o[k]=$("o_"+k).checked});
+  var o={};["clips","min_len","max_len","mode","quality","highlight","keyword_color","font_size","words_per_line","position","hook_seconds","sub_style","music","music_volume","cut_style","quote_clips"].forEach(function(k){o[k]=$("o_"+k).value});
+  ["uppercase","remove_pauses","hook","review","zoom","enhance_audio","cover","fmt_4x5","fmt_1x1","audio_analysis","visual_analysis","tournament","two_stage","reuse_transcript","precise_timing","ai_check","natural_pauses","roomtone","blink_safe","loop_end","stabilize","upscale","fmt_lengths","speaker_colors","blur_faces","blur_plates"].forEach(function(k){o[k]=$("o_"+k).checked});
   return o;
 }
 function jobMeta(){return {settings:readOpts(),context:$("o_context").value}}
@@ -802,13 +804,14 @@ function moreCard(j){
   var s=j.settings||{};
   return '<div class="card" style="margin-top:16px"><div class="row" style="justify-content:space-between;gap:10px"><div><b>Weitere Highlights finden</b><div class="muted small">Ohne neues Hochladen – das Transkript ist schon da. Bereits vorhandene Clips werden nicht wiederholt.</div></div></div>'+
     '<div class="row" style="gap:10px;margin-top:10px;align-items:flex-end">'+
+    '<div><label>Art</label><select id="e_more_kind" onchange="var q=this.value===\'quotes\';$(\'e_more_min\').disabled=q;$(\'e_more_max\').disabled=q"><option value="highlights">Highlights</option><option value="quotes">Zitat-Clips (5–15 s)</option></select></div>'+
     '<div><label>Anzahl</label><input id="e_more_n" type="number" min="1" max="10" value="3" style="width:80px"></div>'+
     '<div><label>Länge min. (s)</label><input id="e_more_min" type="number" min="5" max="170" value="'+(s.min_len||20)+'" style="width:90px"></div>'+
     '<div><label>Länge max. (s)</label><input id="e_more_max" type="number" min="10" max="180" value="'+(s.max_len||60)+'" style="width:90px"></div>'+
     '<button class="btn primary" onclick="findMore()">Suchen und rendern</button></div></div>';
 }
 function findMore(){
-  var b={count:+$("e_more_n").value,min_len:+$("e_more_min").value,max_len:+$("e_more_max").value};
+  var b={count:+$("e_more_n").value,min_len:+$("e_more_min").value,max_len:+$("e_more_max").value,kind:$("e_more_kind").value};
   if(document.activeElement) document.activeElement.blur();
   api("POST","/api/jobs/"+S.job.id+"/more",b).then(function(j){S.job=j;renderJob();toast("Suche läuft – neue Clips erscheinen unten")}).catch(function(e){toast(e.message)});
 }
@@ -1083,7 +1086,7 @@ function renderJob(){
     var pz=c.postiz?'<div class="tag">✓ An Postiz gesendet'+(c.postiz.now?' (sofort)':' – geplant für '+new Date(c.postiz.date*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"}))+(c.postiz.channels&&c.postiz.channels.length?': '+esc(c.postiz.channels.join(", ")):'')+'</div>':'';
     var f=c.formats||{},dl=function(file,label,cls){return '<a class="btn sm'+(cls||"")+'" href="/files/'+j.id+'/'+file+'?dl=1">'+label+'</a>'};
     return '<div class="clip">'+media+'<div class="b"><div class="row" style="justify-content:space-between;gap:6px"><span class="muted small">Clip '+(i+1)+(c.variant_of!=null?' · Variante von Clip '+(c.variant_of+1):'')+' · '+fmt(c.start)+'–'+fmt(c.end)+' · '+len+'</span><span class="score">'+c.score+'</span></div>'+
-      (c.series?'<div><span class="pill rev">Teil '+c.series.part+'/'+c.series.total+'</span></div>':'')+(c.manual&&!c.series?'<div><span class="pill">Von Hand markiert</span></div>':'')+
+      (c.series?'<div><span class="pill rev">Teil '+c.series.part+'/'+c.series.total+'</span></div>':'')+(c.manual&&!c.series?'<div><span class="pill">Von Hand markiert</span></div>':'')+(c.quote_clip?'<div><span class="pill rev">Zitat-Clip</span></div>':'')+
       lengthNote(outLen)+audioBadge(c)+criteriaUI(c)+checksUI(c,i)+
       '<div class="ti">'+esc(c.title)+'</div>'+(c.hook_text?'<div class="small">Hook: <b>'+esc(c.hook_text)+'</b></div>':'')+(c.hook?'<div class="muted small">'+esc(c.hook)+'</div>':'')+whyInfo(c)+
       (!review&&c.caption?'<div class="cap">'+esc(c.caption)+'</div>':'')+(!review&&clipRef(c)?'<div class="muted small">📍 '+esc(refText(clipRef(c)))+'</div>':'')+pz+
